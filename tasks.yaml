@@ -1,0 +1,207 @@
+# =====================================================================
+# 评测任务清单（冻结后不再修改；替换题目须在 replacements 中记录原因）
+#
+# 结构：
+#   benchmarks:  各数据集的公共信息（数据位置、判分方式、给 agent 的输入字段）
+#   test:        评测集，按数据集分组。最终结果只来自这里
+#   dev:         调试集，按数据集分组。开发机制时使用，不进最终报告
+#   backups:     备选题，按顺序替换
+#   replacements:替换记录
+#
+# 题目的完整标识为 "<benchmark>/<id>"，例如 promax/google__langextract-239
+# 转换后的任务目录统一为 belay/build/tasks/<benchmark>/<id>/（Pier / Harbor 格式），
+#   由 python -m eval.prepare 生成
+# 相对路径均相对于本文件所在目录（belay/）；原始数据集在与 belay/ 同级的 benchmarks/ 下
+# =====================================================================
+
+version: 1
+frozen_at: "2026-09-24"
+
+benchmarks:
+  promax:
+    name: SWE-Bench ProMax
+    data: ../benchmarks/promax/data/swe-bench-promax.json
+    eval_scripts: ../benchmarks/promax/data/eval.json
+    task_format: convert            # 需由 eval/convert/promax_to_harbor.py 转换
+    image_template: "key4127/refactor-dockerhub:{id}"
+    instruction_fields: [problem_statement]   # 不得包含 hints_text（由参考答案生成）
+    grading: all_tests_pass
+
+  deepswe:
+    name: DeepSWE
+    data: ../benchmarks/deep-swe/tasks
+    task_format: native             # 原生 Harbor 格式，直接复制任务目录
+    image_template: null            # 镜像写在各任务的 task.toml 中
+    instruction_fields: [instruction.md]
+    grading: functional_verifier
+
+  swe_evo:
+    name: SWE-EVO
+    data: ../benchmarks/SWE-EVO/hf_out/hf_jsonl/swe-evo.jsonl
+    task_format: convert            # 需由 eval/convert/sweevo_to_harbor.py 转换
+    image_template: null            # 各题镜像见下方 image 字段
+    instruction_fields: [problem_statement]
+    instruction_setting: release_note_only
+    instruction_cleanup: [strip_urls]         # 删除 release notes 中的 PR / 文档链接
+    repo_sanitize: single_commit              # 容器内仓库重建为单一提交，去除后续历史
+    grading: all_tests_pass
+    extra_metrics: [fix_rate]
+
+# ---------------------------------------------------------------------
+# 评测集（22 道）
+# ---------------------------------------------------------------------
+test:
+  promax:
+    - id: google__langextract-239
+      lang: python
+      repo: google/langextract
+      stats: {src_files: 19, loc: 1728, top_dirs: 10}
+    - id: stanfordnlp__dspy-9193
+      lang: python
+      repo: stanfordnlp/dspy
+      stats: {src_files: 13, loc: 1829, top_dirs: 6}
+    - id: OpenListTeam__OpenList-1001
+      lang: go
+      repo: OpenListTeam/OpenList
+      stats: {src_files: 46, loc: 850, top_dirs: 37}
+    - id: go-gitea__gitea-35775
+      lang: go
+      repo: go-gitea/gitea
+      stats: {src_files: 24, loc: 1356, top_dirs: 5}
+    - id: ant-design__ant-design-53739
+      lang: typescript
+      repo: ant-design/ant-design
+      stats: {src_files: 22, loc: 234, top_dirs: 13}
+    - id: nacos__alibaba-13142
+      lang: java
+      repo: alibaba/nacos
+      stats: {src_files: 46, loc: 889, top_dirs: 7}
+    - id: nasa__fprime-3642
+      lang: cpp
+      repo: nasa/fprime
+      stats: {src_files: 32, loc: 1575, top_dirs: 24}
+    - id: tracel-ai__burn-4337
+      lang: rust
+      repo: tracel-ai/burn
+      stats: {src_files: 49, loc: 1954, top_dirs: 12}
+
+  deepswe:
+    - id: scriggo-method-declarations
+      lang: go
+      repo: open2b/scriggo
+      stats: {files: 18, loc: 872}
+    - id: arcane-drift-detection-baselines
+      lang: go
+      repo: getarcaneapp/arcane
+      stats: {files: 14, loc: 1086}
+    - id: participle-grammar-conflict-analysis
+      lang: go
+      repo: alecthomas/participle
+      stats: {files: 14, loc: 767}
+    - id: testem-bail-on-test-failure
+      lang: javascript
+      repo: testem/testem
+      stats: {files: 18, loc: 616}
+    - id: yjs-map-conflict-detection
+      lang: javascript
+      repo: yjs/yjs
+      stats: {files: 8, loc: 656}
+    - id: python-statemachine-state-data-scoping
+      lang: python
+      repo: fgmacedo/python-statemachine
+      stats: {files: 17, loc: 554}
+    - id: narwhals-rolling-window-suite
+      lang: python
+      repo: narwhals-dev/narwhals
+      stats: {files: 11, loc: 816}
+    - id: sqlfmt-create-table-ddl-formatting
+      lang: python
+      repo: tconbeer/sqlfmt
+      stats: {files: 10, loc: 757}
+    - id: wasmi-trap-coredumps
+      lang: rust
+      repo: wasmi-labs/wasmi
+      stats: {files: 11, loc: 645}
+    - id: boa-hierarchical-evaluation-cancellation
+      lang: rust
+      repo: boa-dev/boa
+      stats: {files: 7, loc: 575}
+    - id: dynamodb-toolbox-conditional-attribute-requirements
+      lang: typescript
+      repo: dynamodb-toolbox/dynamodb-toolbox
+      stats: {files: 36, loc: 669}
+    - id: valibot-recursive-schema-composition
+      lang: typescript
+      repo: open-circle/valibot
+      stats: {files: 22, loc: 837}
+
+  swe_evo:
+    - id: iterative__dvc_0.52.1_0.53.1
+      lang: python
+      repo: iterative/dvc
+      image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-2275
+      stats: {files: 42, f2p: 132}
+    - id: dask__dask_2023.6.0_2023.6.1
+      lang: python
+      repo: dask/dask
+      image: xingyaoww/sweb.eval.x86_64.dask_s_dask-10342
+      stats: {files: 33, f2p: 105}
+
+# ---------------------------------------------------------------------
+# 调试集（5 道）
+# ---------------------------------------------------------------------
+dev:
+  promax:
+    - id: TecharoHQ__anubis-1308
+      lang: go
+      repo: TecharoHQ/anubis
+      stats: {src_files: 16, loc: 1451, top_dirs: 9}
+    - id: roboflow__supervision-1943
+      lang: python
+      repo: roboflow/supervision
+      stats: {src_files: 11, loc: 861, top_dirs: 7}
+
+  deepswe:
+    - id: wazero-multi-module-snapshots
+      lang: go
+      repo: wazero/wazero
+      stats: {files: 14, loc: 555}
+    - id: koota-query-predicates
+      lang: typescript
+      repo: pmndrs/koota
+      stats: {files: 17, loc: 877}
+
+  swe_evo:
+    - id: conan-io__conan_2.0.2_2.0.3
+      lang: python
+      repo: conan-io/conan
+      image: xingyaoww/sweb.eval.x86_64.conan-io_s_conan-13450
+      stats: {files: 48, f2p: 8}
+
+# ---------------------------------------------------------------------
+# 备选题（按列表顺序使用；key 为被替换题的语言）
+# ---------------------------------------------------------------------
+backups:
+  promax:
+    cpp:        [LMMS__lmms-7454]
+    rust:       [astral-sh__ruff-20221]
+    go:         [gitleaks__gitleaks-1831]
+    python:     [confident-ai__deepeval-c_08844c8]
+    java:       [plantuml__plantuml-c_15fa06c]
+    typescript: [ant-design__ant-design-52470]
+  deepswe:
+    go:         [expr-try-catch-errors, helm-unified-manifest-stream]
+    python:     [bandit-interprocedural-taint-checks]
+    typescript: [drizzle-orm-window-function-builders]
+    javascript: [drizzle-orm-window-function-builders]
+  swe_evo:
+    any:
+      - id: iterative__dvc_3.43.1_3.44.0
+        image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-10277
+
+# ---------------------------------------------------------------------
+# 替换记录（示例格式，初始为空）
+#   - {split: test, benchmark: promax, removed: nasa__fprime-3642,
+#      added: LMMS__lmms-7454, reason: "oracle 第二次运行失败", date: "2026-09-25"}
+# ---------------------------------------------------------------------
+replacements: []

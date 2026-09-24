@@ -1,0 +1,126 @@
+# =====================================================================
+# 运行编排
+#
+# 用法（在 belay/ 目录下）：python -m eval.run --profile <名称> [覆盖参数]
+#   覆盖参数：--split --benchmarks --tasks --agent --model --repeats
+#            --concurrency --timeout-min --run-id --source-run --keep-containers
+#            -y（不询问） --dry-run（只打印计划与 Pier 配置）
+#
+# 选题规则：
+#   split       必填，test 或 dev
+#   benchmarks  all 或列表 / 逗号分隔；默认 all
+#   tasks       all 或题目列表；可写短 id（google__langextract-239）
+#               或完整标识（promax/google__langextract-239）；
+#               短 id 在所选 split 内必须唯一，且必须属于所选 benchmarks
+#
+# 结果目录：<results_root>/<run_id>/<benchmark>/<id>/<repeat>/
+# 同一 run_id 重跑即断点续跑：已完成的 trial 自动跳过
+# =====================================================================
+
+version: 1
+# 相对路径均相对于本文件所在目录（belay/）
+tasks_file: tasks.yaml
+task_dirs: build/tasks                # 由 python -m eval.prepare 生成，可随时重建（已 gitignore）
+results_root: results                 # 运行结果（已 gitignore）
+
+defaults:
+  benchmarks: all
+  tasks: all
+  repeats: 1
+  concurrency: 2              # 8 vCPU / 32 GiB 下建议 ≤ 2
+  timeout_min: 180            # 单次 agent 运行的墙钟上限（覆盖 task.toml 中的 agent 超时）
+  environment: docker
+  grading:
+    inline_verify: true       # agent 结束后在原容器里也跑一次 verifier，用于和重放结果对账
+  keep_containers: false
+  run_id: "{profile}-{agent}-{split}-{date}"
+  # 网络：不再在这里写白名单。任务的 task.toml 统一 allow_internet = false（prepare 会强制），
+  # Pier 只放行 agent 自己声明的域名（claude-code 即 ANTHROPIC_BASE_URL 的域名）。
+
+# ---------------------------------------------------------------------
+# Agent 定义
+#   name        Pier 内置 agent；import_path 自定义 agent（二选一）
+#   model       模型名（--model 可覆盖）
+#   env         传给 agent 的环境变量；${VAR} 由 Pier 在运行时从宿主机展开，不写入任何文件
+#   kwargs      传给 agent 构造函数的参数
+#   grade       replay（默认：导出补丁，在全新容器重放评分）或 inline（用原容器的 verifier 结果）
+# ---------------------------------------------------------------------
+agents:
+  oracle:
+    name: oracle
+    grade: inline
+
+  nop:
+    name: nop
+    grade: inline
+
+  claude-code:                # A 组：Pier 的 ClaudeCode + 补丁导出
+    import_path: "eval.agents.claude_code:ClaudeCodeWithPatch"
+    model: "<DeepSeek 模型名>"  # 填 DeepSeek Anthropic 接口文档中的模型名
+    env:
+      ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${DEEPSEEK_API_KEY}
+      API_TIMEOUT_MS: "600000"
+    kwargs:
+      version: "<Claude Code 版本号>"   # 固定版本，保证 A 组各次运行一致；试跑时可先删掉这一行
+      # repo_dir: /testbed             # 仅当容器工作目录不在仓库内时需要
+
+  flat:                       # B 组：自研执行器，单循环，无任务图
+    import_path: "eval.agents.flat_agent:FlatAgent"
+    model: "<DeepSeek 模型名>"
+    env:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+
+  belay:                      # C/D 组：完整 runtime（待实现）
+    import_path: "eval.agents.belay_agent:BelayAgent"
+    model: "<DeepSeek 模型名>"
+    env:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+    kwargs:
+      workers: 1
+
+# ---------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------
+profiles:
+
+  gold-check:                 # 参考解两次通过 + 空补丁失败
+    split: dev                # 验证评测集：--split test
+    steps:
+      - {agent: oracle, repeats: 2, expect: pass}
+      - {agent: nop,    repeats: 1, expect: fail}
+    concurrency: 4
+    grading: {inline_verify: true}
+
+  cc-pilot:                   # Claude Code 试跑：摸清耗时与 token
+    split: dev
+    agent: claude-code
+    repeats: 1
+    concurrency: 1
+    keep_containers: true
+
+  cc-test:
+    split: test
+    agent: claude-code
+    repeats: 2
+
+  flat-test:
+    split: test
+    agent: flat
+    repeats: 2
+
+  belay-dev:
+    split: dev
+    agent: belay
+    repeats: 1
+    keep_containers: true
+
+  belay-test:
+    split: test
+    agent: belay
+    repeats: 2
+
+  regrade:                    # 对已有补丁重新评分，不调用模型
+    split: test
+    grading_only: true
+    source_run: "<run_id>"    # 或 --source-run 指定
