@@ -66,9 +66,13 @@ agents:
       CLAUDE_CODE_SUBAGENT_MODEL: deepseek-flash
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: "786432"
       API_TIMEOUT_MS: "600000"
+      DISABLE_AUTOUPDATER: "1"          # 容器内不联网，禁止 Claude Code 自动更新
     kwargs:
       reasoning_effort: max             # 即 CLAUDE_CODE_EFFORT_LEVEL=max，Pier 以 --effort max 传入
-      # version: "x.y.z"                # 试跑通过后，把 run.json 里的 agent_version 填到这里固定版本
+      version: "2.1.281"                # 固定 Claude Code 版本（从 npm 安装），保证各次运行一致
+      # 构建镜像时下载 Node.js 与 npm 包的来源；默认官方源，访问慢时可换镜像：
+      # node_mirror: https://npmmirror.com/mirrors/node
+      # npm_registry: https://registry.npmmirror.com
       # repo_dir: /testbed              # 仅当容器工作目录不在仓库内时需要
 
   flat:                       # B 组：自研执行器，单循环，无任务图
