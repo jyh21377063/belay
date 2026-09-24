@@ -54,20 +54,26 @@ agents:
     name: nop
     grade: inline
 
-  claude-code:                # A 组：Pier 的 ClaudeCode + 补丁导出
+  claude-code:                # A 组：Pier 的 ClaudeCode + 补丁导出（Claude Code 由 Pier 装进每道题的容器）
     import_path: "eval.agents.claude_code:ClaudeCodeWithPatch"
-    model: "<DeepSeek 模型名>"  # 填 DeepSeek Anthropic 接口文档中的模型名
-    env:
+    model: "deepseek-flash[1m]"         # 即 ANTHROPIC_MODEL；[1m] 告诉 Claude Code 上下文为 1M
+    env:                                # 按 DeepSeek 官方推荐配置；这里的值会覆盖 Pier 的默认设置
       ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
       ANTHROPIC_AUTH_TOKEN: ${DEEPSEEK_API_KEY}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-flash[1m]"
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek-flash[1m]"
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-flash
+      CLAUDE_CODE_SUBAGENT_MODEL: deepseek-flash
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: "786432"
       API_TIMEOUT_MS: "600000"
     kwargs:
-      version: "<Claude Code 版本号>"   # 固定版本，保证 A 组各次运行一致；试跑时可先删掉这一行
-      # repo_dir: /testbed             # 仅当容器工作目录不在仓库内时需要
+      reasoning_effort: max             # 即 CLAUDE_CODE_EFFORT_LEVEL=max，Pier 以 --effort max 传入
+      # version: "x.y.z"                # 试跑通过后，把 run.json 里的 agent_version 填到这里固定版本
+      # repo_dir: /testbed              # 仅当容器工作目录不在仓库内时需要
 
   flat:                       # B 组：自研执行器，单循环，无任务图
     import_path: "eval.agents.flat_agent:FlatAgent"
-    model: "<DeepSeek 模型名>"
+    model: "<DeepSeek 模型名>"          # 与 A 组保持同一模型
     env:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
 
