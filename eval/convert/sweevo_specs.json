@@ -1,0 +1,547 @@
+{
+ "conan-io__conan_2.0.14_2.0.15": {
+  "repo": "conan-io/conan",
+  "spec_version": "2.0",
+  "install": [
+   "echo 'cython<3' > /tmp/constraint.txt; export PIP_CONSTRAINT=/tmp/constraint.txt; python -m pip install -r conans/requirements.txt; python -m pip install -r conans/requirements_server.txt; python -m pip install -r conans/requirements_dev.txt "
+  ],
+  "eval_commands": [
+   "export PYTHONPATH=${PYTHONPATH:-}:$(pwd)"
+  ],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA conans/test/functional/command/test_install_deploy.py conans/test/functional/conanfile/runner_test.py conans/test/functional/graph/test_graph_build_mode.py conans/test/functional/only_source_test.py conans/test/functional/toolchains/cmake/cmakedeps/test_cmakedeps.py conans/test/functional/toolchains/cmake/cmakedeps/test_cmakedeps_aggregator.py conans/test/functional/toolchains/cmake/cmakedeps/test_cmakedeps_transitivity.py conans/test/functional/toolchains/cmake/test_cmake.py conans/test/functional/toolchains/cmake/test_cmake_toolchain.py conans/test/functional/toolchains/conftest.py conans/test/functional/toolchains/env/test_complete.py conans/test/functional/toolchains/gnu/autotools/test_apple_toolchain.py conans/test/functional/toolchains/google/test_bazel.py conans/test/functional/toolchains/microsoft/test_msbuilddeps_traits.py conans/test/functional/toolchains/microsoft/test_msbuildtoolchain.py conans/test/functional/toolchains/test_nmake_toolchain.py conans/test/functional/tools/scm/test_git.py conans/test/integration/build_requires/build_requires_test.py conans/test/integration/build_requires/profile_build_requires_test.py conans/test/integration/build_requires/test_build_requires_source_method.py conans/test/integration/cache/backup_sources_test.py conans/test/integration/command/export/export_dirty_test.py conans/test/integration/command/info/test_graph_info_graphical.py conans/test/integration/command/install/install_missing_dep_test.py conans/test/integration/command/install/install_test.py conans/test/integration/command/install/test_install_transitive.py conans/test/integration/command/test_profile.py conans/test/integration/command/upload/upload_complete_test.py conans/test/integration/command/user_test.py conans/test/integration/command_v2/list_test.py conans/test/integration/command_v2/test_cache_path.py conans/test/integration/command_v2/test_cache_save_restore.py conans/test/integration/command_v2/test_combined_pkglist_flows.py conans/test/integration/command_v2/test_graph_find_binaries.py conans/test/integration/command_v2/test_output.py conans/test/integration/conan_v2/test_legacy_cpp_info.py conans/test/integration/conanfile/no_copy_source_test.py conans/test/integration/conanfile/set_name_version_test.py conans/test/integration/conanfile/test_deploy_method.py conans/test/integration/configuration/conf/test_conf.py conans/test/integration/configuration/conf/test_conf_from_br.py conans/test/integration/configuration/conf/test_conf_profile.py conans/test/integration/cross_building/build_requires_from_profile_test.py conans/test/integration/deprecated/test_deprecated.py conans/test/integration/editable/test_editable_envvars.py conans/test/integration/graph/core/test_build_requires.py conans/test/integration/graph/test_dependencies_visit.py conans/test/integration/graph/test_platform_requires.py conans/test/integration/graph/test_replace_requires.py conans/test/integration/graph/test_system_tools.py conans/test/integration/graph/version_ranges/version_range_override_test.py conans/test/integration/graph/version_ranges/version_ranges_diamond_test.py conans/test/integration/hooks/test_post_export.py conans/test/integration/hooks/test_post_package.py conans/test/integration/lockfile/test_user_overrides.py conans/test/integration/metadata/test_metadata_collect.py conans/test/integration/metadata/test_metadata_commands.py conans/test/integration/metadata/test_metadata_logs.py conans/test/integration/options/test_package_config_test.py conans/test/integration/package_id/compatible_test.py conans/test/integration/package_id/package_id_test.py conans/test/integration/package_id/python_requires_package_id_test.py conans/test/integration/package_id/test_default_package_id.py conans/test/integration/package_id/transitive_header_only_test.py conans/test/integration/remote/broken_download_test.py conans/test/integration/remote/requester_test.py conans/test/integration/remote/retry_test.py conans/test/integration/settings/remove_subsetting_test.py conans/test/integration/test_migrations.py conans/test/integration/toolchains/cmake/test_cmaketoolchain.py conans/test/integration/toolchains/env/test_buildenv.py conans/test/integration/toolchains/microsoft/test_nmakedeps.py conans/test/integration/toolchains/microsoft/vcvars_test.py conans/test/unittests/client/build/cpp_std_flags_test.py conans/test/unittests/client/graph/build_mode_test.py conans/test/unittests/client/profile_loader/profile_loader_test.py conans/test/unittests/model/options_test.py conans/test/unittests/model/profile_test.py conans/test/unittests/model/test_conf.py conans/test/unittests/tools/cmake/test_cmake_presets_definitions.py conans/test/unittests/tools/cmake/test_cmaketoolchain.py conans/test/unittests/tools/files/test_patches.py conans/test/unittests/tools/gnu/autotools_test.py conans/test/unittests/tools/google/test_bazel.py conans/test/utils/tools.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "conan-io__conan_2.0.2_2.0.3": {
+  "repo": "conan-io/conan",
+  "spec_version": "2.0",
+  "install": [
+   "echo 'cython<3' > /tmp/constraint.txt; export PIP_CONSTRAINT=/tmp/constraint.txt; python -m pip install -r conans/requirements.txt; python -m pip install -r conans/requirements_server.txt; python -m pip install -r conans/requirements_dev.txt "
+  ],
+  "eval_commands": [
+   "export PYTHONPATH=${PYTHONPATH:-}:$(pwd)"
+  ],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA conans/test/functional/command/test_install_deploy.py conans/test/integration/cache/backup_sources_test.py conans/test/integration/cache/download_cache_test.py conans/test/integration/command/export/export_test.py conans/test/integration/command/export_pkg_test.py conans/test/integration/command/install/install_update_test.py conans/test/integration/command/remote_test.py conans/test/integration/command/remove_test.py conans/test/integration/command/source_test.py conans/test/integration/command_v2/custom_commands_test.py conans/test/integration/command_v2/test_cache_clean.py conans/test/integration/command_v2/test_cache_integrity.py conans/test/integration/configuration/test_profile_priority.py conans/test/integration/editable/transitive_editable_test.py conans/test/integration/environment/test_env.py conans/test/integration/extensions/test_plugin_cmd_wrapper.py conans/test/integration/options/options_test.py conans/test/integration/py_requires/python_requires_test.py conans/test/integration/test_source_download_password.py conans/test/integration/toolchains/cmake/test_cmaketoolchain.py conans/test/unittests/client/build/cpp_std_flags_test.py conans/test/unittests/client/profile_loader/profile_loader_test.py conans/test/unittests/model/test_conf.py conans/test/unittests/tools/cmake/test_cmakedeps.py conans/test/unittests/tools/files/test_downloads.py conans/test/utils/mocks.py conans/test/utils/tools.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2022.9.2_2022.10.0": {
+  "repo": "dask/dask",
+  "spec_version": "2022.10",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [
+   "pip install 'pandas<2.0'"
+  ],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no dask/array/tests/test_array_core.py dask/array/tests/test_creation.py dask/array/tests/test_testing.py dask/dataframe/io/tests/test_csv.py dask/dataframe/io/tests/test_demo.py dask/dataframe/tests/test_format.py dask/dataframe/tests/test_groupby.py dask/dataframe/tests/test_rolling.py dask/diagnostics/tests/test_profiler.py dask/tests/test_base.py dask/tests/test_cli.py dask/tests/test_spark_compat.py dask/tests/test_threaded.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2023.3.2_2023.4.0": {
+  "repo": "dask/dask",
+  "spec_version": "2023.4",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [
+   "pip install 'pandas<2.0'"
+  ],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no conftest.py dask/array/tests/test_array_core.py dask/array/tests/test_array_function.py dask/array/tests/test_atop.py dask/array/tests/test_cupy_core.py dask/array/tests/test_cupy_creation.py dask/array/tests/test_cupy_gufunc.py dask/array/tests/test_cupy_linalg.py dask/array/tests/test_cupy_percentile.py dask/array/tests/test_cupy_reductions.py dask/array/tests/test_cupy_routines.py dask/array/tests/test_cupy_sparse.py dask/array/tests/test_dispatch.py dask/array/tests/test_gufunc.py dask/array/tests/test_linalg.py dask/array/tests/test_masked.py dask/array/tests/test_overlap.py dask/array/tests/test_percentiles.py dask/array/tests/test_rechunk.py dask/array/tests/test_reductions.py dask/array/tests/test_routines.py dask/array/tests/test_slicing.py dask/dataframe/io/tests/test_csv.py dask/dataframe/io/tests/test_hdf.py dask/dataframe/io/tests/test_io.py dask/dataframe/io/tests/test_json.py dask/dataframe/io/tests/test_parquet.py dask/dataframe/tests/test_accessors.py dask/dataframe/tests/test_dataframe.py dask/dataframe/tests/test_groupby.py dask/dataframe/tests/test_numeric.py dask/dataframe/tests/test_utils_dataframe.py dask/tests/test_base.py dask/tests/test_cli.py dask/tests/test_compatibility.py dask/tests/test_config.py dask/tests/test_distributed.py dask/tests/test_highgraph.py dask/tests/test_spark_compat.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2023.6.0_2023.6.1": {
+  "repo": "dask/dask",
+  "spec_version": "2023.6",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [
+   "pip install 'pandas<2.0'",
+   "pip install 'distributed==2023.6.0'"
+  ],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no dask/array/tests/test_rechunk.py dask/bag/tests/test_bag.py dask/dataframe/io/tests/test_csv.py dask/dataframe/tests/test_dataframe.py dask/dataframe/tests/test_groupby.py dask/dataframe/tests/test_shuffle.py dask/tests/test_cli.py dask/tests/test_distributed.py dask/tests/test_highgraph.py dask/tests/test_utils.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2023.6.1_2023.7.0": {
+  "repo": "dask/dask",
+  "spec_version": "2023.7",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [
+   "pip install 'pandas<2.0'"
+  ],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no dask/dataframe/io/tests/test_io.py dask/dataframe/tests/test_dataframe.py dask/tests/test_cli.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2023.8.0_2023.8.1": {
+  "repo": "dask/dask",
+  "spec_version": "2023.8",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [
+   "pip install 'pandas<2.0'"
+  ],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no dask/dataframe/io/tests/test_csv.py dask/dataframe/tests/test_dataframe.py dask/dataframe/tests/test_groupby.py dask/tests/test_system.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2023.9.2_2023.9.3": {
+  "repo": "dask/dask",
+  "spec_version": "2023.9",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [
+   "pip install 'pandas<2.0'"
+  ],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no dask/array/tests/test_reductions.py dask/dataframe/io/tests/test_csv.py dask/dataframe/io/tests/test_json.py dask/dataframe/tests/test_dataframe.py dask/dataframe/tests/test_merge_column_and_index.py dask/dataframe/tests/test_multi.py dask/tests/test_config.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2024.1.0_2024.1.1": {
+  "repo": "dask/dask",
+  "spec_version": "2024.1",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no conftest.py dask/array/tests/test_array_core.py dask/array/tests/test_fft.py dask/array/tests/test_linalg.py dask/array/tests/test_masked.py dask/array/tests/test_random.py dask/array/tests/test_reductions.py dask/array/tests/test_routines.py dask/bag/tests/test_bag.py dask/bytes/tests/test_http.py dask/bytes/tests/test_s3.py dask/conftest.py dask/dataframe/_testing.py dask/dataframe/io/tests/test_demo.py dask/dataframe/io/tests/test_io.py dask/dataframe/io/tests/test_parquet.py dask/dataframe/tests/test_arithmetics_reduction.py dask/dataframe/tests/test_dataframe.py dask/dataframe/tests/test_groupby.py dask/dataframe/tests/test_indexing.py dask/dataframe/tests/test_multi.py dask/dataframe/tests/test_numeric.py dask/dataframe/tests/test_reshape.py dask/dataframe/tests/test_rolling.py dask/dataframe/tests/test_shuffle.py dask/dataframe/tests/test_ufunc.py dask/dataframe/tseries/tests/test_resample.py dask/tests/test_backends.py dask/tests/test_base.py dask/tests/test_ci.py dask/tests/test_distributed.py dask/tests/test_graph_manipulation.py dask/tests/test_highgraph.py dask/tests/test_layers.py dask/tests/test_order.py dask/tests/test_sizeof.py dask/tests/test_tokenize.py dask/tests/test_typing.py dask/tests/test_utils.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "dask__dask_2024.3.1_2024.4.0": {
+  "repo": "dask/dask",
+  "spec_version": "2024.4",
+  "install": [
+   "python -m pip install --no-deps -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA  --color=no dask/dataframe/tests/test_dataframe.py dask/dataframe/tests/test_groupby.py dask/dataframe/tests/test_utils_dataframe.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_0.30.0_0.30.1": {
+  "repo": "iterative/dvc",
+  "spec_version": "0.30",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/test_stage.py tests/unit/stage.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_0.33.1_0.34.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "0.34",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/test_checkout.py tests/test_data_cloud.py tests/test_metrics.py tests/test_remote.py tests/test_tag.py tests/unit/test_progress.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_0.35.3_0.35.4": {
+  "repo": "iterative/dvc",
+  "spec_version": "0.35",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/test_checkout.py tests/test_remove.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_0.52.1_0.53.1": {
+  "repo": "iterative/dvc",
+  "spec_version": "3.1",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/conftest.py tests/func/test_data_cloud.py tests/func/test_import_url.py tests/func/test_output.py tests/func/test_remote.py tests/func/test_repro.py tests/func/test_s3.py tests/func/test_tree.py tests/func/test_update.py tests/unit/command/test_imp_url.py tests/unit/dependency/test_hdfs.py tests/unit/output/test_hdfs.py tests/unit/remote/ssh/test_pool.py tests/unit/test_path_info.py tests/unit/test_stage.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_0.89.0_0.90.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "0.90",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/remote/test_local.py tests/func/test_add.py tests/func/test_api.py tests/func/test_cache.py tests/func/test_checkout.py tests/func/test_data_cloud.py tests/func/test_diff.py tests/func/test_external_repo.py tests/func/test_gc.py tests/func/test_import.py tests/func/test_remote.py tests/func/test_remove.py tests/func/test_repro.py tests/func/test_run.py tests/func/test_unprotect.py tests/func/test_version.py tests/unit/remote/test_local.py tests/unit/test_path_info.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_0.91.2_0.91.3": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.3",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/test_data_cloud.py tests/unit/remote/test_base.py tests/unit/remote/test_gdrive.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_0.92.0_0.92.1": {
+  "repo": "iterative/dvc",
+  "spec_version": "2.1",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/unit/command/test_data_sync.py tests/unit/command/test_metrics.py tests/unit/command/test_status.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.0.0a1_1.0.0a2": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.0",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/basic_env.py tests/conftest.py tests/dir_helpers.py tests/func/metrics/test_diff.py tests/func/params/test_diff.py tests/func/plots/__init__.py tests/func/plots/test_diff.py tests/func/plots/test_plots.py tests/func/remote/test_gdrive.py tests/func/remote/test_index.py tests/func/test_add.py tests/func/test_analytics.py tests/func/test_api.py tests/func/test_checkout.py tests/func/test_cli.py tests/func/test_commit.py tests/func/test_config.py tests/func/test_data_cloud.py tests/func/test_diff.py tests/func/test_external_repo.py tests/func/test_gc.py tests/func/test_get.py tests/func/test_ignore.py tests/func/test_import.py tests/func/test_import_url.py tests/func/test_init.py tests/func/test_install.py tests/func/test_lockfile.py tests/func/test_ls.py tests/func/test_move.py tests/func/test_pipeline.py tests/func/test_remote.py tests/func/test_repo.py tests/func/test_repro.py tests/func/test_repro_multistage.py tests/func/test_run_multistage.py tests/func/test_run_single_stage.py tests/func/test_scm.py tests/func/test_stage.py tests/func/test_status.py tests/func/test_tree.py tests/func/test_update.py tests/func/test_utils.py tests/remotes.py tests/unit/command/test_diff.py tests/unit/command/test_metrics.py tests/unit/command/test_params.py tests/unit/command/test_plots.py tests/unit/command/test_repro.py tests/unit/command/test_run.py tests/unit/command/test_update.py tests/unit/remote/ssh/test_connection.py tests/unit/remote/ssh/test_ssh.py tests/unit/remote/test_azure.py tests/unit/remote/test_base.py tests/unit/remote/test_gdrive.py tests/unit/remote/test_gs.py tests/unit/remote/test_http.py tests/unit/remote/test_oss.py tests/unit/remote/test_remote.py tests/unit/remote/test_remote_dir.py tests/unit/remote/test_s3.py tests/unit/repo/plots/__init__.py tests/unit/repo/plots/test_data.py tests/unit/repo/plots/test_diff.py tests/unit/repo/test_repo_tree.py tests/unit/repo/test_tree.py tests/unit/scm/test_git.py tests/unit/stage/test_run.py tests/unit/stage/test_stage.py tests/unit/test_rwlock.py tests/unit/test_updater.py tests/unit/utils/test_fs.py tests/unit/utils/test_http.py tests/utils/__init__.py tests/utils/httpd.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.0.0b6_1.0.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.0",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/test_import_url.py tests/unit/command/test_imp_url.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.0.1_1.0.2": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.0",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/__init__.py tests/conftest.py tests/dir_helpers.py tests/func/test_add.py tests/func/test_data_cloud.py tests/func/test_get.py tests/unit/command/test_git_hook.py tests/unit/repo/__init__.py tests/unit/repo/test_run.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.1.0_1.1.1": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.1",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/unit/command/test_diff.py tests/unit/command/test_metrics.py tests/unit/command/test_params.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.1.7_1.1.8": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.8",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/test_ignore.py tests/func/test_run_multistage.py tests/remotes/__init__.py tests/remotes/azure.py tests/remotes/oss.py tests/unit/dependency/test_params.py tests/unit/remote/test_azure.py tests/unit/test_ignore.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.10.2_1.11.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.11",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/experiments/test_checkpoints.py tests/func/experiments/test_diff.py tests/func/experiments/test_experiments.py tests/func/experiments/test_gc.py tests/func/experiments/test_show.py tests/func/params/test_diff.py tests/func/test_add.py tests/func/test_api.py tests/func/test_checkout.py tests/func/test_dvcfile.py tests/func/test_import_url.py tests/func/test_init.py tests/func/test_repo.py tests/func/test_run_single_stage.py tests/func/test_scm.py tests/func/test_stage.py tests/func/test_stage_load.py tests/func/test_stage_resolver.py tests/func/test_stage_resolver_error_msg.py tests/remotes/__init__.py tests/unit/command/test_experiments.py tests/unit/command/test_repro.py tests/unit/remote/test_base.py tests/unit/repo/test_repo.py tests/unit/scm/test_git.py tests/unit/test_context.py tests/unit/tree/test_base.py tests/unit/utils/test_utils.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.11.12_1.11.13": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.11",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/unit/remote/test_local.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_1.6.3_1.6.4": {
+  "repo": "iterative/dvc",
+  "spec_version": "1.6",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/experiments/test_experiments.py tests/unit/command/test_plots.py tests/unit/repo/plots/test_diff.py tests/unit/tree/test_dvc.py tests/unit/tree/test_repo.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_2.19.0_2.20.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "2.20",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/test_data_cloud.py tests/func/test_import_url.py tests/func/test_update.py tests/unit/command/test_imp.py tests/unit/command/test_imp_url.py tests/unit/command/test_update.py tests/unit/output/test_output.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_2.21.1_2.21.2": {
+  "repo": "iterative/dvc",
+  "spec_version": "2.21",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/api/test_params.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_2.5.0_2.5.1": {
+  "repo": "iterative/dvc",
+  "spec_version": "2.5",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/plots/test_show.py tests/func/test_add.py tests/func/test_status.py tests/func/test_version.py tests/unit/command/test_diff.py tests/unit/objects/test_tree.py tests/unit/remote/test_http.py tests/unit/test_info.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_2.58.1_2.58.2": {
+  "repo": "iterative/dvc",
+  "spec_version": "2.58",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/test_repro_multistage.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_2.7.2_2.7.3": {
+  "repo": "iterative/dvc",
+  "spec_version": "2.7",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/experiments/conftest.py tests/func/experiments/test_remote.py tests/func/test_fs.py tests/unit/fs/test_ssh.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_2.8.1_2.8.2": {
+  "repo": "iterative/dvc",
+  "spec_version": "2.8",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\"; python -m pip install \"numpy<=1.20\"; python -m pip install \"pytest<8\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/__init__.py tests/conftest.py tests/dir_helpers.py tests/func/experiments/test_experiments.py tests/func/experiments/test_remote.py tests/func/experiments/test_show.py tests/func/machine/__init__.py tests/func/machine/test_machine_config.py tests/func/machine/test_machine_status.py tests/func/metrics/test_diff.py tests/func/metrics/test_show.py tests/func/objects/db/test_index.py tests/func/params/test_show.py tests/func/plots/test_show.py tests/func/test_add.py tests/func/test_checkout.py tests/func/test_data_cloud.py tests/func/test_external_repo.py tests/func/test_gc.py tests/func/test_import_url.py tests/func/test_install.py tests/func/test_lockfile.py tests/func/test_ls.py tests/func/test_move.py tests/func/test_odb.py tests/func/test_remote.py tests/func/test_repo_index.py tests/func/test_repro.py tests/func/test_run_single_stage.py tests/func/test_scm.py tests/func/test_stage.py tests/func/test_state.py tests/func/test_update.py tests/func/test_version.py tests/remotes/__init__.py tests/remotes/gdrive.py tests/remotes/git_server.py tests/remotes/s3.py tests/unit/command/test_compat_flag.py tests/unit/command/test_experiments.py tests/unit/command/test_machine.py tests/unit/command/test_metrics.py tests/unit/command/test_params.py tests/unit/fs/test_dvc.py tests/unit/fs/test_repo.py tests/unit/objects/db/test_local.py tests/unit/objects/test_tree.py tests/unit/output/test_local.py tests/unit/render/test_render.py tests/unit/render/test_vega.py tests/unit/scm/test_git.py tests/unit/test_compare.py tests/unit/test_dvcfile.py tests/unit/test_info.py tests/unit/test_pathspec_math.py tests/unit/test_updater.py tests/unit/ui/test_console.py tests/utils/__init__.py tests/utils/httpd.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_3.12.0_3.13.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "3.13",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/utils/test_hydra.py tests/unit/repo/experiments/test_utils.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_3.13.3_3.14.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "3.14",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/test_config.py tests/unit/test_config.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_3.15.0_3.15.1": {
+  "repo": "iterative/dvc",
+  "spec_version": "3.15",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/repro/test_repro.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_3.4.0_3.5.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "3.5",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/api/test_data.py tests/unit/command/test_data_sync.py tests/unit/repo/test_graph.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "iterative__dvc_3.43.1_3.44.0": {
+  "repo": "iterative/dvc",
+  "spec_version": "3.4",
+  "install": [
+   "python -m pip install --upgrade pip wheel GitPython; python -m pip install \"cython<3.0.0\" && python -m pip install --no-build-isolation pyyaml==5.4.1; python -m pip install git+https://github.com/iterative/mock-ssh-server.git || true; python -m pip install -r tests/requirements.txt || true; python -m pip install -r test-requirements.txt || true; python -m pip install -e \".[tests,dev,all_remotes,all,testing]\";"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/func/test_data_cloud.py tests/func/test_get.py tests/func/test_ls.py tests/func/test_status.py tests/unit/command/test_status.py tests/unit/repo/test_repo.py tests/utils/asserts.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "modin-project__modin_0.24.0_0.24.1": {
+  "repo": "modin-project/modin",
+  "spec_version": "0.24",
+  "install": [
+   "python -m pip install 'numpy<2.0'; python -m pip install --upgrade Cython; python -m pip install -r requirements-dev.txt; python -m pip install -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA modin/experimental/core/execution/native/implementations/hdk_on_native/test/test_dataframe.py modin/test/storage_formats/pandas/test_internals.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "modin-project__modin_0.25.0_0.25.1": {
+  "repo": "modin-project/modin",
+  "spec_version": "0.25",
+  "install": [
+   "python -m pip install 'numpy<2.0'; python -m pip install --upgrade Cython; python -m pip install -r requirements-dev.txt; python -m pip install -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA modin/pandas/test/test_groupby.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "modin-project__modin_0.27.0_0.27.1": {
+  "repo": "modin-project/modin",
+  "spec_version": "0.27",
+  "install": [
+   "python -m pip install 'numpy<2.0'; python -m pip install --upgrade Cython; python -m pip install -r requirements-dev.txt; python -m pip install -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -n0 -rA modin/pandas/test/test_groupby.py",
+  "log_parser": "parse_log_pytest"
+ },
+ "psf__requests_v2.12.2_v2.12.3": {
+  "repo": "psf/requests",
+  "spec_version": "2.12",
+  "install": [
+   "python -m pip install ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/test_requests.py",
+  "log_parser": "parse_log_pytest_options"
+ },
+ "psf__requests_v2.27.0_v2.27.1": {
+  "repo": "psf/requests",
+  "spec_version": "2.27",
+  "install": [
+   "python -m pip install ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA tests/test_utils.py",
+  "log_parser": "parse_log_pytest_options"
+ },
+ "psf__requests_v2.4.0_v2.4.1": {
+  "repo": "psf/requests",
+  "spec_version": "2.4",
+  "install": [
+   "python -m pip install ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA test_requests.py",
+  "log_parser": "parse_log_pytest_options"
+ },
+ "psf__requests_v2.9.0_v2.9.1": {
+  "repo": "psf/requests",
+  "spec_version": "2.9",
+  "install": [
+   "python -m pip install ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA test_requests.py",
+  "log_parser": "parse_log_pytest_options"
+ },
+ "pydantic__pydantic_v2.6.0b1_v2.6.0": {
+  "repo": "pydantic/pydantic",
+  "spec_version": "2.6",
+  "install": [
+   "export PATH=\"$HOME/.local/bin:$PATH\"; pdm add pre-commit; make install;"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA --tb=short -vv -o console_output_style=classic --no-header tests/test_discriminated_union.py",
+  "log_parser": "parse_log_pytest_pydantic"
+ },
+ "pydantic__pydantic_v2.7.0_v2.7.1": {
+  "repo": "pydantic/pydantic",
+  "spec_version": "2.7",
+  "install": [
+   "export PATH=\"$HOME/.local/bin:$PATH\"; pdm add pre-commit; make install;"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA --tb=short -vv -o console_output_style=classic --no-header tests/test_construction.py tests/test_discriminated_union.py tests/test_json_schema.py tests/test_main.py tests/test_networks.py tests/test_root_model.py tests/test_types.py",
+  "log_parser": "parse_log_pytest_pydantic"
+ },
+ "pydantic__pydantic_v2.7.1_v2.7.2": {
+  "repo": "pydantic/pydantic",
+  "spec_version": "2.7",
+  "install": [
+   "export PATH=\"$HOME/.local/bin:$PATH\"; pdm add pre-commit; make install;"
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA --tb=short -vv -o console_output_style=classic --no-header",
+  "log_parser": "parse_log_pytest_pydantic"
+ },
+ "scikit-learn__scikit-learn_0.20.1_0.20.2": {
+  "repo": "scikit-learn/scikit-learn",
+  "spec_version": "0.20",
+  "install": [
+   "python -m pip install -v --no-use-pep517 --no-build-isolation -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA doc/testimonials/testimonials.rst sklearn/compose/tests/test_column_transformer.py sklearn/decomposition/tests/test_pca.py sklearn/linear_model/tests/test_logistic.py sklearn/metrics/tests/test_pairwise.py sklearn/model_selection/tests/test_split.py sklearn/neighbors/tests/test_dist_metrics.py sklearn/utils/testing.py sklearn/utils/tests/test_validation.py",
+  "log_parser": "parse_log_pytest_v2"
+ },
+ "scikit-learn__scikit-learn_0.21.1_0.21.2": {
+  "repo": "scikit-learn/scikit-learn",
+  "spec_version": "0.21",
+  "install": [
+   "python -m pip install -v --no-use-pep517 --no-build-isolation -e ."
+  ],
+  "eval_commands": [],
+  "hot_fix": [],
+  "test_cmd": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning -rA sklearn/cross_decomposition/tests/test_pls.py sklearn/decomposition/tests/test_fastica.py sklearn/linear_model/tests/test_least_angle.py sklearn/metrics/tests/test_pairwise.py sklearn/preprocessing/tests/test_encoders.py sklearn/utils/tests/test_sparsefuncs.py",
+  "log_parser": "parse_log_pytest_v2"
+ }
+}
