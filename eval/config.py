@@ -235,7 +235,7 @@ def build_plan(runs_path: str | Path, profile: str, overrides: dict | None = Non
         key = s.get("agent")
         if not key:
             raise ConfigError(f"profile {profile} 没有指定 agent")
-        agent = ({"import_path": "eval.agents.replay:PatchReplayAgent", "grade": "inline"}
+        agent = ({"import_path": "eval.agents.replay:PatchReplayAgent", "grade": "replay"}
                  if key == "replay" else resolve_agent(runs, key, overrides.get("model")))
         run_id = tmpl.format(profile=profile, agent=key, split=split, date=today)
         if overrides.get("run_id") and len(raw_steps) > 1:
