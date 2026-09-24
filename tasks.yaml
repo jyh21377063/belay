@@ -20,8 +20,8 @@ frozen_at: "2026-09-24"
 benchmarks:
   promax:
     name: SWE-Bench ProMax
-    data: ../benchmarks/promax/data/swe-bench-promax.json
-    eval_scripts: ../benchmarks/promax/data/eval.json
+    data: ../benchmarks/promax/swe-bench-promax.json
+    eval_scripts: ../benchmarks/promax/eval.json
     task_format: convert            # 需由 eval/convert/promax_to_harbor.py 转换
     image_template: "key4127/refactor-dockerhub:{id}"
     instruction_fields: [problem_statement]   # 不得包含 hints_text（由参考答案生成）
