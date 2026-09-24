@@ -20,8 +20,8 @@
 version: 1
 # 相对路径均相对于本文件所在目录（belay/）
 tasks_file: tasks.yaml
-task_dirs: build/tasks                # 由 python -m eval.prepare 生成，可随时重建（已 gitignore）
-results_root: results                 # 运行结果（已 gitignore）
+task_dirs: ../tasks                # 由 python -m eval.prepare 生成，可随时重建（已 gitignore）
+results_root: ../results                 # 运行结果（已 gitignore）
 
 defaults:
   benchmarks: all
