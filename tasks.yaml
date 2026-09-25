@@ -1,31 +1,34 @@
 # =====================================================================
-# 评测任务清单（冻结后不再修改；替换题目须在 replacements 中记录原因）
+# 评测任务清单（第 2 版）
 #
 # 结构：
-#   benchmarks:  各数据集的公共信息（数据位置、判分方式、给 agent 的输入字段）
-#   test:        评测集，按数据集分组。最终结果只来自这里
-#   dev:         调试集，按数据集分组。开发机制时使用，不进最终报告
-#   backups:     备选题，按顺序替换
-#   replacements:替换记录
+#   benchmarks:   各数据集的公共信息（数据位置、判分方式、给 agent 的输入字段）
+#   test:         正式集，按数据集分组。最终结果只来自这里
+#                 role: negative_control 为负对照（预期 runtime 无收益）
+#   dev:          调试集。开发机制时使用，不进最终报告
+#   backups:      备选题，按顺序替换
+#   replacements: 替换记录
+#   revisions:    选题修订记录
 #
-# 题目的完整标识为 "<benchmark>/<id>"，例如 promax/google__langextract-239
-# 转换后的任务目录统一为 belay/build/tasks/<benchmark>/<id>/（Pier / Harbor 格式），
-#   由 python -m eval.prepare 生成
-# 相对路径均相对于本文件所在目录（belay/）；原始数据集在与 belay/ 同级的 benchmarks/ 下
+# 题目的完整标识为 "<benchmark>/<id>"，例如 swe_evo/iterative__dvc_2.8.1_2.8.2
+# 转换后的任务目录统一为 <父目录>/tasks/<benchmark>/<id>/（Pier / Harbor 格式），由 python -m eval.prepare 生成
+# 相对路径均相对于本文件所在目录（belay/）；benchmarks/、tasks/、results/ 都与 belay/ 同级
+# 选题依据见 task_selection.md；SWE-EVO 全部 48 题的指标见 docs/sweevo_catalog.md
 # =====================================================================
 
-version: 1
-frozen_at: "2026-09-24"
+version: 2
+frozen_at: "2026-09-25"
 
 benchmarks:
   promax:
     name: SWE-Bench ProMax
     data: ../benchmarks/promax/swe-bench-promax.json
     eval_scripts: ../benchmarks/promax/eval.json
-    task_format: convert            # 需由 eval/convert/promax_to_harbor.py 转换
+    task_format: convert            # eval/convert/promax_to_harbor.py
     image_template: "key4127/refactor-dockerhub:{id}"
     instruction_fields: [problem_statement]   # 不得包含 hints_text（由参考答案生成）
     grading: all_tests_pass
+    grading_mode: replay            # 导出补丁，在全新容器中重放评分
 
   deepswe:
     name: DeepSWE
@@ -34,174 +37,182 @@ benchmarks:
     image_template: null            # 镜像写在各任务的 task.toml 中
     instruction_fields: [instruction.md]
     grading: functional_verifier
+    grading_mode: replay            # 重放时应用补丁后自动 commit（其 grader 只评已提交的改动）
 
   swe_evo:
     name: SWE-EVO
     data: ../benchmarks/SWE-EVO/hf_out/hf_jsonl/swe-evo.jsonl
-    task_format: convert            # 需由 eval/convert/sweevo_to_harbor.py 转换
+    task_format: convert            # eval/convert/sweevo_to_harbor.py
     image_template: null            # 各题镜像见下方 image 字段
     instruction_fields: [problem_statement]
     instruction_setting: release_note_only
     instruction_cleanup: [strip_urls]         # 删除 release notes 中的 PR / 文档链接
     repo_sanitize: single_commit              # 容器内仓库重建为单一提交，去除后续历史
     grading: all_tests_pass
+    grading_mode: replay
     extra_metrics: [fix_rate]
 
+  lhtb:
+    name: Long-Horizon Terminal-Bench
+    data: ../benchmarks/LHTB/tasks
+    source: https://github.com/zli12321/LHTB
+    commit: d78f5eb52ad754c5ee9154741af73130a85a65b8   # 2026-09-15；python -m eval.tools.fetch_lhtb 按此版本下载
+    task_format: native             # 原生 Harbor 格式；prepare 时关闭 continue_until_timeout、禁止联网
+    image_template: null            # task.toml 的 environment.docker_image（预构建镜像）
+    instruction_fields: [instruction.md]
+    grading: official_verifier      # 隐藏评分器，按产物重建后评分，reward ∈ [0, 1]
+    grading_mode: official          # 由 Pier 按题目配置评分（同容器或独立评分容器），不做补丁重放
+    solved_threshold: 0.95          # LHTB 口径：reward ≥ 0.95 视为解出
+
 # ---------------------------------------------------------------------
-# 评测集（22 道）
+# 正式集（16 道 = SWE-EVO 7 + ProMax 3 + LHTB 4 + 负对照 2）
+# stats：files 参考解改动文件数；code 其中代码文件数；items release notes 条目数；
+#        est_min 按调试集实测比例估算的 Claude Code 用时（见 task_selection.md 4.3）
 # ---------------------------------------------------------------------
 test:
-  promax:
-    - id: google__langextract-239
-      lang: python
-      repo: google/langextract
-      stats: {src_files: 19, loc: 1728, top_dirs: 10}
-    - id: stanfordnlp__dspy-9193
-      lang: python
-      repo: stanfordnlp/dspy
-      stats: {src_files: 13, loc: 1829, top_dirs: 6}
-    - id: OpenListTeam__OpenList-1001
-      lang: go
-      repo: OpenListTeam/OpenList
-      stats: {src_files: 46, loc: 850, top_dirs: 37}
-    - id: go-gitea__gitea-35775
-      lang: go
-      repo: go-gitea/gitea
-      stats: {src_files: 24, loc: 1356, top_dirs: 5}
-    - id: ant-design__ant-design-53739
-      lang: typescript
-      repo: ant-design/ant-design
-      stats: {src_files: 22, loc: 234, top_dirs: 13}
-    - id: nacos__alibaba-13142
-      lang: java
-      repo: alibaba/nacos
-      stats: {src_files: 46, loc: 889, top_dirs: 7}
-    - id: nasa__fprime-3642
-      lang: cpp
-      repo: nasa/fprime
-      stats: {src_files: 32, loc: 1575, top_dirs: 24}
-    - id: tracel-ai__burn-4337
-      lang: rust
-      repo: tracel-ai/burn
-      stats: {src_files: 49, loc: 1954, top_dirs: 12}
-
-  deepswe:
-    - id: scriggo-method-declarations
-      lang: go
-      repo: open2b/scriggo
-      stats: {files: 18, loc: 872}
-    - id: arcane-drift-detection-baselines
-      lang: go
-      repo: getarcaneapp/arcane
-      stats: {files: 14, loc: 1086}
-    - id: participle-grammar-conflict-analysis
-      lang: go
-      repo: alecthomas/participle
-      stats: {files: 14, loc: 767}
-    - id: testem-bail-on-test-failure
-      lang: javascript
-      repo: testem/testem
-      stats: {files: 18, loc: 616}
-    - id: yjs-map-conflict-detection
-      lang: javascript
-      repo: yjs/yjs
-      stats: {files: 8, loc: 656}
-    - id: python-statemachine-state-data-scoping
-      lang: python
-      repo: fgmacedo/python-statemachine
-      stats: {files: 17, loc: 554}
-    - id: narwhals-rolling-window-suite
-      lang: python
-      repo: narwhals-dev/narwhals
-      stats: {files: 11, loc: 816}
-    - id: sqlfmt-create-table-ddl-formatting
-      lang: python
-      repo: tconbeer/sqlfmt
-      stats: {files: 10, loc: 757}
-    - id: wasmi-trap-coredumps
-      lang: rust
-      repo: wasmi-labs/wasmi
-      stats: {files: 11, loc: 645}
-    - id: boa-hierarchical-evaluation-cancellation
-      lang: rust
-      repo: boa-dev/boa
-      stats: {files: 7, loc: 575}
-    - id: dynamodb-toolbox-conditional-attribute-requirements
-      lang: typescript
-      repo: dynamodb-toolbox/dynamodb-toolbox
-      stats: {files: 36, loc: 669}
-    - id: valibot-recursive-schema-composition
-      lang: typescript
-      repo: open-circle/valibot
-      stats: {files: 22, loc: 837}
-
   swe_evo:
+    - id: iterative__dvc_1.0.0a1_1.0.0a2
+      lang: python
+      repo: iterative/dvc
+      image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-3760
+      stats: {files: 107, code: 105, items: 34, f2p: 68, f2p_files: 18, p2p: 242, est_min: 109}
+    - id: conan-io__conan_2.0.14_2.0.15
+      lang: python
+      repo: conan-io/conan
+      image: xingyaoww/sweb.eval.x86_64.conan-io_s_conan-15109
+      stats: {files: 78, code: 77, items: 43, f2p: 72, f2p_files: 5, p2p: 649, est_min: 80}
+    - id: iterative__dvc_2.8.1_2.8.2
+      lang: python
+      repo: iterative/dvc
+      image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-6550
+      stats: {files: 79, code: 69, items: 30, f2p: 133, f2p_files: 28, p2p: 662, est_min: 71}
     - id: iterative__dvc_0.52.1_0.53.1
       lang: python
       repo: iterative/dvc
       image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-2275
-      stats: {files: 42, f2p: 132}
+      stats: {files: 42, code: 41, items: 12, f2p: 132, f2p_files: 13, p2p: 0, est_min: 42}
+    - id: dask__dask_2023.3.2_2023.4.0
+      lang: python
+      repo: dask/dask
+      image: xingyaoww/sweb.eval.x86_64.dask_s_dask-10042
+      stats: {files: 69, code: 36, items: 39, f2p: 61, f2p_files: 8, p2p: 6246, est_min: 37}
+    - id: dask__dask_2022.9.2_2022.10.0
+      lang: python
+      repo: dask/dask
+      image: xingyaoww/sweb.eval.x86_64.dask_s_dask-9531
+      stats: {files: 50, code: 28, items: 25, f2p: 44, f2p_files: 8, p2p: 2861, est_min: 29}
     - id: dask__dask_2023.6.0_2023.6.1
       lang: python
       repo: dask/dask
       image: xingyaoww/sweb.eval.x86_64.dask_s_dask-10342
-      stats: {files: 33, f2p: 105}
+      stats: {files: 33, code: 22, items: 21, f2p: 105, f2p_files: 8, p2p: 3415, est_min: 23}
 
-# ---------------------------------------------------------------------
-# 调试集（5 道）
-# ---------------------------------------------------------------------
-dev:
   promax:
-    - id: TecharoHQ__anubis-1308
+    - id: OpenListTeam__OpenList-1001
       lang: go
-      repo: TecharoHQ/anubis
-      stats: {src_files: 16, loc: 1451, top_dirs: 9}
+      repo: OpenListTeam/OpenList
+      stats: {src_files: 46, loc: 850, top_dirs: 37}
+    - id: nacos__alibaba-13142
+      lang: java
+      repo: alibaba/nacos
+      stats: {src_files: 46, loc: 889, top_dirs: 7}
+    - id: tracel-ai__burn-4337
+      lang: rust
+      repo: tracel-ai/burn
+      stats: {src_files: 49, loc: 1954, top_dirs: 12}
     - id: roboflow__supervision-1943
       lang: python
       repo: roboflow/supervision
+      role: negative_control        # pilot 中 Claude Code 5.5 / 10.9 min 解出
       stats: {src_files: 11, loc: 861, top_dirs: 7}
 
   deepswe:
-    - id: wazero-multi-module-snapshots
-      lang: go
-      repo: wazero/wazero
-      stats: {files: 14, loc: 555}
     - id: koota-query-predicates
       lang: typescript
       repo: pmndrs/koota
+      role: negative_control        # pilot 中 Claude Code 16.9 min 解出
       stats: {files: 17, loc: 877}
 
+  lhtb:
+    - id: commit0-multilib-tdd
+      lang: python
+      scoring: proportional         # 784 个隐藏测试，按通过比例计分
+      stats: {expert_min: 480, junior_min: 1200, cpus: 2, memory_mb: 4096}
+    - id: langchain-version-migration
+      lang: python
+      scoring: binary               # 部分完成不计分；独立评分容器
+      stats: {expert_min: 120, junior_min: 360, cpus: 2, memory_mb: 4096}
+    - id: duckdb-optimizer-closure
+      lang: cpp
+      scoring: correctness_gated    # 任一查询错误即 0 分，否则按性能计分
+      stats: {expert_min: 300, junior_min: 720, cpus: 4, memory_mb: 8192}
+    - id: riscv-core-debug
+      lang: systemverilog
+      scoring: proportional         # 数量未知的注入 bug
+      stats: {expert_min: 360, junior_min: 720, cpus: 4, memory_mb: 8192}
+
+# ---------------------------------------------------------------------
+# 调试集（3 道）
+# ---------------------------------------------------------------------
+dev:
   swe_evo:
     - id: conan-io__conan_2.0.2_2.0.3
       lang: python
       repo: conan-io/conan
       image: xingyaoww/sweb.eval.x86_64.conan-io_s_conan-13450
-      stats: {files: 48, f2p: 8}
+      stats: {files: 48, code: 44, items: 22, f2p: 8, f2p_files: 3, p2p: 317, est_min: 46}
+    - id: pydantic__pydantic_v2.7.0_v2.7.1
+      lang: python
+      repo: pydantic/pydantic
+      image: xingyaoww/sweb.eval.x86_64.pydantic_s_pydantic-9214
+      stats: {files: 19, code: 11, items: 23, f2p: 234, f2p_files: 6, p2p: 1477, est_min: 11}
+
+  lhtb:
+    - id: unknown-config-semantics
+      lang: python
+      scoring: proportional
+      stats: {expert_min: 95, junior_min: 260, cpus: 2, memory_mb: 4096}
 
 # ---------------------------------------------------------------------
-# 备选题（按列表顺序使用；key 为被替换题的语言）
+# 备选题（按列表顺序使用）
 # ---------------------------------------------------------------------
 backups:
-  promax:
-    cpp:        [LMMS__lmms-7454]
-    rust:       [astral-sh__ruff-20221]
-    go:         [gitleaks__gitleaks-1831]
-    python:     [confident-ai__deepeval-c_08844c8]
-    java:       [plantuml__plantuml-c_15fa06c]
-    typescript: [ant-design__ant-design-52470]
-  deepswe:
-    go:         [expr-try-catch-errors, helm-unified-manifest-stream]
-    python:     [bandit-interprocedural-taint-checks]
-    typescript: [drizzle-orm-window-function-builders]
-    javascript: [drizzle-orm-window-function-builders]
   swe_evo:
     any:
+      - id: iterative__dvc_1.10.2_1.11.0        # 若不希望 conan 同时出现在调试集与正式集，用它替换 conan_2.0.14
+        image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-4961
+      - id: iterative__dvc_2.5.0_2.5.1
+        image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-6273
       - id: iterative__dvc_3.43.1_3.44.0
         image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-10277
+  promax:
+    cpp:        [nasa__fprime-3642, LMMS__lmms-7454]
+    go:         [go-gitea__gitea-35775, gitleaks__gitleaks-1831]
+    java:       [plantuml__plantuml-c_15fa06c]
+    rust:       [astral-sh__ruff-20221]
+  lhtb:
+    any: [vector-db-iterative-build, nbody-accel-iterative, spot-scheduler-traces, great-expectations-audit]
 
 # ---------------------------------------------------------------------
-# 替换记录（示例格式，初始为空）
-#   - {split: test, benchmark: promax, removed: nasa__fprime-3642,
-#      added: LMMS__lmms-7454, reason: "oracle 第二次运行失败", date: "2026-09-25"}
+# 替换记录（格式示例）
+#   - {split: test, benchmark: lhtb, removed: riscv-core-debug,
+#      added: vector-db-iterative-build, reason: "oracle 第二次运行失败", date: "2026-09-26"}
 # ---------------------------------------------------------------------
 replacements: []
+
+# ---------------------------------------------------------------------
+# 选题修订记录
+# ---------------------------------------------------------------------
+revisions:
+  - version: 1
+    date: "2026-09-24"
+    summary: "ProMax 8 + DeepSWE 12 + SWE-EVO 2 = 22 道评测题；调试 5 道"
+  - version: 2
+    date: "2026-09-25"
+    summary: >-
+      依据 pilot（Claude Code 在 11–17 分钟内解出 ProMax / DeepSWE 的中等题）与 Belay v3 方案重选：
+      正式集 16 道（SWE-EVO 7、ProMax 3、LHTB 4、负对照 2），调试集 3 道，统一 90 分钟预算。
+      删除 DeepSWE 全部正式题与 ProMax 5 道较小的题；SWE-EVO 去掉"改动文件 ≤ 60"的上限，
+      加入规模最大的 dvc_1.0.0a1、conan_2.0.14、dvc_2.8.1 等；新增 LHTB。
+      原 v3 方案中 modin / requests / scikit-learn 各 1 道的安排不可行（均不满足 F2P ≥ 5），已取消。
+      koota、supervision 由调试集改为正式集中的负对照。

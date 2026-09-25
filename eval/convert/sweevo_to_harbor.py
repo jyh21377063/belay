@@ -29,7 +29,7 @@ from pathlib import Path
 
 REPO_DIR = "/testbed"
 SPECS_FILE = Path(__file__).with_name("sweevo_specs.json")
-SUPPORTED_PARSERS = {"parse_log_pytest"}
+SUPPORTED_PARSERS = {"parse_log_pytest", "parse_log_pytest_pydantic"}
 
 
 # ---------------------------------------------------------------- 读取数据
@@ -136,19 +136,20 @@ if [ "$applied" = 1 ]; then
   echo ">>>>> End Test Output" >> "$LOG"
 fi
 
-python /tests/grade.py "$LOG" /tests/tests.json "$applied" /logs/verifier/reward.json
+python /tests/grade.py "$LOG" /tests/tests.json "$applied" /logs/verifier/reward.json {spec['log_parser']}
 exit 0
 """
 
 
 GRADE_PY = r'''"""判分：逐项复刻 SWE-EVO 官方实现（兼容 Python 3.6+）。
 
-- 解析：swebench/harness/log_parsers/python_swegym.py::parse_log_pytest
+- 解析：swebench/harness/log_parsers 中的 parse_log_pytest / parse_log_pytest_pydantic
 - 单个测试：PASSED / XFAIL 为成功；缺失或 FAILED / ERROR 为失败；其余（如 SKIPPED）两边都不计
 - resolved：F2P 与 P2P 的成功率都为 1（空列表视为 1）
 - fix_rate：P2P 无失败时为 F2P 成功率，否则为 0（SWE-EVO/SWE-bench/evaluate_instance.py）
 """
 import json
+import re
 import sys
 
 STATUSES = ("FAILED", "PASSED", "SKIPPED", "ERROR", "XFAIL")
@@ -168,6 +169,29 @@ def parse_log_pytest(log):
     return status
 
 
+def parse_log_pytest_pydantic(log):
+    status = {}
+    escapes = "".join(chr(c) for c in range(1, 32))
+    table = str.maketrans("", "", escapes)
+    for line in log.split("\n"):
+        line = re.sub(r"\[(\d+)m", "", line).translate(table)
+        line = re.sub(r"FAILED\s*\[.*?\]", "FAILED", line)
+        if any(line.startswith(s) for s in STATUSES):
+            if line.startswith("FAILED"):
+                line = line.replace(" - ", " ")
+            parts = line.split()
+            if len(parts) > 1:
+                status[parts[1]] = parts[0]
+        elif any(line.endswith(s) for s in STATUSES):
+            parts = line.split()
+            if len(parts) > 1:
+                status[parts[0]] = parts[1]
+    return status
+
+
+PARSERS = {"parse_log_pytest": parse_log_pytest, "parse_log_pytest_pydantic": parse_log_pytest_pydantic}
+
+
 def split(tests, sm):
     ok, bad = 0, 0
     for t in tests:
@@ -182,14 +206,14 @@ def rate(ok, bad):
     return 1.0 if ok + bad == 0 else ok / (ok + bad)
 
 
-def main(log_path, tests_path, applied, out_path):
+def main(log_path, tests_path, applied, out_path, parser="parse_log_pytest"):
     tests = json.load(open(tests_path))
     log = open(log_path, errors="replace").read()
     reward = {"resolved": 0, "reward": 0, "fix_rate": 0.0, "test_patch_applied": int(applied),
               "f2p_success": 0, "f2p_failure": len(tests["FAIL_TO_PASS"]),
               "p2p_success": 0, "p2p_failure": len(tests["PASS_TO_PASS"])}
     if applied == "1" and START in log and END in log:
-        sm = parse_log_pytest(log.split(START)[1].split(END)[0])
+        sm = PARSERS[parser](log.split(START)[1].split(END)[0])
         f_ok, f_bad = split(tests["FAIL_TO_PASS"], sm)
         p_ok, p_bad = split(tests["PASS_TO_PASS"], sm)
         resolved = int(rate(f_ok, f_bad) == 1 and rate(p_ok, p_bad) == 1)
@@ -201,7 +225,7 @@ def main(log_path, tests_path, applied, out_path):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:5])
+    main(*sys.argv[1:6])
 '''
 
 SOLVE_SH = f"""#!/bin/bash

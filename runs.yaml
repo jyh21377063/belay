@@ -27,8 +27,8 @@ defaults:
   benchmarks: all
   tasks: all
   repeats: 1
-  concurrency: 2              # 8 vCPU / 32 GiB 下建议 ≤ 2
-  timeout_min: 180            # 单次 agent 运行的墙钟上限（覆盖 task.toml 中的 agent 超时）
+  concurrency: 2              # 8 vCPU / 32 GiB 下建议 ≤ 2；LHTB 的 duckdb、riscv 各需 4 核 8 GB
+  timeout_min: 90             # 每题统一的 agent 预算（覆盖 task.toml 中的 agent 超时，含 LHTB 原本 1–6 h 的设置）
   environment: docker
   grading:
     inline_verify: true       # agent 结束后在原容器里也跑一次 verifier，用于和重放结果对账
@@ -99,43 +99,48 @@ agents:
 # ---------------------------------------------------------------------
 profiles:
 
-  gold-check:                 # 参考解两次通过 + 空补丁失败
+  gold-check:                 # 参考解两次通过 + 空补丁失败；不调用模型
     split: dev                # 验证评测集：--split test
     steps:
       - {agent: oracle, repeats: 2, expect: pass}
       - {agent: nop,    repeats: 1, expect: fail}
-    concurrency: 4
+    concurrency: 2            # 评测集含 Rust / C++ 完整编译，并发不宜过高
     grading: {inline_verify: true}
 
-  cc-pilot:                   # Claude Code 试跑：摸清耗时与 token
+  cc-pilot:                   # Claude Code 试跑（调试集）：保留容器、原容器与重放双重评分，便于排查
     split: dev
     agent: claude-code
     repeats: 1
     concurrency: 1
     keep_containers: true
 
-  cc-test:
+  # 正式评测：每题先跑 1 次；需要第 2 次时用同一 run_id 加 --repeats 2 补跑。
+  # 流程已验证，只做重放评分（正式成绩），不再在原容器重复评分。
+  cc-test:                    # A 组
     split: test
     agent: claude-code
-    repeats: 2
+    repeats: 1
+    grading: {inline_verify: false}
 
-  flat-test:
+  flat-test:                  # B 组
     split: test
     agent: flat
-    repeats: 2
+    repeats: 1
+    grading: {inline_verify: false}
 
-  belay-dev:
+  belay-dev:                  # C 组调试
     split: dev
     agent: belay
     repeats: 1
     keep_containers: true
 
-  belay-test:
+  belay-test:                 # C 组正式评测（D 组改 agents.belay.kwargs.workers）
     split: test
     agent: belay
-    repeats: 2
+    repeats: 1
+    grading: {inline_verify: false}
 
-  regrade:                    # 对已有补丁重新评分，不调用模型
+  regrade:                    # 对已有补丁重新评分，不调用模型；调试集结果需加 --split dev
     split: test
     grading_only: true
-    source_run: "<run_id>"    # 或 --source-run 指定
+    source_run: "<run_id>"    # 用 --source-run 指定

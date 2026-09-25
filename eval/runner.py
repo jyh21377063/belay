@@ -32,6 +32,26 @@ def log(msg: str) -> None:
         print(msg, flush=True)
 
 
+def code_version() -> dict:
+    """记录本次运行所用的代码版本与 Pier 版本，便于复现。"""
+    import importlib.metadata
+    import subprocess
+    info: dict = {}
+    try:
+        root = pb.PROJECT_ROOT
+        info["code_commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
+                                             capture_output=True, text=True).stdout.strip() or None
+        info["code_dirty"] = bool(subprocess.run(["git", "status", "--porcelain"], cwd=root,
+                                                 capture_output=True, text=True).stdout.strip())
+    except OSError:
+        pass
+    try:
+        info["pier_version"] = importlib.metadata.version("datacurve-pier")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    return info
+
+
 def read_json(p: Path) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
@@ -77,15 +97,24 @@ def preflight(plan: RunPlan) -> list[str]:
 
 
 # ---------------------------------------------------------------- 两个阶段
+def trial_grade_mode(plan: RunPlan, step: Step, t: TaskRef) -> str:
+    """inline：用 agent 阶段的评分结果（oracle / nop，或数据集要求官方评分）；replay：全新容器重放补丁。"""
+    if step.grade_mode == "inline" or plan.task_grading(t) == "official":
+        return "inline"
+    return "replay"
+
+
 def agent_phase(plan: RunPlan, step: Step, t: TaskRef, d: Path) -> dict:
-    verify_inline = plan.inline_verify or step.grade_mode == "inline"
+    mode = trial_grade_mode(plan, step, t)
+    verify_inline = plan.inline_verify or mode == "inline"
     cfg = pb.job_config(job_name="agent", jobs_dir=d / "pier", task_dir=plan.task_dir(t),
                         agent_cfg=pb.agent_config(step.agent, plan.timeout_min),
                         environment=plan.environment, keep_container=plan.keep_containers,
                         verify=verify_inline)
+    # 预算之外还要留出：拉取 / 构建镜像（可达 1 h）与评分（LHTB 可达 1.5 h）
     out = pb.run_job(cfg, d / "agent_job.yaml", d / "agent_pier.log",
-                     timeout_sec=plan.timeout_min * 60 + 3600)
-    rec: dict = {"task": t.key, "agent": step.agent_key, "model": step.agent.get("model"),
+                     timeout_sec=plan.timeout_min * 60 + 3 * 3600)
+    rec: dict = {"task": t.key, "agent": step.agent_key, "model": step.agent.get("model"), "grade_mode": mode,
                  "pier_rc": out.returncode, "pier_trial_dir": str(out.trial_dir or "")}
     if not out.ok:
         rec.update(status="error", error=f"Pier 没有产出 trial 结果，见 {out.log_path}")
@@ -93,20 +122,22 @@ def agent_phase(plan: RunPlan, step: Step, t: TaskRef, d: Path) -> dict:
 
     s = pb.summarize_result(out.result)
     rec.update(s)
-    rec["inline_resolved"], rec["inline_fix_rate"] = pb.interpret_rewards(s["rewards"])
+    rec["inline_resolved"], rec["inline_fix_rate"], rec["inline_score"] = pb.interpret_rewards(
+        s["rewards"], plan.solved_threshold(t))
 
-    if step.grade_mode == "replay":
-        src = out.trial_dir / "agent" / "patch.diff"
-        if not src.exists():
-            rec.update(status="error", error="agent 没有导出 patch.diff（自定义 agent 需继承 PatchCaptureMixin）")
-            return rec
+    src = out.trial_dir / "agent" / "patch.diff"
+    if src.exists():                        # 官方评分的题目补丁可选（工作目录可能不是 git 仓库）
         shutil.copy(src, d / "patch.diff")
         rec.update(patch_stats(d / "patch.diff"))
+    elif mode == "replay":
+        rec.update(status="error", error="agent 没有导出 patch.diff（自定义 agent 需继承 PatchCaptureMixin）")
+        return rec
     rec["status"] = "done"
     return rec
 
 
 def grade_phase(plan: RunPlan, t: TaskRef, d: Path, patch: Path) -> dict:
+    """仅用于 replay 评分的数据集。"""
     cfg = pb.job_config(job_name="grade", jobs_dir=d / "pier", task_dir=plan.task_dir(t),
                         agent_cfg={"import_path": pb.REPLAY_AGENT,
                                    "kwargs": {"patch_path": str(patch.resolve()),
@@ -118,9 +149,9 @@ def grade_phase(plan: RunPlan, t: TaskRef, d: Path, patch: Path) -> dict:
     s = pb.summarize_result(out.result)
     if not s["rewards"]:
         return {"status": "error", "error": f"verifier 没有给出 reward（{s['exception']}），见 {out.trial_dir}"}
-    resolved, fix = pb.interpret_rewards(s["rewards"])
+    resolved, fix, score = pb.interpret_rewards(s["rewards"], plan.solved_threshold(t))
     apply = read_json(out.trial_dir / "agent" / "apply.json")
-    return {"status": "done", "resolved": resolved, "fix_rate": fix, "rewards": s["rewards"],
+    return {"status": "done", "resolved": resolved, "fix_rate": fix, "score": score, "rewards": s["rewards"],
             "apply_ok": apply.get("ok"), "apply_method": apply.get("method"),
             "committed": apply.get("committed"),
             "verify_sec": s["total_sec"]}
@@ -146,7 +177,8 @@ def run_trial(plan: RunPlan, step: Step, t: TaskRef, repeat: int) -> dict:
         write_json(run_path, rec)
 
     grade = read_json(grade_path)
-    if step.grade_mode == "replay" and rec.get("status") == "done" and grade.get("status") != "done":
+    mode = rec.get("grade_mode") or trial_grade_mode(plan, step, t)
+    if mode == "replay" and rec.get("status") == "done" and grade.get("status") != "done":
         log(f"  ▶ {t.key} #{repeat} 重放评分")
         grade = grade_phase(plan, t, d, d / "patch.diff")
         write_json(grade_path, grade)
@@ -154,7 +186,8 @@ def run_trial(plan: RunPlan, step: Step, t: TaskRef, repeat: int) -> dict:
 
 
 def final_resolved(step: Step, rec: dict) -> bool | None:
-    return rec.get("grade", {}).get("resolved") if step.grade_mode == "replay" else rec.get("inline_resolved")
+    mode = rec.get("grade_mode") or step.grade_mode
+    return rec.get("grade", {}).get("resolved") if mode == "replay" else rec.get("inline_resolved")
 
 
 # ---------------------------------------------------------------- 主流程
@@ -167,7 +200,7 @@ def execute(plan: RunPlan) -> bool:
             "profile": plan.profile, "split": plan.split, "agent_key": step.agent_key,
             "agent": {k: v for k, v in step.agent.items() if k != "env"},
             "env_keys": sorted((step.agent.get("env") or {})), "repeats": step.repeats,
-            "timeout_min": plan.timeout_min, "tasks": [t.key for t in plan.tasks]})
+            "timeout_min": plan.timeout_min, "tasks": [t.key for t in plan.tasks], **code_version()})
 
         if plan.grading_only:     # 重新评分：源 run 里有几次就评几次
             jobs = [(t, int(d.name)) for t in plan.tasks

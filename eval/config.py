@@ -65,6 +65,14 @@ class RunPlan:
     results_root: Path
     grading_only: bool = False
     source_run: str | None = None
+    bench_cfg: dict = None          # tasks.yaml 中的 benchmarks 段
+
+    def task_grading(self, t: TaskRef) -> str:
+        """replay：导出补丁、全新容器重放评分；official：按题目自身配置由 Pier 评分（LHTB）。"""
+        return ((self.bench_cfg or {}).get(t.benchmark) or {}).get("grading_mode", "replay")
+
+    def solved_threshold(self, t: TaskRef) -> float:
+        return float(((self.bench_cfg or {}).get(t.benchmark) or {}).get("solved_threshold", 1.0))
 
     def task_dir(self, t: TaskRef) -> Path:
         return self.task_dirs / t.benchmark / t.id
@@ -259,6 +267,7 @@ def build_plan(runs_path: str | Path, profile: str, overrides: dict | None = Non
         results_root=resolve_path(base, cfg.get("results_root") or runs["results_root"]),
         grading_only=bool(cfg.get("grading_only", False)),
         source_run=cfg.get("source_run"),
+        bench_cfg=tasks_yaml.get("benchmarks") or {},
     )
 
 

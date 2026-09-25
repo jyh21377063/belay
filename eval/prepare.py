@@ -4,8 +4,9 @@
   python -m eval.prepare --split dev --benchmarks deepswe
   python -m eval.prepare --split test --force        # 覆盖已存在的目录
 
-DeepSWE 是原生 Harbor 格式，直接复制；ProMax / SWE-EVO 调用各自的转换器（待实现）。
+DeepSWE、LHTB 是原生 Harbor 格式，直接复制；ProMax / SWE-EVO 调用各自的转换器。
 所有任务统一强制 [environment] allow_internet = false：Pier 只会放行 agent 声明的模型 API。
+LHTB 另外关闭 continue_until_timeout（它相当于用隐藏评分器当裁判，只允许在上界对照组中开启）。
 """
 from __future__ import annotations
 
@@ -46,6 +47,15 @@ def force_no_internet(toml_path: Path) -> None:
     assert env.get("allow_internet") is False, toml_path
 
 
+def disable_continue_until_timeout(toml_path: Path) -> None:
+    text = toml_path.read_text()
+    new = re.sub(r"(?m)^(\s*continue_until_timeout\s*=\s*)true\b", r"\1false", text)
+    if new != text:
+        toml_path.write_text(new)
+    agent = tomllib.loads(new).get("agent", {})
+    assert agent.get("continue_until_timeout", False) is False, toml_path
+
+
 def prepare_one(bm: str, tid: str, bench_cfg: dict, entry: dict, dst: Path) -> str:
     if bench_cfg.get("task_format") == "native":
         src = Path(bench_cfg["data"]) / tid
@@ -60,6 +70,7 @@ def prepare_one(bm: str, tid: str, bench_cfg: dict, entry: dict, dst: Path) -> s
         dst.mkdir(parents=True)
         mod.convert(tid, bench_cfg, entry, dst)
     force_no_internet(dst / "task.toml")
+    disable_continue_until_timeout(dst / "task.toml")
     return "ok"
 
 
@@ -76,7 +87,7 @@ def main(argv=None) -> int:
     runs = load_yaml(runs_path)
     tasks_yaml = load_tasks_yaml(resolve_path(runs_path.parent, runs["tasks_file"]))
     root = resolve_path(runs_path.parent, runs["task_dirs"])
-    entries = {(bm, e["id"]): e for bm, lst in (tasks_yaml.get(a.split) or {}).items() for e in lst}
+    entries = {(bm, e["id"]): e for bm, lst in (tasks_yaml.get(a.split) or {}).items() for e in (lst or [])}
 
     for t in select_tasks(tasks_yaml, a.split, a.benchmarks, a.tasks):
         dst = root / t.benchmark / t.id

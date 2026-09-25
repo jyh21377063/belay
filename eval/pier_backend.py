@@ -137,10 +137,15 @@ def summarize_result(r: dict) -> dict:
     }
 
 
-def interpret_rewards(rewards: dict | None) -> tuple[bool | None, float | None]:
-    """约定：verifier 写 reward.json，含 resolved（或 Harbor 默认的 reward）和可选的 fix_rate。"""
+def interpret_rewards(rewards: dict | None, threshold: float = 1.0) -> tuple[bool | None, float | None, float | None]:
+    """返回 (resolved, fix_rate, score)。
+
+    约定：verifier 写 reward.json / reward.txt，含 resolved 或 Harbor 默认的 reward，可选 fix_rate。
+    score 为连续分数（LHTB 的 reward 在 0–1 之间）；resolved = score ≥ threshold（LHTB 取 0.95）。
+    """
     if not rewards:
-        return None, None
-    resolved = rewards.get("resolved", rewards.get("reward"))
+        return None, None, None
+    raw = rewards.get("resolved", rewards.get("reward"))
+    score = None if rewards.get("reward") is None else float(rewards["reward"])
     fix = rewards.get("fix_rate")
-    return (None if resolved is None else float(resolved) >= 1.0), (None if fix is None else float(fix))
+    return (None if raw is None else float(raw) >= threshold), (None if fix is None else float(fix)), score
