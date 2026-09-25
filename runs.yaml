@@ -74,11 +74,11 @@ agents:
       # node_mirror: https://npmmirror.com/mirrors/node
       # npm_registry: https://registry.npmmirror.com
       # repo_dir: /testbed              # 仅当容器工作目录不在仓库内时需要
-    pricing:                            # 用于汇总表估算成本；按 DeepSeek 官网价格填写（每百万 token），留空则不估算
-      currency: CNY
-      input_miss_per_m: null            # 输入（缓存未命中）
-      input_hit_per_m: null             # 输入（缓存命中）
-      output_per_m: null                # 输出
+    pricing:                            # 汇总表估算成本用（元 / 百万 tokens）；按高峰价，即成本上限
+      currency: CNY                     # 空闲时段单价减半：0.02 / 1 / 4，成本也减半
+      input_hit_per_m: 0.04             # 输入（缓存命中）
+      input_miss_per_m: 2               # 输入（缓存未命中）
+      output_per_m: 8                   # 输出
 
   flat:                       # B 组：自研执行器，单循环，无任务图
     import_path: "eval.agents.flat_agent:FlatAgent"
