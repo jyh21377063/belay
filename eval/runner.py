@@ -23,6 +23,9 @@ from eval.config import RunPlan, Step, TaskRef
 
 _print_lock = threading.Lock()
 
+# 这些数据集的评分脚本只评"已提交"的内容，重放时应用补丁后需要 commit（与其 solve.sh 一致）
+COMMIT_SUBMISSION = {"deepswe"}
+
 
 def log(msg: str) -> None:
     with _print_lock:
@@ -106,7 +109,8 @@ def agent_phase(plan: RunPlan, step: Step, t: TaskRef, d: Path) -> dict:
 def grade_phase(plan: RunPlan, t: TaskRef, d: Path, patch: Path) -> dict:
     cfg = pb.job_config(job_name="grade", jobs_dir=d / "pier", task_dir=plan.task_dir(t),
                         agent_cfg={"import_path": pb.REPLAY_AGENT,
-                                   "kwargs": {"patch_path": str(patch.resolve())}},
+                                   "kwargs": {"patch_path": str(patch.resolve()),
+                                              "commit": t.benchmark in COMMIT_SUBMISSION}},
                         environment=plan.environment, keep_container=False, verify=True)
     out = pb.run_job(cfg, d / "grade_job.yaml", d / "grade_pier.log", timeout_sec=3 * 3600)
     if not out.ok:
@@ -118,6 +122,7 @@ def grade_phase(plan: RunPlan, t: TaskRef, d: Path, patch: Path) -> dict:
     apply = read_json(out.trial_dir / "agent" / "apply.json")
     return {"status": "done", "resolved": resolved, "fix_rate": fix, "rewards": s["rewards"],
             "apply_ok": apply.get("ok"), "apply_method": apply.get("method"),
+            "committed": apply.get("committed"),
             "verify_sec": s["total_sec"]}
 
 
