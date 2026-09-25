@@ -94,6 +94,11 @@ def _median(xs):
     return round(statistics.median(xs), 1) if xs else None
 
 
+def _d(v):
+    """None 显示为 —；0 照常显示。"""
+    return "—" if v is None else v
+
+
 def write(root: Path, rows: list[dict]) -> None:
     with open(root / "summary.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
@@ -114,10 +119,10 @@ def write(root: Path, rows: list[dict]) -> None:
         ok = sum(1 for r in rs if r["resolved"] is True)
         bad = sum(1 for r in rs if r["resolved"] is None)
         total_min = [((r["trial_min"] or 0) + (r["grade_min"] or 0)) or None for r in rs]
-        lines.append(f"| {bm} | {n} | {ok} | {ok / n:.0%} | {_mean(r['fix_rate'] for r in rs) or '—'} | "
-                     f"{_median(r['agent_min'] for r in rs) or '—'} | {_median(total_min) or '—'} | "
-                     f"{_mean(r['n_agent_steps'] for r in rs) or '—'} | {_mean(r['cache_hit_rate'] for r in rs) or '—'} | "
-                     f"{_mean(r['cost_est'] for r in rs) or '—'} | {bad} |")
+        lines.append(f"| {bm} | {n} | {ok} | {ok / n:.0%} | {_d(_mean(r['fix_rate'] for r in rs))} | "
+                     f"{_d(_median(r['agent_min'] for r in rs))} | {_d(_median(total_min))} | "
+                     f"{_d(_mean(r['n_agent_steps'] for r in rs))} | {_d(_mean(r['cache_hit_rate'] for r in rs))} | "
+                     f"{_d(_mean(r['cost_est'] for r in rs))} | {bad} |")
 
     lines += ["", "| 题目 | # | 结果 | Fix Rate | agent(min) | 总耗时(min) | 轮数 | 输入 / 缓存命中 / 输出 token | 成本 | "
               "补丁文件数（其中测试） | 异常 | 备注 |",
