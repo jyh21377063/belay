@@ -47,12 +47,21 @@ EDIT_BASH_RE = re.compile(r"(sed -i|perl -pi|\btee\b|(^|[^>2&])>\s*[\w./-]+\.\w+
 GIT_WRITE_RE = re.compile(r"\bgit (add|commit|stash|reset|checkout|restore|rebase|merge|cherry-pick)\b")
 TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*\.py$|_test\.(py|go)$|"
                           r"\.(test|spec)\.[jt]sx?$|(^|/)conftest\.py$")
-CLAIM_RE = re.compile(r"\b(all (changes|items|tests|features|requirements|release.note)[^.\n]{0,60}"
-                      r"(implemented|complete|done|pass|verified)|(implementation|task|work) is complete|"
-                      r"successfully (implemented|completed))", re.I)
+CLAIM_RE = re.compile(r"(^\s*(all )?done\b|\ball (changes|items|tests|features|requirements|release.note|\w+ changes)[^.\n]{0,60}"
+                      r"(implemented|complete|done|pass|verified|in place)|(implementation|task|work) is complete|"
+                      r"successfully (implemented|completed)|in place and verified)", re.I)
+WAIT_RE = re.compile(r"(^|[;&|]\s*)sleep\s+\d+")
+# 测试输出中的失败信号（管道 `| tail` 会吞掉退出码，因此不能只看 is_error）
+TEST_SUMMARY_RE = re.compile(r"\b\d+ (passed|failed)\b|\bTests?:\s+\d+|test result:|^(ok|FAIL|PASS)\s|--- (PASS|FAIL):|"
+                             r"Test Files\s+\d+|\b\d+ (passing|failing)\b", re.M)
+TEST_FAIL_RE = re.compile(r"\b[1-9]\d* (failed|errors?)\b|^(FAILED|ERROR)\s+\S+|--- FAIL:|^FAIL\s|"
+                          r"Tests?:\s+[^\n]*\b[1-9]\d* failed|\b[1-9]\d* failing\b|test result: FAILED", re.M)
+GIT_PROBE_RE = re.compile(r"git\s+(cat-file\s+--batch-all-objects|fsck|reflog|log\s[^|;&]*--all|rev-list\s[^|;&]*--all|"
+                          r"for-each-ref|show-ref|verify-pack|count-objects)|\.git/(objects|packed-refs|refs|logs)")
+NON_CODE_RE = re.compile(r"(^|/)(docs?|\.github)/|\.(md|rst|txt|svg|png|jpe?g|gif|ico)$|(^|/)(README|CHANGELOG|LICENSE)[^/]*$", re.I)
 FAIL_NAME_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)|^--- FAIL: (\S+)|^\s*(?:✗|×|FAIL)\s+(.{5,120})$", re.M)
 
-CATS = ["探索", "编辑", "测试", "构建/安装", "计划", "其他"]
+CATS = ["探索", "编辑", "测试", "构建/安装", "等待", "计划", "其他"]
 
 
 def strip_cd(cmd: str) -> str:
@@ -73,6 +82,8 @@ def classify(name: str, inp: dict) -> str:
         return "计划"
     if name == "Bash":
         cmd = strip_cd(str(inp.get("command", "")))
+        if WAIT_RE.search(cmd):
+            return "等待"
         if TEST_RE.search(cmd):
             return "测试"
         if EDIT_BASH_RE.search(cmd):
@@ -245,6 +256,8 @@ def analyze_trial(d: Path, task_dir: Path | None, split: str | None) -> dict:
     tr = build_trace(events, source)
     main = [c for c in tr.calls if not c.sidechain]
     side = [c for c in tr.calls if c.sidechain]
+    for pos, c in enumerate(main):          # 位置按主线程重新编号，子 agent 的调用不占步数
+        c.idx = pos
     m: dict = {"trial": f"{d.parent.parent.name}/{d.parent.name}#{d.name}", "source": source}
 
     # 结果
@@ -266,6 +279,13 @@ def analyze_trial(d: Path, task_dir: Path | None, split: str | None) -> dict:
     model_sec = sum((t["ts"] - t["prev_user_ts"]).total_seconds() for t in tr.turns
                     if t["ts"] and t["prev_user_ts"] and t["ts"] > t["prev_user_ts"])
     m["tool_min"] = round(tool_sec / 60, 1) if tr.t_first else None
+    wait_sec = sum((c.t_result - c.t_call).total_seconds() for c in main if c.cat == "等待" and c.t_call and c.t_result)
+    m["wait_min"] = round(wait_sec / 60, 1) if tr.t_first else None
+    m["tool_names"] = dict(Counter(c.name for c in main).most_common(12))
+    m["subagent_tool_names"] = dict(Counter(c.name for c in side).most_common(6))
+    probes = [c for c in main + side if c.name == "Bash" and GIT_PROBE_RE.search(str(c.inp.get("command", "")))]
+    m["git_history_probes"] = [{"step": c.idx, "sidechain": c.sidechain, "cmd": short(c.inp.get("command"), 160),
+                                "output": short(c.output, 200)} for c in probes][:10]
     m["model_min"] = round(model_sec / 60, 1) if tr.t_first else None
     slow = sorted((c for c in main if c.t_call and c.t_result), key=lambda c: c.t_result - c.t_call, reverse=True)[:5]
     m["slowest_calls"] = [{"sec": round((c.t_result - c.t_call).total_seconds()), "cat": c.cat,
@@ -318,12 +338,19 @@ def analyze_trial(d: Path, task_dir: Path | None, split: str | None) -> dict:
 
     # 测试与失败签名
     tests = [c for c in main if c.cat == "测试"]
+    failed = lambda c: c.is_error or bool(TEST_FAIL_RE.search(c.output))
     m["test_runs"] = len(tests)
-    m["test_runs_failed"] = sum(1 for c in tests if c.is_error)
+    m["test_runs_failed"] = sum(1 for c in tests if failed(c))
+    # 后台运行后再 tail / cat 日志查看结果：按输出中的测试摘要识别
+    observed = [c for c in main if c.name == "Bash" and c.cat != "测试" and TEST_SUMMARY_RE.search(c.output)]
+    m["test_results_viewed_separately"] = len(observed)
+    m["test_results_viewed_failed"] = sum(1 for c in observed if TEST_FAIL_RE.search(c.output))
+    fail_views = [c for c in tests + observed if failed(c)]
+    m["last_failure_seen_at"] = f"{max(c.idx for c in fail_views)}/{len(main)}" if fail_views else None
     m["last_test_at"] = f"{tests[-1].idx}/{len(main)}" if tests else "从未运行测试"
     sigs = Counter()
-    for c in tests:
-        if c.is_error:
+    for c in tests + observed:
+        if failed(c):
             names = sorted({next(x for x in g if x) for g in FAIL_NAME_RE.findall(c.output)})[:5]
             if names:
                 sigs[tuple(names)] += 1
@@ -365,8 +392,9 @@ def analyze_trial(d: Path, task_dir: Path | None, split: str | None) -> dict:
     if split == "dev" and task_dir is not None:
         gold = gold_files(task_dir)
         if gold:
-            g = {f for f in gold if not TEST_PATH_RE.search(f)}
-            a = {f for f in agent_files if not TEST_PATH_RE.search(f)}
+            code = lambda f: not TEST_PATH_RE.search(f) and not NON_CODE_RE.search(f)
+            g = {f for f in gold if code(f)}
+            a = {f for f in agent_files if code(f)}
             m["gold_src_files"] = len(g)
             m["gold_recall"] = round(len(g & a) / len(g), 2) if g else None
             m["gold_missed"] = sorted(g - a)[:15]
@@ -400,13 +428,16 @@ def trial_md(m: dict) -> str:
         L.append(f"- 参考解源码文件覆盖率：{m['gold_recall']:.0%}（参考解 {m['gold_src_files']} 个，agent 额外改了 {m['extra_files']} 个）")
         if m["gold_missed"]:
             L.append(f"- 漏改的文件：{'、'.join(m['gold_missed'])}")
-    L += [f"- 最后一次跑测试：第 {m['last_test_at']} 步", "", "### 计划漂移", "",
+    L += [f"- 最后一次跑测试：第 {m['last_test_at']} 步" +
+          (f"；最后一次在测试结果中看到失败：第 {m['last_failure_seen_at']} 步" if m.get("last_failure_seen_at") else ""),
+          "", "### 计划漂移", "",
           f"- 上下文压缩：{m['compactions']} 次" + (f"（{'；'.join(m['compaction_at'])}）" if m["compaction_at"] else ""),
           f"- 上下文峰值：{m.get('ctx_max_k', '?')}k tokens；走势（每 10% 轮次）：{' → '.join(map(str, m.get('ctx_curve_k', [])))}k"]
     if "reread_after_compaction" in m:
         L.append(f"- 压缩后重新读取压缩前读过的文件：{m['reread_after_compaction']} 个")
     L += ["", "### 脏状态 / 打转", "",
-          f"- 测试运行 {m['test_runs']} 次，其中失败 {m['test_runs_failed']} 次",
+          f"- 测试运行 {m['test_runs']} 次，其中输出含失败 {m['test_runs_failed']} 次；"
+          f"另有 {m['test_results_viewed_separately']} 次单独查看测试结果（后台运行后读日志），其中含失败 {m['test_results_viewed_failed']} 次",
           f"- 同一失败签名重复出现 ≥ 3 次：{'；'.join(m['repeated_failure']) or '无'}",
           f"- 反复修改的文件（≥ 5 次）：{'；'.join(m['churn_files']) or '无'}；编辑报错 {m['edit_errors']} 次",
           f"- 打转片段（10 步内同一动作 ≥ 3 次）：{m['stuck_count']} 处" + (f"：{'；'.join(m['stuck_episodes'][:3])}" if m["stuck_episodes"] else ""),
@@ -418,9 +449,19 @@ def trial_md(m: dict) -> str:
           "阶段变化（按工具调用顺序分成 10 段）：", ""]
     for i, p in enumerate(m["phases"]):
         L.append(f"  {i * 10:>3}–{i * 10 + 10}%：{bar(p) if p else '—'}")
+    L += ["", "### 规划与完整性", "",
+          f"- 工具调用分布：{'，'.join(f'{k} {v}' for k, v in m['tool_names'].items())}"]
+    if m.get("subagent_tool_names"):
+        L.append(f"- 子 agent 工具调用：{'，'.join(f'{k} {v}' for k, v in m['subagent_tool_names'].items())}")
+    if m.get("git_history_probes"):
+        L.append(f"- **查看 git 历史 / 对象库的命令 {len(m['git_history_probes'])} 次**（可能在寻找被删除的提交，需人工核实）：")
+        for g in m["git_history_probes"][:5]:
+            L.append(f"  - 第 {g['step']} 步{'（子 agent）' if g['sidechain'] else ''}：`{g['cmd']}` → {g['output'] or '（无输出）'}")
+    else:
+        L.append("- 未发现查看 git 历史 / 对象库的命令")
     L += ["", "### 时间与规模", "",
           f"- {m['turns']} 轮、{m['tool_calls']} 次工具调用" + (f"、子 agent 工具调用 {m['subagent_calls']} 次" if m["subagent_calls"] else "") +
-          (f"；会话 {m['wall_min']} min，其中工具执行 {m['tool_min']} min、模型生成 {m['model_min']} min" if m.get("wall_min") else ""),
+          (f"；会话 {m['wall_min']} min，其中工具执行 {m['tool_min']} min（含 sleep 等待 {m['wait_min']} min）、模型生成 {m['model_min']} min" if m.get("wall_min") else ""),
           f"- 补丁 {m['patch_files']} 个文件" + (f"，其中测试文件：{'、'.join(m['patch_test_files'])}" if m["patch_test_files"] else "")]
     if m["slowest_calls"] and m["slowest_calls"][0]["sec"]:
         L.append("- 最慢的工具调用：" + "；".join(f"{x['sec']}s [{x['cat']}] {x['what']}" for x in m["slowest_calls"][:3]))
@@ -434,13 +475,14 @@ def compare_md(ms: list[dict]) -> str:
             ("宣布完成", lambda m: "是" + ("（假）" if m["false_completion"] else "") if m["claims_done"] else "否"),
             ("参考解覆盖", lambda m: f"{m['gold_recall']:.0%}" if m.get("gold_recall") is not None else "—"),
             ("轮数", lambda m: m["turns"]), ("工具调用", lambda m: m["tool_calls"]),
-            ("探索 / 编辑 / 测试", lambda m: "/".join(f"{round(m['category_share'][k] * 100)}" for k in ("探索", "编辑", "测试"))),
+            ("探索 / 编辑 / 测试 %", lambda m: "/".join(f"{round(m['category_share'][k] * 100)}" for k in ("探索", "编辑", "测试"))),
             ("首次编辑", lambda m: m["first_edit_at"]), ("最长无进展", lambda m: m["longest_no_progress"]),
-            ("测试（失败）", lambda m: f"{m['test_runs']}（{m['test_runs_failed']}）"),
+            ("测试（含失败）", lambda m: f"{m['test_runs']}（{m['test_runs_failed'] + m['test_results_viewed_failed']}）"),
+            ("git 探查", lambda m: len(m.get("git_history_probes") or [])),
             ("压缩", lambda m: m["compactions"]), ("上下文峰值", lambda m: f"{m.get('ctx_max_k', '?')}k"),
             ("打转", lambda m: m["stuck_count"]), ("重复失败", lambda m: len(m["repeated_failure"])),
             ("反复修改文件", lambda m: len(m["churn_files"])),
-            ("工具 / 模型 (min)", lambda m: f"{m.get('tool_min')} / {m.get('model_min')}" if m.get("tool_min") is not None else "")]
+            ("工具（等待）/ 模型 (min)", lambda m: f"{m.get('tool_min')}（{m.get('wait_min')}）/ {m.get('model_min')}" if m.get("tool_min") is not None else "")]
     L = ["| 题目 | " + " | ".join(c for c, _ in cols) + " |", "|---|" + "---|" * len(cols)]
     for m in ms:
         L.append(f"| {m['trial']} | " + " | ".join(str(f(m)) for _, f in cols) + " |")
