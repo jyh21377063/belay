@@ -107,8 +107,13 @@ def trial_grade_mode(plan: RunPlan, step: Step, t: TaskRef) -> str:
 def agent_phase(plan: RunPlan, step: Step, t: TaskRef, d: Path) -> dict:
     mode = trial_grade_mode(plan, step, t)
     verify_inline = plan.inline_verify or mode == "inline"
+    extra = {}
+    if step.agent.get("gate"):              # A-gate：每题的门禁配置由转换器生成（task_dir/gate.json，不进容器）
+        gate_file = plan.task_dir(t) / "gate.json"
+        if gate_file.exists():
+            extra["gate_spec"] = gate_file.read_text()
     cfg = pb.job_config(job_name="agent", jobs_dir=d / "pier", task_dir=plan.task_dir(t),
-                        agent_cfg=pb.agent_config(step.agent, plan.timeout_min),
+                        agent_cfg=pb.agent_config(step.agent, plan.timeout_min, extra),
                         environment=plan.environment, keep_container=plan.keep_containers,
                         verify=verify_inline)
     # 预算之外还要留出：拉取 / 构建镜像（可达 1 h）与评分（LHTB 可达 1.5 h）
@@ -193,6 +198,7 @@ def final_resolved(step: Step, rec: dict) -> bool | None:
 # ---------------------------------------------------------------- 主流程
 def execute(plan: RunPlan) -> bool:
     all_ok = True
+    gold_scores: dict[str, list[float]] = {}                 # gold-check：oracle 在连续得分题上的得分，供 nop 对比
     for step in plan.steps:
         root = plan.results_root / step.run_id
         root.mkdir(parents=True, exist_ok=True)
@@ -220,6 +226,9 @@ def execute(plan: RunPlan) -> bool:
                 res = final_resolved(step, rec)
                 mark = {True: "✅", False: "❌", None: "⚠️ "}[res]
                 extra = rec.get("error") or rec.get("grade", {}).get("error") or ""
+                score = rec.get("grade", {}).get("score") if rec.get("grade_mode") == "replay" else rec.get("inline_score")
+                if score is not None and plan.task_grading(t) == "official":      # 连续得分的题目同时显示得分
+                    extra = f"得分={score}  " + extra
                 log(f"  {mark} {t.key} #{r}  status={rec.get('status')}  "
                     f"agent={rec.get('agent_sec')}s  exc={rec.get('exception')}  {extra}")
 
@@ -228,11 +237,46 @@ def execute(plan: RunPlan) -> bool:
         log(f"   汇总：{root / 'summary.md'}")
 
         if step.expect:                                      # gold-check 的期望检查
-            want = step.expect == "pass"
-            bad = [r for r in rows if r["resolved"] is not want]
+            ok, bad = check_expectation(plan, step, rows, gold_scores)
+            all_ok &= ok
             if bad:
-                all_ok = False
-                log(f"   ✗ 期望全部 {step.expect}，不符合：" + ", ".join(f"{r['task']}#{r['repeat']}" for r in bad))
+                log(f"   ✗ 期望 {step.expect}，不符合：" + "；".join(bad))
             else:
                 log(f"   ✓ 全部符合期望 {step.expect}")
     return all_ok
+
+
+def check_expectation(plan: RunPlan, step: Step, rows: list[dict], gold_scores: dict) -> tuple[bool, list[str]]:
+    """gold-check 的判定。
+
+    二元评分的数据集：oracle 必须解出（resolved），nop 必须未解出。
+    连续得分、按题目自身配置评分的数据集（LHTB）：参考解不一定能拿满分（例如以"预知未来的离线最优"为分母的优化题），
+    因此 oracle 要求得分 > 0，nop 要求得分低于同一题 oracle 的最低得分（或 oracle 未运行时低于解出阈值）。
+    """
+    keys = {t.key: t for t in plan.tasks}
+    rows = [r for r in rows if r["task"] in keys]            # 只检查本次选中的题目（忽略目录中遗留的其他题）
+    bad = []
+    for r in rows:
+        t = keys[r["task"]]
+        continuous = plan.task_grading(t) == "official"
+        name = f"{r['task']}#{r['repeat']}"
+        if step.expect == "pass":
+            if continuous:
+                if r["score"] is None or r["score"] <= 0:
+                    bad.append(f"{name}（得分 {r['score']}）")
+                else:
+                    gold_scores.setdefault(r["task"], []).append(r["score"])
+            elif r["resolved"] is not True:
+                bad.append(name)
+        else:
+            if continuous:
+                ref = min(gold_scores.get(r["task"]) or [plan.solved_threshold(t)])
+                if r["score"] is None or r["score"] >= ref:
+                    bad.append(f"{name}（得分 {r['score']}，oracle 最低 {ref}）")
+            elif r["resolved"] is not False:
+                bad.append(name)
+    if step.expect == "pass":
+        for task, scores in gold_scores.items():
+            if len(scores) > 1 and max(scores) - min(scores) > 0.05:
+                bad.append(f"{task} 两次 oracle 得分差异较大：{scores}（评分可能不稳定）")
+    return not bad, bad
