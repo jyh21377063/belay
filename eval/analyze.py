@@ -47,7 +47,8 @@ EDIT_BASH_RE = re.compile(r"(sed -i|perl -pi|\btee\b|(^|[^>2&])>\s*[\w./-]+\.\w+
 GIT_WRITE_RE = re.compile(r"\bgit (add|commit|stash|reset|checkout|restore|rebase|merge|cherry-pick)\b")
 TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*\.py$|_test\.(py|go)$|"
                           r"\.(test|spec)\.[jt]sx?$|(^|/)conftest\.py$")
-CLAIM_RE = re.compile(r"(^\s*(all )?done\b|\ball (changes|items|tests|features|requirements|release.note|\w+ changes)[^.\n]{0,60}"
+CLAIM_RE = re.compile(r"(^\s*(all )?done\b|\ball \d+ [\w-]+(?: [\w-]+)? (items|changes|features|requirements)[^.\n]{0,40}"
+                      r"(implemented|complete|done|in place)|\ball (changes|items|tests|features|requirements|release.note|\w+ changes)[^.\n]{0,60}"
                       r"(implemented|complete|done|pass|verified|in place)|(implementation|task|work) is complete|"
                       r"successfully (implemented|completed)|in place and verified)", re.I)
 WAIT_RE = re.compile(r"(^|[;&|]\s*)sleep\s+\d+")

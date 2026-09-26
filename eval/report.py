@@ -48,6 +48,8 @@ def _read(p: Path) -> dict:
 def f2p_p2p(rewards: dict | None) -> tuple[int | None, int | None, int | None]:
     """从 reward 中取出 F2P 通过数 / 总数、P2P 失败数。兼容 SWE-EVO（我们的 grade.py）与 DeepSWE 的字段名。"""
     rw = rewards or {}
+    if rw.get("test_patch_applied") == 0:      # 测试补丁无法应用：未运行任何测试，不能算作回归
+        return 0, int(rw.get("f2p_success", 0) + rw.get("f2p_failure", 0)), None
     if "f2p_success" in rw:
         ok, bad = rw.get("f2p_success", 0), rw.get("f2p_failure", 0)
         return int(ok), int(ok + bad), int(rw.get("p2p_failure", 0))
@@ -92,6 +94,8 @@ def collect_dir(root: Path, grade_mode: str = "replay", pricing: dict | None = N
                                        "n_agent_steps", "summarization_count", "patch_files", "patch_loc")},
             "error": rec.get("error") or grade.get("error"),
             "_currency": (pricing or {}).get("currency"),
+            "test_patch_failed": ((grade.get("rewards") if grade_mode_row == "replay" else rec.get("rewards")) or {})
+                                 .get("test_patch_applied") == 0,
         })
     return rows
 
@@ -148,7 +152,9 @@ def write(root: Path, rows: list[dict]) -> None:
     fmt = lambda v: f"{v:,}" if isinstance(v, int) else ("" if v is None else str(v))
     for r in rows:
         mark = {True: "✅", False: "❌", None: "⚠️"}[r["resolved"]]
-        note = "; ".join(filter(None, ["inline≠replay" if r["mismatch"] else "",
+        note = "; ".join(filter(None, ["测试补丁无法应用（agent 修改了评测所用的测试文件），未运行测试"
+                                       if r.get("test_patch_failed") else "",
+                                       "inline≠replay" if r["mismatch"] else "",
                                        "补丁应用失败" if r["apply_ok"] is False else "",
                                        (r["error"] or "")[:80]]))
         total = round((r["trial_min"] or 0) + (r["grade_min"] or 0), 1) or ""
