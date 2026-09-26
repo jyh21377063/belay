@@ -52,6 +52,8 @@ def agent_config(agent: dict, timeout_min: int | None, extra_kwargs: dict | None
         cfg["kwargs"] = kwargs
     if timeout_min:
         cfg["override_timeout_sec"] = timeout_min * 60
+    if agent.get("setup_timeout_min"):      # A-gate 在 setup 阶段跑两次基线测试
+        cfg["override_setup_timeout_sec"] = agent["setup_timeout_min"] * 60
     return cfg
 
 

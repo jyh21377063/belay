@@ -19,6 +19,7 @@ tests/ 与 solution/ 只在评分 / oracle 时进入容器；数据集中的 PRs
   environment/Dockerfile  environment/setup_env.sh
   solution/solve.sh  solution/gold.patch
   tests/test.sh  tests/grade.py  tests/test.patch  tests/tests.json
+  gate.json（A-gate 的门禁配置，不进容器）
 """
 from __future__ import annotations
 
@@ -288,6 +289,16 @@ def convert(task_id: str, bench_cfg: dict, entry: dict, dst: Path) -> None:
                                         "PASS_TO_PASS": rec["PASS_TO_PASS"]}, indent=1),
         "tests/test.sh": test_sh(spec),
         "tests/grade.py": GRADE_PY,
+        # A-gate 的门禁配置：与官方评测相同的测试命令，但不应用测试补丁（只跑仓库中已有的测试）。
+        # 放在任务目录根部，Pier 不会上传；由 runner 以 gate_spec 参数传给 A-gate agent。
+        "gate.json": json.dumps({
+            "workdir": REPO_DIR,
+            "prelude": "source /opt/miniconda3/bin/activate && conda activate testbed",
+            "commands": spec["eval_commands"],
+            "test_cmd": spec["test_cmd"],
+            "parser": spec["log_parser"],
+            "timeout_sec": 3600,
+        }, indent=1),
     }
     for rel, text in files.items():
         (dst / rel).write_text(text)
