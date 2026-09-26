@@ -72,7 +72,9 @@ def audit_trial(d: Path) -> dict:
             net.append((c, "WebFetch", c.inp.get("url")))
         elif c.name == "Bash":
             cmd = str(c.inp.get("command", ""))
-            if SEEK_RULES[0][1].search(cmd):
+            external = [u for u in URL_RE.findall(cmd) if not re.match(r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)", u)]
+            local_only = re.search(r"localhost|127\.0\.0\.1", cmd) and not external
+            if SEEK_RULES[0][1].search(cmd) and not local_only:     # 只访问本机（自建测试服务器）不算联网
                 net.append((c, "shell", cmd))
     a["container_net"] = {"calls": len(net),
                           "possibly_succeeded": [{"what": short(w, 150), "output": short(c.output, 200)}

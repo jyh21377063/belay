@@ -179,6 +179,12 @@ pilot 表明，Claude Code + DeepSeek V4 Flash 在 11–17 分钟内就能解出
 | SWE-EVO 的 release notes 附带 PR 链接 | 转换时删除全部 URL |
 | 镜像中保留目标版本之后的 git 历史 | SWE-EVO 重建为单一提交；ProMax 删除 base 之后的提交。pilot 中 supervision 用五种途径寻找上游答案，均被拦截 |
 | agent 联网检索或下载新版本 | 网络白名单，仅放行模型 API；pilot 中 `curl`、`pip download`、`WebFetch` 均被拦截 |
+| **服务端工具绕过网络白名单**：Claude Code 的 `WebSearch` / `WebFetch` 由模型 API 在服务端执行，容器隔离拦不住。dev-v1 中 cc、gate 两组在 conan 上用 WebSearch 共命中评测数据 51 次（HuggingFace 上 SWE-EVO 中其他 agent 在同一道题上的运行记录）以及新版本文档 | 所有基于 Claude Code 的 agent 强制禁用这两个工具：命令行 `--disallowedTools` 与用户配置 `permissions.deny` 两层（后者同样作用于子 agent）；`eval.tools.audit` 统计每次运行的 WebSearch 次数与是否命中评测数据 |
+| 镜像自带的搭建脚本（`/root/setup_*.sh`，含上游仓库地址与 commit 哈希） | SWE-EVO、ProMax 构建镜像时删除 |
+| A-gate 的门禁配置暴露隐藏测试的文件名（dev-v1 中 agent 读到后以文件名为关键词检索） | 转换器生成门禁配置时去掉测试补丁新建的文件；门禁的配置、基线与记录放在 `/opt/belay-gate`，运行结束才复制到 `/logs/agent/gate` |
+| agent 手动运行门禁脚本，消耗拦截次数 | 门禁只响应 Stop hook（stdin 中 `hook_event_name == "Stop"`），手动运行不检查、不计数，只记录 |
+| agent 修改测试让门禁失效（dev-v1 中 cc 改 27 个测试文件、删 7 条断言；PEE 改 17 个、删 6 条） | 门禁检查时把 agent 改过的测试文件临时恢复为原始版本，运行后放回；官方评分同样使用原始测试，修改测试会导致测试补丁无法应用、整题记 0 |
+| 模型训练数据中含有目标版本之后的文档（PEE 未联网却使用了新版本的配置名） | 无法消除；属于用历史版本出题的基准固有的污染，在报告中说明 |
 | 做题阶段可写评分目录 `/logs/verifier`，事先放入伪造结果 | Claude Code agent 结束时清空该目录并留证（`verifier_dir_before_cleanup.txt`）；replay 数据集在全新容器中评分 |
 | LHTB 的 continue-until-timeout 相当于隐藏评分器当裁判 | prepare 时关闭，仅允许在上界对照组（O 组）中开启 |
 | LHTB 读取评分器（其仓库记录过一轮测试中 17 个满分有 14 个来自读取评分器） | 隐藏测试只在评分时上传；langchain 使用独立评分容器；`eval.analyze` 统计访问 harness 目录等"寻找答案"的尝试 |

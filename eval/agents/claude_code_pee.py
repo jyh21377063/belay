@@ -23,7 +23,7 @@ from pier.agents.installed.claude_code import ClaudeCode
 
 from eval.agents.claude_code import ClaudeCodeWithPatch
 
-READONLY_FLAGS = '--disallowedTools "Edit,Write,MultiEdit,NotebookEdit"'
+READONLY_TOOLS = "Edit,Write,MultiEdit,NotebookEdit"
 
 PLANNER = """You are the PLANNER in a planner / executor / evaluator team. Do not modify any files.
 
@@ -87,6 +87,7 @@ class ClaudeCodePEE(ClaudeCodeWithPatch):
         self.max_rounds = int(max_rounds)
         self._pee_role: str | None = None
         self._pee_flags = ""
+        self._pee_readonly = False
         self._pee_seq = 0
         self._pee_results: list[dict] = []
         super().__init__(*args, **kwargs)
@@ -95,6 +96,9 @@ class ClaudeCodePEE(ClaudeCodeWithPatch):
     async def exec_as_agent(self, environment, command, env=None, cwd=None, timeout_sec=None):
         if self._pee_role and "claude --verbose" in command:
             log = f"/logs/agent/pee/{self._pee_role}.jsonl"
+            if self._pee_readonly:            # 编辑工具并入已有的 --disallowedTools（其中已含 WebSearch / WebFetch）
+                command = re.sub(r"--disallowedTools[ =]'?([^\s']+)'?",
+                                 lambda m: f"--disallowedTools {m.group(1)},{READONLY_TOOLS}", command, count=1)
             command = command.replace("--print --", f"{self._pee_flags} --print --", 1)
             command = command.replace("tee /logs/agent/claude-code.txt", f"tee -a {log} /logs/agent/claude-code.txt", 1)
         return await super().exec_as_agent(environment, command=command, env=env, cwd=cwd, timeout_sec=timeout_sec)
@@ -106,9 +110,7 @@ class ClaudeCodePEE(ClaudeCodeWithPatch):
         flags = []
         if resume:
             flags.append(f"--resume {shlex.quote(resume)}")
-        if readonly:
-            flags.append(READONLY_FLAGS)
-        self._pee_role, self._pee_flags = name, " ".join(flags)
+        self._pee_role, self._pee_flags, self._pee_readonly = name, " ".join(flags), readonly
         error = None
         try:
             await ClaudeCode.run(self, prompt, environment, context)     # 不经过 ClaudeCodeWithPatch.run（不导出补丁）
@@ -117,7 +119,7 @@ class ClaudeCodePEE(ClaudeCodeWithPatch):
         except Exception as e:                                          # 单个会话失败不中断整体流程
             error = f"{type(e).__name__}: {str(e)[:300]}"
         finally:
-            self._pee_role, self._pee_flags = None, ""
+            self._pee_role, self._pee_flags, self._pee_readonly = None, "", False
         info = self._read_session(name)
         info.update(role=role, name=name, error=error)
         self._pee_results.append(info)

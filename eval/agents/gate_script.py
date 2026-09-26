@@ -2,6 +2,10 @@
 
   python3 gate_script.py baseline   # setup 阶段：原始代码上跑两次，记录两次都通过的测试
   python3 gate_script.py check      # Claude Code 的 Stop hook：重跑，若有"原来通过、现在失败"则拦下
+                                    # 只响应 Stop hook（stdin 中 hook_event_name == "Stop"）；手动运行被忽略并记录
+
+检查时使用原始版本的测试文件：agent 修改或删除的测试文件（以及新增的 conftest.py）在运行期间临时恢复为
+基线版本，运行后放回 agent 的版本。因此修改测试不能绕过门禁。基线树取自补丁快照（base_tree_file）。
 
 配置 /opt/belay-gate/spec.json：
   workdir      运行测试的目录
@@ -12,10 +16,10 @@
   timeout_sec  单次测试的超时
   max_blocks   最多拦截次数，之后放行
 
-状态与记录：
-  /opt/belay-gate/baseline.json（+ .sha256）  基线，放在 agent 工作区之外
+状态与记录（都不在 agent 可见的 /logs/agent 下；运行结束时由 agent 类复制到 /logs/agent/gate/）：
+  /opt/belay-gate/baseline.json（+ .sha256）  基线
   /opt/belay-gate/state/blocks                已拦截次数
-  /logs/agent/gate/                           基线与每次检查的记录（同步到宿主机）
+  /opt/belay-gate/log/                        基线与每次检查的记录
 """
 import hashlib
 import json
@@ -27,7 +31,9 @@ import sys
 import time
 
 BASE = "/opt/belay-gate"
-LOGDIR = "/logs/agent/gate"
+LOGDIR = "/opt/belay-gate/log"
+TEST_PATH = re.compile(r"(^|/)(tests?|testing|__tests__)/|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$")
+GIT = ["git", "-c", "safe.directory=*"]
 STATUSES = ("FAILED", "PASSED", "SKIPPED", "ERROR", "XFAIL")
 OK = ("PASSED", "XFAIL")
 
@@ -85,6 +91,59 @@ def build_command(spec):
     parts = [spec.get("prelude") or "true", "cd " + shlex.quote(spec["workdir"])] + list(spec.get("commands") or [])
     parts.append(" ".join(shlex.quote(t) for t in kept))
     return "; ".join(parts), has_target, dropped
+
+
+def _git(spec, args, env=None, check=True):
+    out = subprocess.run(GIT + args, cwd=spec["workdir"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    if check and out.returncode != 0:
+        raise RuntimeError("git %s failed: %s" % (" ".join(args), out.stderr.decode("utf-8", "replace")[:300]))
+    return out.stdout.decode("utf-8", "replace")
+
+
+class OriginalTests(object):
+    """在运行测试期间，把 agent 改动过的测试文件恢复为基线版本；结束后放回。"""
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.restored, self.hidden, self.saved = [], [], {}
+        self.env = dict(os.environ, GIT_INDEX_FILE=os.path.join(BASE, "state", "orig_index"))
+
+    def __enter__(self):
+        tree_file = self.spec.get("base_tree_file")
+        if not tree_file or not os.path.exists(tree_file):
+            return self
+        base = open(tree_file).read().strip()
+        _git(self.spec, ["read-tree", base], self.env)
+        _git(self.spec, ["update-index", "-q", "--refresh"], self.env, check=False)
+        changed = [l.split("\t", 1) for l in _git(self.spec, ["diff-files", "--name-status"], self.env).splitlines() if "\t" in l]
+        new = _git(self.spec, ["ls-files", "--others", "--exclude-standard"], self.env).splitlines()
+        wd = self.spec["workdir"]
+        for status, path in changed:
+            if not TEST_PATH.search(path):
+                continue
+            full = os.path.join(wd, path)
+            self.saved[path] = open(full, "rb").read() if os.path.exists(full) else None
+            _git(self.spec, ["checkout-index", "-f", "--", path], self.env)
+            self.restored.append(path)
+        for path in new:
+            if path.endswith("conftest.py"):
+                full = os.path.join(wd, path)
+                self.saved[path] = open(full, "rb").read()
+                os.remove(full)
+                self.hidden.append(path)
+        return self
+
+    def __exit__(self, *exc):
+        wd = self.spec["workdir"]
+        for path, data in self.saved.items():
+            full = os.path.join(wd, path)
+            if data is None:
+                if os.path.exists(full):
+                    os.remove(full)
+            else:
+                with open(full, "wb") as f:
+                    f.write(data)
+        return False
 
 
 def run_tests(spec):
@@ -145,7 +204,14 @@ def failure_reasons(out):
 
 
 def check():
-    sys.stdin.read()                         # hook 输入（本门禁不需要）
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        payload = {}
+    if payload.get("hook_event_name") != "Stop":   # agent 手动运行：不检查、不计数，只记录
+        log_event("checks.jsonl", {"decision": "ignored", "why": "not invoked by the Stop hook"})
+        return
     spec = load_spec()
     max_blocks = int(spec.get("max_blocks", 5))
     counter = os.path.join(BASE, "state", "blocks")
@@ -164,13 +230,16 @@ def check():
         log_event("checks.jsonl", {"decision": "allow", "why": "empty baseline", "baseline_tampered": tampered})
         return
     t0 = time.time()
-    sm, err, _, out = run_tests(spec)
+    with OriginalTests(spec) as orig:
+        sm, err, _, out = run_tests(spec)
     if sm is None:
-        log_event("checks.jsonl", {"decision": "allow", "why": err, "sec": round(time.time() - t0)})
+        log_event("checks.jsonl", {"decision": "allow", "why": err, "sec": round(time.time() - t0),
+                                   "tests_restored": orig.restored, "conftest_hidden": orig.hidden})
         return
     regressions = [t for t in stable if sm.get(t) not in OK]
     rec = {"blocks_before": blocks, "n_regressions": len(regressions), "regressions": regressions[:50],
-           "sec": round(time.time() - t0), "baseline_tampered": tampered}
+           "sec": round(time.time() - t0), "baseline_tampered": tampered,
+           "tests_restored": orig.restored, "conftest_hidden": orig.hidden}
     if not regressions:
         log_event("checks.jsonl", dict(rec, decision="allow", why="no regressions"))
         return
@@ -182,7 +251,8 @@ def check():
              for t in regressions[:30]]
     more = "\n... and %d more" % (len(regressions) - 30) if len(regressions) > 30 else ""
     reason = ("Regression check failed (%d of %d). These %d tests passed on the original code before your changes, "
-              "and they do not pass now:\n%s%s\n\nFix these regressions before finishing."
+              "and they do not pass now:\n%s%s\n\nThe check runs the repository's original versions of these tests, "
+              "so edits to test files do not affect it. Fix these regressions in the code before finishing."
               % (blocks, max_blocks, len(regressions), "\n".join(lines), more))
     log_event("checks.jsonl", dict(rec, decision="block"))
     print(json.dumps({"decision": "block", "reason": reason}))

@@ -105,7 +105,8 @@ RUN set -eux; cd {REPO_DIR}; git config --global --add safe.directory '*'; \\
     git for-each-ref --format='%(refname)' | grep -vx 'refs/tags/_base' | xargs -r -n1 git update-ref -d; \\
     git reflog expire --expire=now --all; \\
     git gc -q --prune=now; \\
-    test "$(git rev-parse HEAD)" = "$(git rev-parse _base)" || echo "WARNING: HEAD 与评测脚本的 base commit 不一致"
+    test "$(git rev-parse HEAD)" = "$(git rev-parse _base)" || echo "WARNING: HEAD 与评测脚本的 base commit 不一致"; \\
+    rm -f /root/setup_*.sh
 """
 
 

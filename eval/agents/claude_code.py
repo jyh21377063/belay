@@ -14,6 +14,9 @@ ANTHROPIC_AUTH_TOKEN 和 model。Pier 的 ClaudeCode 会：
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+import shlex
 
 from pier.agents.installed.claude_code import ClaudeCode
 from pier.models.agent.install import AgentInstallSpec, InstallStep
@@ -21,6 +24,12 @@ from pier.models.agent.install import AgentInstallSpec, InstallStep
 from eval.agents.patch_capture import PatchCaptureMixin
 
 NODE_VERSION = "22.12.0"          # @anthropic-ai/claude-code 要求 node >= 22
+
+# 禁用的工具。WebSearch / WebFetch 由模型 API 在服务端执行，容器的网络白名单拦不住：
+# dev-v1 中 agent 用 WebSearch 搜到了评测数据集中其他 agent 在同一道题上的运行记录与新版本文档。
+# 两层保护：命令行 --disallowedTools，以及用户配置中的 permissions.deny（同样作用于子 agent）。
+BLOCKED_TOOLS = ["WebSearch", "WebFetch"]
+DISALLOWED_TOOLS = ["EnterPlanMode"] + BLOCKED_TOOLS
 
 INSTALL_ROOT = r"""
 set -euo pipefail
@@ -60,7 +69,17 @@ class ClaudeCodeWithPatch(PatchCaptureMixin, ClaudeCode):
         self.repo_dir = repo_dir
         self.node_mirror = node_mirror.rstrip("/")
         self.npm_registry = npm_registry
+        # 无论配置如何，禁用列表中都包含 WebSearch / WebFetch
+        given = [t for t in re.split(r"[,\s]+", str(kwargs.get("disallowed_tools") or "")) if t]
+        kwargs["disallowed_tools"] = ",".join(dict.fromkeys(DISALLOWED_TOOLS + given))
+        self._belay_settings: dict = {"permissions": {"deny": list(BLOCKED_TOOLS)}}
         super().__init__(*args, **kwargs)
+
+    async def _belay_write_settings(self, environment) -> None:
+        """写入 Claude Code 的用户配置（Pier 把 CLAUDE_CONFIG_DIR 设为 /logs/agent/sessions）。"""
+        cfg_dir = f"{environment.env_paths.agent_dir}/sessions"
+        await self._belay_exec(environment, f"mkdir -p {cfg_dir} && echo {shlex.quote(json.dumps(self._belay_settings))} "
+                                            f"> {cfg_dir}/settings.json && chmod -R a+rwX {cfg_dir}")
 
     def install_spec(self) -> AgentInstallSpec:
         root_run = INSTALL_ROOT.format(
@@ -80,6 +99,7 @@ class ClaudeCodeWithPatch(PatchCaptureMixin, ClaudeCode):
     async def setup(self, environment) -> None:
         await super().setup(environment)
         await self._belay_snapshot(environment)
+        await self._belay_write_settings(environment)
 
     async def run(self, instruction, environment, context) -> None:
         try:

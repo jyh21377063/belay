@@ -99,6 +99,9 @@ git reflog expire --expire=now --all
 git gc -q --prune=now
 test "$(git rev-parse 'HEAD^{{tree}}')" = "$BASE_TREE"
 test "$(git rev-list --all | wc -l)" = "1"
+
+# 4. 删除镜像自带的搭建脚本（含上游仓库地址与 commit 哈希）
+rm -f /root/setup_*.sh
 """
 
 
@@ -264,6 +267,16 @@ workdir = "{REPO_DIR}"
 """
 
 
+def gate_test_cmd(test_cmd: str, test_patch: str) -> str:
+    """去掉测试补丁中新建的测试文件：它们只在评分时出现，其文件名会透露隐藏测试考查的内容。"""
+    new_files = set()
+    for block in re.split(r"(?m)^(?=diff --git )", test_patch):
+        m = re.match(r"diff --git a/(\S+) b/(\S+)", block)
+        if m and re.search(r"(?m)^new file mode", block[:500]):
+            new_files.add(m.group(2))
+    return " ".join(t for t in test_cmd.split() if t.split("::")[0] not in new_files)
+
+
 def convert(task_id: str, bench_cfg: dict, entry: dict, dst: Path) -> None:
     rec = _load_instances(bench_cfg["data"]).get(task_id)
     if rec is None:
@@ -295,7 +308,7 @@ def convert(task_id: str, bench_cfg: dict, entry: dict, dst: Path) -> None:
             "workdir": REPO_DIR,
             "prelude": "source /opt/miniconda3/bin/activate && conda activate testbed",
             "commands": spec["eval_commands"],
-            "test_cmd": spec["test_cmd"],
+            "test_cmd": gate_test_cmd(spec["test_cmd"], rec["test_patch"]),
             "parser": spec["log_parser"],
             "timeout_sec": 3600,
         }, indent=1),
