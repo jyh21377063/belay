@@ -54,10 +54,10 @@ agents:
     name: nop
     grade: inline
 
-  claude-code:                # A 组：Pier 的 ClaudeCode + 补丁导出（Claude Code 由 Pier 装进每道题的容器）
+  claude-code: &claude_code   # A 组：Pier 的 ClaudeCode + 补丁导出（Claude Code 由 Pier 装进每道题的容器）
     import_path: "eval.agents.claude_code:ClaudeCodeWithPatch"
     model: "deepseek-flash[1m]"         # 即 ANTHROPIC_MODEL；[1m] 告诉 Claude Code 上下文为 1M
-    env:                                # 按 DeepSeek 官方推荐配置；这里的值会覆盖 Pier 的默认设置
+    env: &claude_code_env               # 按 DeepSeek 官方推荐配置；这里的值会覆盖 Pier 的默认设置
       ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
       ANTHROPIC_AUTH_TOKEN: ${DEEPSEEK_API_KEY}
       ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-flash[1m]"
@@ -67,7 +67,7 @@ agents:
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: "786432"
       API_TIMEOUT_MS: "600000"
       DISABLE_AUTOUPDATER: "1"          # 容器内不联网，禁止 Claude Code 自动更新
-    kwargs:
+    kwargs: &claude_code_kwargs
       reasoning_effort: max             # 即 CLAUDE_CODE_EFFORT_LEVEL=max，Pier 以 --effort max 传入
       version: "2.1.281"                # 固定 Claude Code 版本（从 npm 安装），保证各次运行一致
       # 构建镜像时下载 Node.js 与 npm 包的来源；默认官方源，访问慢时可换镜像：
@@ -79,6 +79,23 @@ agents:
       input_hit_per_m: 0.04             # 输入（缓存命中）
       input_miss_per_m: 2               # 输入（缓存未命中）
       output_per_m: 8                   # 输出
+
+  # 以下两组与 A 组共用模型、环境变量、Claude Code 版本与价格（YAML 锚点），只在 harness 上不同
+  claude-code-gate:           # A-gate 组：Claude Code + 确定性回归门（Stop hook）
+    <<: *claude_code
+    import_path: "eval.agents.claude_code_gate:ClaudeCodeGate"
+    gate: true                          # runner 读取任务目录下的 gate.json（目前仅 SWE-EVO 转换器生成）
+    setup_timeout_min: 150              # setup 阶段在原始代码上跑两次基线测试，不计入 90 分钟预算
+    kwargs:
+      <<: *claude_code_kwargs
+      max_blocks: 5                     # 最多拦截 5 次，之后放行并记录
+
+  claude-code-pee:            # PEE 组：基于 Claude Code 的朴素 planner → executor → evaluator
+    <<: *claude_code
+    import_path: "eval.agents.claude_code_pee:ClaudeCodePEE"
+    kwargs:
+      <<: *claude_code_kwargs
+      max_rounds: 5                     # evaluator 最多评估 5 轮
 
   flat:                       # B 组：自研执行器，单循环，无任务图
     import_path: "eval.agents.flat_agent:FlatAgent"
@@ -116,9 +133,33 @@ profiles:
 
   # 正式评测：每题先跑 1 次；需要第 2 次时用同一 run_id 加 --repeats 2 补跑。
   # 流程已验证，只做重放评分（正式成绩），不再在原容器重复评分。
+  gate-pilot:                 # A-gate 组试跑（调试集）
+    split: dev
+    agent: claude-code-gate
+    repeats: 1
+    concurrency: 1
+
+  pee-pilot:                  # PEE 组试跑（调试集）
+    split: dev
+    agent: claude-code-pee
+    repeats: 1
+    concurrency: 1
+
   cc-test:                    # A 组
     split: test
     agent: claude-code
+    repeats: 1
+    grading: {inline_verify: false}
+
+  gate-test:                  # A-gate 组
+    split: test
+    agent: claude-code-gate
+    repeats: 1
+    grading: {inline_verify: false}
+
+  pee-test:                   # PEE 组
+    split: test
+    agent: claude-code-pee
     repeats: 1
     grading: {inline_verify: false}
 
