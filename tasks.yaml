@@ -168,10 +168,10 @@ dev:
       stats: {files: 19, code: 11, items: 23, f2p: 234, f2p_files: 6, p2p: 1477, est_min: 11}
 
   lhtb:
-    - id: unknown-config-semantics
+    - id: spot-scheduler-traces     # 2026-09-26 替换 unknown-config-semantics（后者有 50 秒 / 次的强制限速，参考解本身需约 88 分钟）
       lang: python
       scoring: proportional
-      stats: {expert_min: 95, junior_min: 260, cpus: 2, memory_mb: 4096}
+      stats: {expert_min: 200, junior_min: 480, cpus: 2, memory_mb: 4096}
 
 # ---------------------------------------------------------------------
 # 备选题（按列表顺序使用）
@@ -191,7 +191,7 @@ backups:
     java:       [plantuml__plantuml-c_15fa06c]
     rust:       [astral-sh__ruff-20221]
   lhtb:
-    any: [vector-db-iterative-build, nbody-accel-iterative, spot-scheduler-traces, great-expectations-audit]
+    any: [vector-db-iterative-build, nbody-accel-iterative, great-expectations-audit, unknown-config-semantics]
 
 # ---------------------------------------------------------------------
 # 替换记录（格式示例）
@@ -216,3 +216,8 @@ revisions:
       加入规模最大的 dvc_1.0.0a1、conan_2.0.14、dvc_2.8.1 等；新增 LHTB。
       原 v3 方案中 modin / requests / scikit-learn 各 1 道的安排不可行（均不满足 F2P ≥ 5），已取消。
       koota、supervision 由调试集改为正式集中的负对照。
+  - version: 2.1
+    date: "2026-09-26"
+    summary: >-
+      LHTB 调试题由 unknown-config-semantics 换为 spot-scheduler-traces：前者的 daemon 对每次探测强制等待 50 秒，
+      完整解法至少需要 5 × 21 × 50 秒 ≈ 88 分钟，几乎等于 90 分钟预算，不适合作为快速迭代的调试题；移入备选末尾。

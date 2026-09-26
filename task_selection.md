@@ -91,7 +91,7 @@ pilot 表明，Claude Code + DeepSeek V4 Flash 在 11–17 分钟内就能解出
 |---|---|---:|---|
 | `conan-io__conan_2.0.2_2.0.3` | SWE-EVO | 实测 53 min | 失败模式最完整（看到失败仍宣布完成、引入回归、误解需求） |
 | `pydantic__pydantic_v2.7.0_v2.7.1` | SWE-EVO | 约 11 min | 23 条改动但运行快，适合频繁迭代；该仓库不出现在正式集中 |
-| `unknown-config-semantics` | LHTB | 专家 95 min | LHTB 中最短的软件工程题，用于打通 LHTB 流程 |
+| `spot-scheduler-traces` | LHTB | 专家 200 min | 无限速、2 核 4 GB、评分 5 分钟，用于打通 LHTB 流程。原选 `unknown-config-semantics` 因强制限速（每次探测等待 50 秒，完整解法至少约 88 分钟）改为备选 |
 
 ## 4. 难度参考
 
@@ -192,7 +192,7 @@ pilot 表明，Claude Code + DeepSeek V4 Flash 在 11–17 分钟内就能解出
 |---|---|
 | SWE-EVO | `iterative__dvc_1.10.2_1.11.0` → `iterative__dvc_2.5.0_2.5.1` → `iterative__dvc_3.43.1_3.44.0` |
 | ProMax | C++：`nasa__fprime-3642`、`LMMS__lmms-7454`；Go：`go-gitea__gitea-35775`、`gitleaks__gitleaks-1831`；Java：`plantuml__plantuml-c_15fa06c`；Rust：`astral-sh__ruff-20221` |
-| LHTB | `vector-db-iterative-build` → `nbody-accel-iterative` → `spot-scheduler-traces` → `great-expectations-audit` |
+| LHTB | `vector-db-iterative-build` → `nbody-accel-iterative` → `great-expectations-audit` → `unknown-config-semantics` |
 
 LHTB 备选中 `great-expectations-audit` 原本允许联网，关闭联网后能否评分需要先用 gold-check 确认。
 
