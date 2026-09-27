@@ -1,86 +1,107 @@
 # Belay
 
-长程编码任务的外部任务图 runtime，以及配套的评测框架。设计见 `docs/long_horizon_runtime_plan.md`，选题见 `task_selection.md`。
-
-## 目录
+### 目录规划
 
 ```
-<父目录>/
-├── benchmarks/        原始数据集（只读，不进 git）
-└── belay/             本仓库
-    ├── tasks.yaml     题目清单（冻结）
-    ├── runs.yaml      运行编排：agent 定义 + profile
-    ├── belay/         runtime 本体（开发中）
-    ├── eval/          评测框架，入口 python -m eval.run
-    ├── build/tasks/   eval.prepare 生成的 Pier 任务目录（gitignore）
-    └── results/       运行结果（gitignore）
+belay/                      # 仓库根目录
+├── belay/                  # runtime 本体（宿主机上运行）
+│   ├── llm.py              # 模型客户端（已有）
+│   ├── env.py              # 执行环境（已有）
+│   ├── config.py           # 统一的配置 dataclass，从 runs.yaml 的 kwargs 构造
+│   ├── cli.py              # 本地调试入口（已有）
+│   │
+│   ├── worker/             # M1：单个 worker 的一切
+│   │   ├── loop.py         #   主循环（现在的 worker.py）
+│   │   ├── context.py      #   截断、清理、交接（已有）
+│   │   └── prompts.py      #   系统提示与首条消息（已有）
+│   │
+│   ├── tools/              # 模型能调用的工具
+│   │   ├── base.py  files.py  shell.py      # 已有
+│   │   └── runtime.py      #   M2 起：run_check / wait / ledger / submit / spawn_work /
+│   │                       #   request_test / report_conflict，只负责把请求投进收件箱
+│   │
+│   ├── graph/              # 证据图：数据模型 + 存储，不含调度逻辑
+│   │   ├── model.py        #   节点、边、状态枚举（dataclass）
+│   │   ├── store.py        #   SQLite：状态表 + 只追加的事件表
+│   │   ├── invariants.py   #   五条不变量的断言
+│   │   └── requirements.py #   需求抽取（release notes 切分、LHTB 阶段）
+│   │
+│   ├── runtime/            # Orchestrator 及其副作用
+│   │   ├── messages.py     #   收件箱里的消息类型
+│   │   ├── decide.py       #   纯函数 decide(state, msg) -> (changes, actions)
+│   │   ├── orchestrator.py #   单写者循环：取消息 → decide → 落库 → 执行 actions
+│   │   ├── effects.py      #   执行 actions：派发 worker、启动作业、回复 Future
+│   │   ├── jobs.py         #   Job Runner：进程组、完成标记、按树哈希去重
+│   │   ├── checks.py       #   基线、测试结果解析、失败签名归一化与归类
+│   │   ├── gitops.py       #   worktree、影子仓库、merge-tree、比较并交换推进
+│   │   ├── judges.py       #   M4：Test Author、Reviewer（独立上下文的模型调用）
+│   │   └── recovery.py     #   M6：重启对账
+│   │
+│   ├── container/          # 上传到容器里执行的脚本：只用标准库，兼容 Python 3.6
+│   │   └── runner.py       #   跑检查、写完成标记、输出结构化结果
+│   │
+│   └── observe/            # M6：读事件表生成回放页面
+│
+├── eval/                   # 评测框架（已有），所有对照组共用
+│   └── agents/             #   A / A-gate / PEE / B / Belay 的 Pier 适配层
+├── tests/
+│   ├── unit/               # 纯逻辑：decide、不变量、截断、glob…… 不起进程
+│   ├── integration/        # LocalEnv + ScriptedLLM：完整跑一遍，不需要容器和模型
+│   ├── docker/             # 需要容器的测试，默认跳过（pytest -m docker）
+│   └── fixtures/           # 小型示例仓库、录制的模型回复
+└── docs/                   # 计划、设计说明、决策记录
 ```
 
-`runs.yaml` 和 `tasks.yaml` 中的相对路径都相对于文件自身所在目录解析，整个父目录放在服务器任意位置都可以。
+### 三条依赖规则
 
-## 环境准备
+目录只是形式，真正防止代码缠在一起的是依赖方向：
 
-服务器上只需要 Docker 和 Python，**不需要安装 Claude Code**：Pier 会在每道题的容器里自动安装，
-并通过 `runs.yaml` 中的环境变量把模型指向 DeepSeek。
+1. **`graph/` 和 `runtime/decide.py` 是纯的。** 它们不做 IO、不调模型、不执行命令，只依赖 `graph/model.py`。所以 Orchestrator 的所有判断逻辑都可以用普通单元测试覆盖，这也是面试时最能体现工程质量的部分。
+2. **`worker/` 和 `tools/` 不认识 Orchestrator 的内部实现。** 工具只通过一个很窄的接口提请求，比如 `await ctx.runtime.request(msg)`。单 worker 的 B 组传入空实现，Belay 传入真实的收件箱。这样 worker 的代码在 B 组和 Belay 之间完全共用，对比才干净。
+3. **`eval` 可以依赖 `belay`，反过来不行。** 所有对照组共用评测框架，Belay 特有的逻辑只能出现在 `eval/agents/belay_agent.py` 这一个适配文件里，不能渗进评分和报告。这也是公平性的保证。
 
-```bash
-cd belay
-python -m venv .venv && source .venv/bin/activate
-pip install datacurve-pier pyyaml      # Pier 必须装在本 venv 里，自定义 agent 通过 import_path 加载
-export DEEPSEEK_API_KEY=...
+### 先把复杂度拆掉：一个事件循环、一个收件箱
+
+你担心的"worker 是异步协程，runtime 也是异步的，两层叠在一起很乱"，可以用一个很朴素的结构化解：**整个 Belay 跑在 `BelayAgent.run()` 里的同一个 asyncio 事件循环上，所有组件都是这个循环里的协程，彼此只通过一个队列通信。**
+
+- **Orchestrator** 是唯一消费收件箱的协程，逐条处理消息。因为只有它写状态，所以不需要任何锁。
+- **worker** 是普通的循环：调模型 → 执行工具 → 再调模型。遇到需要 runtime 的工具（`run_check`、`submit`、`spawn_work` 等），就往收件箱投一条消息，附一个 Future，然后 `await` 这个 Future 等回复。
+- **作业**由 Orchestrator 启动为后台任务，完成后把结果作为一条新消息投回收件箱。
+
+```python
+async def orchestrator(inbox, state, effects):
+    while True:
+        msg = await inbox.get()
+        changes, actions = decide(state, msg)   # 纯函数：不碰 IO
+        state.apply(changes)                     # 写 SQLite：事件 + 状态
+        for a in actions:
+            effects.spawn(a)                     # 副作用：exec、git、回复 Future
 ```
 
-然后填写 `runs.yaml` 中 claude-code 的 `model`（DeepSeek 模型名）和 `kwargs.version`（Claude Code 版本号，可先删掉这一行）。
+这就是"函数式核心、命令式外壳"：`decide()` 是纯函数，可以直接写单元测试，不需要容器和模型。难调试的并发问题因此都集中在很薄的外壳里。worker 数量从 1 变成 3，只是多起几个 worker 协程，Orchestrator 的逻辑不变。
 
-## 运行
+### 开发顺序：每一步都能通过 eval 端到端跑通
 
-以下命令都在 `belay/` 下执行。
+原则是"行走的骨架"：每个里程碑结束时，`python -m eval.run --profile belay-dev` 都能跑出一个带补丁、带评分的结果。这样任何时候停下来，手里都有能演示的东西。
 
-```bash
-python -m eval.prepare --split dev                        # 生成任务目录（DeepSWE 可直接用）
-python -m eval.run --profile gold-check -y                # 环境验证：oracle 两次通过、nop 失败
-python -m eval.run --profile cc-pilot --tasks koota-query-predicates   # 先跑一道
-python -m eval.run --profile cc-pilot -y                  # 调试集全部
-python -m eval.run --profile cc-test -y                   # 评测集，A 组
-python -m eval.run --profile gold-check --split test      # 验证评测集题目环境
-python -m eval.run --profile regrade --source-run <run_id>  # 对已有补丁重新评分
-python -m eval.run --profile cc-pilot --dry-run           # 只打印计划与 Pier 配置
-python -m eval.report results/<run_id>                    # 重新生成汇总
-```
+1. **M0 骨架（半天）**：`eval/agents/belay_agent.py` 接入 Pier；搭好 `belay/` 的包结构（llm、worker、tools、runtime、graph）。再做一个 `FakeEnvironment`，在本地临时目录里用 subprocess 模拟 `exec`，后面所有单元测试都靠它。
+2. **M1 单 worker 执行器（3 天）**：这就是 `FlatAgent`，也就是 B 组。建议按这个顺序加：模型客户端（直接用 DeepSeek 的 Anthropic 兼容接口，工具调用格式和 Claude Code 一致）和重试 → 只有 bash 的循环 → 文件工具 → 输出截断 → 消息逐轮写盘 → 超过阈值时重开上下文。**完成标准**：在 2–3 道开发题上与 A 组对跑，不明显更弱。这一步不过，后面都不用做。
+3. **M2 Orchestrator + 证据图 + 作业（2 天）**：SQLite 表结构和事件表；收件箱与 `decide()`；Job Runner（`setsid` 起进程组、写完成标记文件）；`run_check`、`wait`、`ledger` 三个工具。基线可以直接复用 `gate_script.py` 的逻辑，放在 setup 阶段跑，和 A-gate 一样不计入 90 分钟。需求抽取先只做 SWE-EVO 的 release notes 切分。**完成标准**：worker 用 `wait` 代替 `sleep`，`ledger` 能看到基线。
+4. **M3 完成权 + 门禁 + 集成分支（1.5 天）**：git 写操作收归 runtime；`submit` → 候选 → 门禁 → 比较并交换推进；受保护文件的哈希校验；bash 拒绝 git 写命令；DONE / INCOMPLETE 与截止保护。**完成标准**：在 conan 开发题上，回归被拦下、补丁里没有测试改动。**到这一步就是最小可演示版本**，时间不够时它本身已经是一个比 A-gate 更完整的对照。
+5. **M4 独立证据与上报（1.5 天）**：`request_test` + Test Author，收录前在原始代码上验证"断言级失败"；`report_conflict` + Reviewer，校验引文逐字存在；按证据计算需求状态。**完成标准**：一次上报从提交到裁决、再到账本更新能完整跑通。
+6. **M5 并发（2 天）**：`spawn_work`、每个 worker 一个 worktree、合并队列（`merge-tree` + CAS）、失败签名广播。因为 M2 的数据模型已经按多 worker 设计，这一步主要是加 worker 协程和合并逻辑。**完成标准**：一道可分解的开发题上 3 个 worker 的改动都合并成功。
+7. **M6 恢复、隔离、回放（1.5 天）**：见下文第三点。
 
-- `--profile` 决定 agent、split、重复次数；`--tasks`、`--benchmarks`、`--agent`、`--model`、`--repeats` 可临时覆盖。
-- 结果写到 `results/<run_id>/<benchmark>/<id>/<repeat>/`，汇总在 `results/<run_id>/summary.md` 和 `summary.csv`。
-- 同一命令重跑即断点续跑，已完成的 trial 自动跳过。
+### 几个会踩的坑，最好提前定下来
 
-## 评测流程
+**补丁导出要改成导出集成分支。** 现在的 `PatchCaptureMixin` 导出的是工作目录相对基线的 diff。Belay 的交付物应该是集成分支 HEAD，所以在 `finally` 里要先把 HEAD 检出到仓库工作目录（或者直接对 HEAD 的 tree 做 diff），再剔除测试路径下的改动，然后导出。Pier 超时取消 `run()` 时，这一步同样要放在 `asyncio.shield` 里。
 
-每个 trial 分两个阶段，以 `patch.diff` 为边界：
+**LHTB 的部分题目工作目录不是 git 仓库。** 集成分支依赖 git，可以在工作目录之外建一个影子仓库（`GIT_DIR` 放在 `/opt/belay`，`GIT_WORK_TREE` 指向工作目录），只由 runtime 使用。这类题没有现成测试，检查就是任务自带的公开工具，基线也从这些工具跑出来。
 
-1. **agent 阶段**：Pier 启动题目容器，运行 agent；结束时 `eval/agents/patch_capture.py` 导出补丁（超时也会导出）。
-2. **评分阶段**：在全新容器中用 `eval/agents/replay.py` 应用补丁，运行题目自带的 verifier。
+**恢复演示不要放在 Pier 里做。** Pier 管理的宿主进程一旦崩溃，这次 trial 就结束了。更实际的做法是：用 `keep_containers` 保留容器，再提供一个 `python -m belay.run --resume <run_dir>` 的命令，对着保留的容器和 SQLite 状态做对账，然后继续跑。故障注入也在这个命令上做。
 
-所有对比组走同一条评分路径。`inline_verify` 开启时，agent 结束后也会在原容器评分一次；两次结果不一致会在汇总表中标为 `inline≠replay`。
+**并发调用 `exec` 之前先确认 Pier 支持。** 多个 worker 会同时对同一个容器调用 `environment.exec`。docker exec 本身是可以并发的，但最好先写一个小测试确认 Pier 的封装没有串行化，或者没有共享状态。
 
-防泄漏：`eval.prepare` 把所有任务设为 `allow_internet = false`，Pier 只放行 agent 声明的模型 API 域名；运行前检查会拒绝允许联网的任务。
+**调试时录制模型回复。** 把每次调用模型的请求和回复录下来，调试 runtime 时直接回放，不花钱、结果可复现。这对调 `decide()` 和合并逻辑特别有用。
 
-## eval 模块
-
-| 文件 | 职责 |
-|---|---|
-| `eval/run.py` | 命令行入口 |
-| `eval/config.py` | defaults ← profile ← 命令行 合并；选题与校验（纯函数） |
-| `eval/runner.py` | 运行前检查、trial 循环、断点续跑、agent 阶段与重放评分 |
-| `eval/pier_backend.py` | 唯一调用 Pier 的模块：生成 JobConfig、调用 `pier run -c`、解析 result.json |
-| `eval/prepare.py` | 生成 Pier 任务目录，强制不联网 |
-| `eval/report.py` | 生成 summary.csv / summary.md |
-| `eval/convert/` | ProMax、SWE-EVO 转 Pier 格式（待实现） |
-| `eval/agents/patch_capture.py` | 快照 + 导出 patch.diff |
-| `eval/agents/claude_code.py` | A 组：Pier 的 ClaudeCode + 补丁导出 |
-| `eval/agents/flat_agent.py` | B 组：自研执行器（骨架） |
-| `eval/agents/replay.py` | 评分用：在全新容器中应用补丁 |
-
-## 待办
-
-- [ ] `eval/convert/promax_to_harbor.py`、`sweevo_to_harbor.py`：instruction.md 只写 problem_statement；SWE-EVO 的单提交重建写进 Dockerfile；`tests/test.sh` 写 `/logs/verifier/reward.json`（`{"resolved": 0|1, "fix_rate": x}`）
-- [ ] `eval/agents/belay_agent.py`：C/D 组接入
-- [ ] 填写 `task_selection.md` 4.3 节的实测难度
+另外，`task_selection.md` 已经是第 2 版（正式集 16 题：SWE-EVO 7、ProMax 3、LHTB 4、负对照 2），而计划文档的实验设计一节还是按 20 题写的；要的话我可以把文档里的题目、运行次数和排期同步成这版。
