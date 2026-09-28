@@ -11,6 +11,8 @@ runs.yaml 中除 FlatAgent 的参数外还可用：
   runtime     belay.config.RuntimeConfig 的字段，例如 {gate: advise, test_author: false}
   workers     M5 起生效
   paths       belay.config.RuntimePaths 的字段（容器内的状态目录等），只有本地测试需要改
+  task_instruction  由 runner 在 setup 前传入的任务原文（agent 定义里写 pass_instruction: true），用于在 setup
+              阶段做需求拆解；没有时在 run() 开头拆，耗时计入预算
 日志（trial 的 agent 日志目录下 belay/）：graph.sqlite、events.jsonl、ledger.json / ledger.md、setup.json、
 worktree.diff（结束时工作区相对原始代码的完整改动，调试用）、test_author-*.jsonl、reviews.jsonl。
 """
@@ -24,7 +26,9 @@ from pathlib import Path
 from belay.config import RuntimeConfig, RuntimePaths
 from belay.env import PierEnv
 from belay.runtime.bootstrap import SetupInfo, setup_container, verify_agent_user
+from belay.graph.requirements import extract_requirements
 from belay.runtime.orchestrator import Orchestrator
+from belay.runtime.planner import PlanResult, plan_requirements
 from belay.runtime.prompts import BELAY_RULES
 from belay.tools import BELAY_TOOLS, Policy, get_belay_tools
 from belay.worker import Worker, WorkerConfig
@@ -37,12 +41,14 @@ class BelayAgent(FlatAgent):
     time_reminders = True
 
     def __init__(self, *args, workers: int = 1, gate_spec: str | dict | None = None, runtime: dict | None = None,
-                 paths: dict | None = None, **kwargs):
+                 paths: dict | None = None, task_instruction: str | None = None, **kwargs):
         spec = json.loads(gate_spec) if isinstance(gate_spec, str) and gate_spec else gate_spec
         self.gate_spec: dict | None = spec or None
         self.runtime_cfg = RuntimeConfig.from_dict({**(runtime or {}), "workers": int(workers)})
         self.paths = RuntimePaths(**(paths or {}))         # 容器内路径；只有本地测试需要改
+        self.task_instruction = task_instruction           # runner 在 setup 前传入（pass_instruction: true）
         self.setup_info: SetupInfo | None = None
+        self.plan: PlanResult | None = None
         self.orch: Orchestrator | None = None
         super().__init__(*args, **kwargs)
 
@@ -76,6 +82,21 @@ class BelayAgent(FlatAgent):
                                                               ensure_ascii=False), encoding="utf-8")
         self.logger.info(f"[belay] setup 完成（{info.sec:.0f}s）：gate={info.gate_available} "
                          f"test_author={info.test_author_available} isolation={info.isolation} notes={info.notes}")
+        if self.task_instruction:                           # 需求拆解也在 setup 阶段做，不占 agent 预算
+            self.plan = await self._plan(self._make_llm(), self.task_instruction)
+
+    async def _plan(self, llm, instruction: str) -> PlanResult:
+        if self.runtime_cfg.requirement_planner == "rules":
+            plan = PlanResult(extract_requirements(instruction), "rules")
+        else:
+            def record(rec: dict) -> None:
+                with open(self.belay_dir / "planner.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            plan = await plan_requirements(llm, instruction, rounds=self.runtime_cfg.planner_rounds,
+                                           review=self.runtime_cfg.planner_review, record=record,
+                                           log=self.logger.info)
+        (self.belay_dir / "requirements.json").write_text(plan.to_json(), encoding="utf-8")
+        return plan
 
     def make_belay_worker(self, llm, env: PierEnv, context, work_id: str, runtime, task_refresh,
                           deadline: float) -> Worker:
@@ -89,7 +110,7 @@ class BelayAgent(FlatAgent):
                       task_refresh=task_refresh)
 
     async def run(self, instruction, environment, context) -> None:
-        budget = self.budget_min * 60 - 30
+        t0 = time.time()
         status = "error"
         try:
             info = self.setup_info
@@ -99,6 +120,11 @@ class BelayAgent(FlatAgent):
             root = PierEnv(environment, info.workspace, user="root")
             agent_env = PierEnv(environment, info.workspace, user=info.agent_user) if info.isolation else root
             llm = self._make_llm()                          # worker、Test Author、Reviewer 共用（录制在同一文件）
+            plan = self.plan
+            if plan is None or " ".join((self.task_instruction or "").split()) != " ".join(instruction.split()):
+                plan = await self._plan(llm, instruction)   # 没能在 setup 阶段拆：在这里拆，计入预算
+                self.plan = plan
+            budget = self.budget_min * 60 - 30 - (time.time() - t0)
 
             def factory(work_id, runtime, task_refresh, deadline):
                 self.worker = self.make_belay_worker(llm, agent_env, context, work_id, runtime, task_refresh,
@@ -108,7 +134,8 @@ class BelayAgent(FlatAgent):
             self.orch = Orchestrator(cfg=self.runtime_cfg, paths=self.paths, setup=info, spec=self.gate_spec,
                                      instruction=instruction, root_env=root, agent_env=agent_env, llm=llm,
                                      worker_factory=factory, out_dir=self.belay_dir, budget_sec=budget,
-                                     log=self.logger.info)
+                                     log=self.logger.info, requirements=plan.requirements,
+                                     plan_notes=plan.notes)
             status = await self.orch.run()
         except asyncio.CancelledError:
             status = "cancelled"

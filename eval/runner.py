@@ -112,6 +112,10 @@ def agent_phase(plan: RunPlan, step: Step, t: TaskRef, d: Path) -> dict:
         gate_file = plan.task_dir(t) / "gate.json"
         if gate_file.exists():
             extra["gate_spec"] = gate_file.read_text()
+    if step.agent.get("pass_instruction"):  # 在 setup 阶段就需要任务原文的 agent（Belay：需求拆解不占预算）
+        instr = plan.task_dir(t) / "instruction.md"
+        if instr.exists():
+            extra["task_instruction"] = instr.read_text()
     cfg = pb.job_config(job_name="agent", jobs_dir=d / "pier", task_dir=plan.task_dir(t),
                         agent_cfg=pb.agent_config(step.agent, plan.timeout_min, extra),
                         environment=plan.environment, keep_container=plan.keep_containers,

@@ -48,10 +48,15 @@ RUN_RUNNING, RUN_DONE, RUN_INCOMPLETE = "RUNNING", "DONE", "INCOMPLETE"
 @dataclass
 class Requirement:
     id: str
-    text: str                       # 原文（逐行照录，去掉列表符号）
+    text: str                       # 需求表述：规则切分时是原文；LLM 拆解时是归一化后的表述
     section: str = ""
     kind: str = "change"
     order: int = 0
+    quotes: list[str] = field(default_factory=list)   # 逐字的原文片段（LLM 拆解时由 runtime 校验过）
+
+    def original(self) -> str:
+        """这条需求在任务原文里的文字：reviewer 的引文按它校验。"""
+        return "\n".join(self.quotes) if self.quotes else self.text
 
 
 @dataclass

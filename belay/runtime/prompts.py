@@ -115,8 +115,9 @@ services), not by the code. Approve only if the failure output shows such a caus
 Costs are asymmetric: wrongly approving a test_conflict can let a real regression through and zero the whole \
 task, while wrongly rejecting costs at most one test. When in doubt, reject.
 
-To approve you MUST quote, verbatim, the passage that justifies the approval: from the requirement text for \
-test_conflict and insufficient_info, from the failure output for environment. The harness checks that the quote \
+To approve you MUST quote, verbatim, the passage that justifies the approval: from the task's original wording of \
+the requirement (the "Original task text" when one is given, otherwise the requirement text) for test_conflict and \
+insufficient_info, from the failure output for environment. The harness checks that the quote \
 appears exactly in that text and rejects the approval otherwise.
 
 Reply with a JSON object only:
@@ -136,3 +137,58 @@ def reviewer_message(kind: str, req_id: str | None, req_text: str, checks: list[
         parts.append(f"<failure_output>\n{failure}\n</failure_output>")
     parts.append(f"<diff>\n{diff or '(no changes)'}\n</diff>")
     return "\n\n".join(parts)
+
+
+# ---- 需求拆解（planner） -----------------------------------------------------------
+
+SPLITTER_SYSTEM = """You split a coding task into REQUIREMENTS for an evaluation harness. Each requirement is one \
+promise in the task that can be checked on its own. You do not solve the task.
+
+Rules:
+- One requirement = one independently checkable change of behaviour, API, output, option, or documentation. If a \
+single bullet describes several independent changes, split it. If several bullets describe the same change, merge \
+them.
+- Cover the whole task: every substantive line of the task text belongs to some requirement. Leave out only \
+contributor lists, changelog links and headings.
+- Items that need no code change (documentation, CI, packaging, internal refactors) are still requirements; mark \
+their kind accordingly.
+- kind: "new" (adds something), "change" (changes or fixes existing behaviour), "docs", "maintenance" \
+(build, CI, internal), "keep" (something that must stay as it is).
+- quotes: one or more passages copied EXACTLY from the task text (character for character, including backticks and \
+punctuation) that state this requirement. The harness checks them verbatim; a quote that is not in the task text is \
+rejected. Quote the whole item when it is short.
+- statement: the requirement in one or two precise English sentences, keeping every name, identifier, option and \
+value from the task. Do not add details the task does not state.
+- section: the heading the item is under, if any.
+
+Reply with a JSON object only:
+{"requirements": [{"statement": "...", "quotes": ["..."], "kind": "...", "section": "..."}]}"""
+
+
+def splitter_message(instruction: str, previous: str = "", feedback: list[str] | None = None) -> str:
+    parts = [f"<task>\n{instruction.strip()}\n</task>"]
+    if previous:
+        parts.append(f"<previous_answer>\n{previous}\n</previous_answer>")
+    if feedback:
+        parts.append("Your previous answer has these problems. Fix them and reply with the complete corrected JSON:\n"
+                     + "\n".join(f"- {f}" for f in feedback))
+    return "\n\n".join(parts)
+
+
+SPLIT_REVIEW_SYSTEM = """You review how a coding task was split into requirements for an evaluation harness. You see \
+the task text and the proposed requirements. Judge only the split, not how to implement it.
+
+Report a problem when:
+- a requirement bundles several independent changes that should be checked separately;
+- two requirements are really the same change;
+- a requirement's statement adds details the task does not state, or misses a name, value or condition it does state;
+- the kind is wrong ("new", "change", "docs", "maintenance", "keep");
+- something in the task that needs its own requirement is missing.
+Do not report style or wording preferences. If the split is acceptable, say so.
+
+Reply with a JSON object only:
+{"ok": true | false, "issues": ["Requirement 3: ...", "..."]}"""
+
+
+def split_review_message(instruction: str, drafts_json: str) -> str:
+    return f"<task>\n{instruction.strip()}\n</task>\n\n<proposed_requirements>\n{drafts_json}\n</proposed_requirements>"

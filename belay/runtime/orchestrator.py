@@ -90,7 +90,8 @@ class WorkerRuntime:
 class Orchestrator:
     def __init__(self, *, cfg: RuntimeConfig, paths: RuntimePaths, setup: SetupInfo, spec: dict | None,
                  instruction: str, root_env: Env, agent_env: Env, llm, worker_factory: WorkerFactory,
-                 out_dir: str | Path, budget_sec: float, log: Callable[[str], None] = print):
+                 out_dir: str | Path, budget_sec: float, log: Callable[[str], None] = print,
+                 requirements: list | None = None, plan_notes: list[str] | None = None):
         self.cfg = cfg
         self.paths = paths
         self.setup = setup
@@ -126,7 +127,7 @@ class Orchestrator:
             reserve = setup.full_gate_sec * cfg.gate_reserve_factor
         reserve = max(cfg.gate_reserve_min_sec, reserve + cfg.judge_reserve_sec)
         reserve = min(reserve, budget_sec * cfg.gate_reserve_max_frac)
-        reqs = extract_requirements(instruction)
+        reqs = requirements if requirements else extract_requirements(instruction)
         self.store = Store(self.out_dir / "graph.sqlite")
         self.state: GraphState = initial_state(
             requirements=reqs, baseline=setup.baseline, now=now, deadline_t=now + budget_sec, reserve_sec=reserve,
@@ -134,7 +135,7 @@ class Orchestrator:
             workspace=setup.workspace, gate_available=setup.gate_available,
             test_author_available=setup.test_author_available and cfg.test_author,
             protect_tests=cfg.protect_tests and setup.gate_available, test_files=setup.test_files,
-            notes=setup.notes)
+            notes=list(setup.notes) + list(plan_notes or []))
         init_state(self.store, self.state)
         self.log(f"[belay] {len(reqs)} 条需求，{len(setup.baseline)} 个基线测试，预留 {reserve:.0f}s 给最终门禁")
 

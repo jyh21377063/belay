@@ -19,6 +19,14 @@ from belay.runtime.messages import (Advance, AuthoredDraft, CallReviewer, CallTe
 from belay.runtime.prompts import worker_task
 from belay.worker.transcript import Transcript
 
+def requirement_for_judges(req) -> str:
+    """给 Test Author / Reviewer 的需求：表述 + 任务原文里的对应文字（引文按原文校验）。"""
+    original = req.original()
+    if " ".join(original.split()) == " ".join(req.text.split()):
+        return original
+    return f"{req.text}\n\nOriginal task text:\n{original}"
+
+
 if TYPE_CHECKING:                   # pragma: no cover
     from belay.runtime.orchestrator import Orchestrator
 
@@ -199,7 +207,8 @@ class Effects:
             try:
                 deadline = time.monotonic() + max(60.0, o.state.run.deadline_t - time.time() - o.state.run.reserve_sec)
                 code, err = await judges.write_test(
-                    o.llm, o.root_env, orig=o.paths.orig, selector=check.selector, req_id=req.id, req_text=req.text,
+                    o.llm, o.root_env, orig=o.paths.orig, selector=check.selector, req_id=req.id,
+                    req_text=requirement_for_judges(req),
                     section=req.section, task_context=o.task_context(), interface=a.interface, feedback=a.feedback,
                     max_turns=o.cfg.test_author_max_turns, deadline=deadline,
                     transcript=Transcript(o.out_dir / f"test_author-{check.id}-{check.attempts}.jsonl"))
@@ -228,7 +237,8 @@ class Effects:
                 diff = await o.repo.diff(o.state.run.base_tree, tree, max_chars=40000)
                 failure = o.failure_text(rep.check_ids)
                 source = "\n\n".join(filter(None, [await self._test_source(c) for c in rep.check_ids[:5]]))
-                verdict = await judges.review(o.llm, kind=rep.kind, req_id=rep.req_id, req_text=req.text if req else "",
+                verdict = await judges.review(o.llm, kind=rep.kind, req_id=rep.req_id,
+                                              req_text=requirement_for_judges(req) if req else "",
                                               checks=rep.check_ids, reason=rep.reason, diff=diff, failure=failure,
                                               test_source=source, record=o.review_record)
                 o.post(ReviewDone(time.time(), rep.id, verdict["approved"], verdict["quote"], verdict["reason"],

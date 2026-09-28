@@ -716,8 +716,8 @@ def on_review_done(tx: Tx, msg: ReviewDone, cfg) -> None:
     elif not msg.approved:
         verdict, review = "rejected", msg.reason
     else:
-        source = msg.failure_text if rep.kind == "environment" else (req.text if req else "")
-        where = "the failure output" if rep.kind == "environment" else f"the text of {rep.req_id}"
+        source = msg.failure_text if rep.kind == "environment" else (req.original() if req else "")
+        where = "the failure output" if rep.kind == "environment" else f"the task text of {rep.req_id}"
         if not msg.quote or not quote_in(msg.quote, source):
             verdict = "rejected"
             review = (f"the reviewer approved, but its quote does not appear verbatim in {where}, so the runtime "

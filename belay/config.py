@@ -15,6 +15,10 @@ from dataclasses import dataclass, fields
 
 @dataclass
 class RuntimeConfig:
+    # ---- 需求拆解（worker 开始之前）
+    requirement_planner: str = "llm"    # llm：一个模型拆、一个模型审、runtime 检查引文与覆盖；rules：规则切分
+    planner_rounds: int = 2             # 检查或审阅有意见时，交回拆解模型重做的最多轮数
+    planner_review: bool = True         # 是否用第二个模型审阅拆解
     # ---- 门禁
     gate: str = "block"                 # block | advise | off
     checkpoint_gate: str = "related"    # 检查点：related（改动相关的测试文件）| full
@@ -57,6 +61,8 @@ class RuntimeConfig:
         cfg = cls(**d)
         if cfg.gate not in ("block", "advise", "off"):
             raise ValueError(f"gate 只能是 block / advise / off，而不是 {cfg.gate!r}")
+        if cfg.requirement_planner not in ("llm", "rules"):
+            raise ValueError("requirement_planner 只能是 llm / rules")
         for name in ("checkpoint_gate", "final_gate"):
             if getattr(cfg, name) not in ("related", "full"):
                 raise ValueError(f"{name} 只能是 related / full")

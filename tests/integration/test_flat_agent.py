@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -82,7 +83,8 @@ def test_belay_agent_is_strict_and_delivers_the_integration_branch(setup):
     tmp = agent_dir.parent
     paths = {"state": str(tmp / "belay-state"), "bin": str(tmp / "belay-bin"), "dev_jobs": str(tmp / "belay-jobs")}
     agent = BelayAgent(logs_dir=agent_dir, model_name="deepseek-flash", extra_env={"DEEPSEEK_API_KEY": "x"}, workers=1,
-                       runtime={"isolation": False, "tick_sec": 0.5}, paths=paths)
+                       runtime={"isolation": False, "tick_sec": 0.5, "requirement_planner": "rules"},
+                       paths=paths)
     llm = ScriptedLLM([list(s) for s in SCRIPT])
     agent._make_llm = lambda: llm
     context = SimpleNamespace(metadata=None)
@@ -99,3 +101,32 @@ def test_belay_agent_is_strict_and_delivers_the_integration_branch(setup):
     patch = (agent_dir / "patch.diff").read_text()
     assert "+    return a + b" in patch
     assert (agent_dir / "belay" / "ledger.json").exists() and (agent_dir / "belay" / "events.jsonl").exists()
+
+
+def test_belay_agent_splits_requirements_during_setup(setup):
+    """runner 在 setup 前传入任务原文时，需求拆解在 setup 里完成（不占预算），run() 不再重拆。"""
+    repo, agent_dir = setup
+    env = FakePierEnvironment(repo, agent_dir)
+    tmp = agent_dir.parent
+    paths = {"state": str(tmp / "belay-state"), "bin": str(tmp / "belay-bin"), "dev_jobs": str(tmp / "belay-jobs")}
+    split = {"requirements": [{"statement": "add() returns the sum of its arguments.", "quotes": ["Fix add()"],
+                               "kind": "change", "section": ""}]}
+    plan_calls = [[{"type": "text", "text": json.dumps(split)}],
+                  [{"type": "text", "text": json.dumps({"ok": True, "issues": []})}]]
+    agent = BelayAgent(logs_dir=agent_dir, model_name="deepseek-flash", extra_env={"DEEPSEEK_API_KEY": "x"}, workers=1,
+                       runtime={"isolation": False, "tick_sec": 0.5}, paths=paths, task_instruction="Fix add()")
+    llm = ScriptedLLM(plan_calls + [list(s) for s in SCRIPT])
+    agent._make_llm = lambda: llm
+    context = SimpleNamespace(metadata=None)
+
+    async def go():
+        await agent.setup(env)
+        assert len(llm.requests) == 2                      # 拆 + 审，都在 setup 里
+        await agent.run("Fix add()", env, context)
+    asyncio.run(go())
+    plan = json.loads((agent_dir / "belay" / "requirements.json").read_text())
+    assert plan["source"] == "llm" and plan["requirements"][0]["text"] == "add() returns the sum of its arguments."
+    assert plan["requirements"][0]["quotes"] == ["Fix add()"]
+    assert (agent_dir / "belay" / "planner.jsonl").exists()
+    assert "add() returns the sum" in llm.requests[2]["messages"][0]["content"]   # worker 看到的需求来自拆解
+    assert context.metadata["belay_status"] == "DONE"

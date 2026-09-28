@@ -119,11 +119,13 @@ agents:
     <<: *flat
     import_path: "eval.agents.belay_agent:BelayAgent"
     gate: true                          # runner 读取任务目录下的 gate.json 作为测试配置（目前仅 SWE-EVO 生成）
-    setup_timeout_min: 150              # setup 阶段在原始代码上跑两次基线，不计入 90 分钟预算
+    pass_instruction: true              # setup 阶段就把任务原文交给 agent，需求拆解不占 90 分钟
+    setup_timeout_min: 150              # setup 阶段在原始代码上跑两次基线、拆解需求，不计入 90 分钟预算
     kwargs: &belay_kwargs
       <<: *flat_kwargs
       workers: 1                        # Belay-1；M5 起可改为 3
       runtime: &belay_runtime           # belay/config.py 的 RuntimeConfig；每个机制都可以关掉
+        requirement_planner: llm        # llm：一个模型拆、一个模型审、runtime 检查引文与覆盖；rules：规则切分
         gate: block                     # block | advise（只提示不拒绝）| off
         checkpoint_gate: related        # 检查点只跑与改动相关的测试文件
         final_gate: full                # 最终提交跑全量；剩余时间不够时自动降为 related
