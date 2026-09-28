@@ -57,6 +57,7 @@ class Wait(Message):
 class LedgerQuery(Message):
     rid: str
     work_id: str
+    req_id: str = ""                # 非空：只看这条需求（含验收测试的内容）
 
 
 @dataclass
@@ -72,14 +73,6 @@ class Submit(Message):
     dropped_tests: list[str] = field(default_factory=list)
     by_runtime: str = ""            # deadline | worker_exit；空 = worker 自己提交
     error: str = ""                 # 快照失败
-
-
-@dataclass
-class RequestTest(Message):
-    rid: str
-    work_id: str
-    req_id: str
-    interface: str = ""
 
 
 @dataclass

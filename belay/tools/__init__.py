@@ -1,7 +1,7 @@
 """工具注册表。
 
 DEFAULT_TOOLS 是 B 组（FlatAgent）的工具集；BELAY_TOOLS 用 runtime 版的 submit 替换 B 组的 submit，
-并加入 run_check / wait / ledger / request_test / report_conflict（见 belay/tools/runtime.py）。
+并加入 run_check / wait / ledger / report_conflict（见 belay/tools/runtime.py）。
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ RUNTIME_TOOLS: dict[str, Tool] = {t.name: t for t in runtime.TOOLS}
 DEFAULT_TOOLS = ["read_file", "edit_file", "write_file", "list_files", "grep_search", "bash", "todo_write",
                  "explore", "submit"]
 BELAY_TOOLS = [n for n in DEFAULT_TOOLS if n != "submit"] + ["run_check", "wait", "ledger", "submit",
-                                                             "request_test", "report_conflict"]
+                                                             "report_conflict"]
 EXPLORE_TOOLS = ["read_file", "list_files", "grep_search", "bash"]        # 探索子 agent：只读，不能再开子 agent
 
 

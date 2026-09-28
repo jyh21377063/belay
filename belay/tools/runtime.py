@@ -2,10 +2,9 @@
 
   run_check        后台跑检查（测试或命令），立即返回作业 id；命中缓存时直接返回结果
   wait             挂起到作业完成，返回按基线归类的结果
-  ledger           需求账本、剩余预算、已知失败
+  ledger           需求账本、剩余预算、已知失败；指定需求时显示它的验收测试
   submit           提交候选：检查点（final=false）或最终提交（final=true）
-  request_test     请独立的 Test Author 为一条需求写测试
-  report_conflict  上报测试与需求冲突、信息不足、环境问题
+  report_conflict  申诉：旧测试与需求冲突、验收测试与原文不符、信息不足、环境问题
 
 B 组（FlatAgent）没有 runtime，这些工具不注册。submit 与 shell.py 里 B 组的 submit 同名，二者只注册其一。
 """
@@ -53,7 +52,7 @@ async def wait(inp: dict, ctx: ToolContext) -> str:
 
 
 async def ledger(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _runtime(ctx).request("ledger"))
+    return _out(await _runtime(ctx).request("ledger", req_id=str(inp.get("requirement") or "")))
 
 
 async def submit(inp: dict, ctx: ToolContext) -> str:
@@ -63,14 +62,6 @@ async def submit(inp: dict, ctx: ToolContext) -> str:
         ctx.submitted = True
         ctx.summary = summary
     return _out(reply)
-
-
-async def request_test(inp: dict, ctx: ToolContext) -> str:
-    req = str(inp.get("requirement") or "").strip()
-    if not req:
-        raise ToolError("requirement is required (an id such as R3)")
-    return _out(await _runtime(ctx).request("request_test", req_id=req,
-                                            interface=str(inp.get("interface") or "")))
 
 
 async def report_conflict(inp: dict, ctx: ToolContext) -> str:
@@ -111,17 +102,20 @@ TOOLS = [
          wait),
     Tool("ledger",
          "Show the requirement ledger: each requirement's status and evidence, the time left, what is on the "
-         "integration branch, pending reports and independent tests, and the tests that already fail on the "
-         "original code.",
-         {"type": "object", "properties": {}},
+         "integration branch, pending reports and acceptance tests, and the tests that already fail on the "
+         "original code. With requirement=\"R3\" it shows that requirement in detail, including the content of its "
+         "acceptance test and why it last failed.",
+         {"type": "object", "properties": {
+             "requirement": {"type": "string", "description": "Optional requirement id, e.g. R3"}}},
          ledger, read_only=True),
     Tool("submit",
          "Hand your current working tree to the harness as a candidate. The harness checks it against the tests "
          "that passed on the original code and merges it into the deliverable only if none of them fail now; "
          "otherwise you get the failures back and continue.\n"
          "- final=false: a checkpoint. Tests related to your changes are checked; on success you keep working.\n"
-         "- final=true: you have finished the whole task. The full suite is checked; the harness then decides from "
-         "the ledger whether the run ends.\n"
+         "- final=true: you have finished the whole task. The full suite is checked; the run ends only when every "
+         "acceptance test passes (otherwise your work is merged and you get the failing ones back). If acceptance "
+         "tests are still being written, the call waits for them.\n"
          "The summary must report what actually happened: first which requirements are not done and which checks "
          "fail or were skipped, then what you changed and how you verified it.",
          {"type": "object", "properties": {
@@ -129,32 +123,21 @@ TOOLS = [
              "final": {"type": "boolean", "description": "true when the whole task is finished"}},
           "required": ["summary", "final"]},
          submit),
-    Tool("request_test",
-         "Ask an independent Test Author to write a test for one requirement. It sees the requirement text, the "
-         "original code and the interface you declare, never your implementation. The test is accepted only if it "
-         "fails on the original code at the assertion level; then it runs in every gate, and the requirement counts "
-         "as SUPPORTED once it passes on the integration branch. The call returns at once; you are notified of the "
-         "outcome. Declare the public names and signatures you are adding or changing for this requirement, so the "
-         "test uses them.",
-         {"type": "object", "properties": {
-             "requirement": {"type": "string", "description": "Requirement id, e.g. R3"},
-             "interface": {"type": "string",
-                           "description": "Public functions, classes, options or CLI flags (with signatures) that "
-                                          "the requirement adds or changes"}},
-          "required": ["requirement"]},
-         request_test),
     Tool("report_conflict",
          "Report a problem instead of working around it. A reviewer who sees only the requirement text, your diff "
          "and the failing checks decides; the decision is recorded in the ledger.\n"
          "- test_conflict: a test that passed on the original code now fails because the requirement explicitly "
          "asks for that behaviour change. If approved, the gate stops counting that test as a regression.\n"
+         "- wrong_test: the requirement's acceptance test contradicts the task text or checks something the task "
+         "does not ask for. If approved, the test is withdrawn and no longer blocks the final submission.\n"
          "- insufficient_info: the requirement cannot be implemented from the information available.\n"
          "- environment: a failure is caused by the environment (network, permissions, services), not the code.\n"
          "Name the tests exactly as run_check or the gate reported them.",
          {"type": "object", "properties": {
-             "kind": {"type": "string", "enum": ["test_conflict", "insufficient_info", "environment"]},
+             "kind": {"type": "string", "enum": ["test_conflict", "wrong_test", "insufficient_info", "environment"]},
              "requirement": {"type": "string", "description": "Requirement id, e.g. R3"},
-             "checks": {"type": "array", "items": {"type": "string"}, "description": "Test ids"},
+             "checks": {"type": "array", "items": {"type": "string"},
+                        "description": "Test ids (test_conflict, environment)"},
              "reason": {"type": "string", "description": "Why; cite the requirement text"}},
           "required": ["kind", "reason"]},
          report_conflict),

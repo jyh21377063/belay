@@ -32,7 +32,7 @@ from belay.runtime.decide import decide
 from belay.runtime.effects import Effects
 from belay.runtime.gitops import ShadowRepo
 from belay.runtime.jobs import JobRunner
-from belay.runtime.messages import (LedgerQuery, Message, ReportConflict, RequestTest, RunCheck, Start, Stop, Submit,
+from belay.runtime.messages import (LedgerQuery, Message, ReportConflict, RunCheck, Start, Stop, Submit,
                                     Tick, Wait)
 
 WorkerFactory = Callable[[str, "WorkerRuntime", Callable[[], Awaitable[str]], float], Any]
@@ -65,13 +65,11 @@ class WorkerRuntime:
             elif kind == "wait":
                 msg = Wait(now, rid, self.work_id, list(p["job_ids"]), float(p.get("timeout") or 600))
             elif kind == "ledger":
-                msg = LedgerQuery(now, rid, self.work_id)
+                msg = LedgerQuery(now, rid, self.work_id, str(p.get("req_id") or "").strip())
             elif kind == "submit":
                 facts = await o.candidate_facts(self.work_id)
                 msg = Submit(time.time(), rid, self.work_id, str(p.get("summary") or ""), bool(p.get("final")),
                              **facts)
-            elif kind == "request_test":
-                msg = RequestTest(now, rid, self.work_id, str(p["req_id"]), str(p.get("interface") or ""))
             elif kind == "report_conflict":
                 msg = ReportConflict(now, rid, self.work_id, str(p.get("report_kind") or ""), p.get("req_id"),
                                      list(p.get("check_ids") or []), str(p.get("reason") or ""))
@@ -122,11 +120,7 @@ class Orchestrator:
         self._tick_task: asyncio.Task | None = None
 
         now = time.time()
-        reserve = 0.0
-        if setup.gate_available and cfg.gate != "off":
-            reserve = setup.full_gate_sec * cfg.gate_reserve_factor
-        reserve = max(cfg.gate_reserve_min_sec, reserve + cfg.judge_reserve_sec)
-        reserve = min(reserve, budget_sec * cfg.gate_reserve_max_frac)
+        reserve = cfg.reserve_sec(setup.full_gate_sec, budget_sec, setup.gate_available)
         reqs = requirements if requirements else extract_requirements(instruction)
         self.store = Store(self.out_dir / "graph.sqlite")
         self.state: GraphState = initial_state(
@@ -171,6 +165,11 @@ class Orchestrator:
                       key=lambda j: j.finished_t or 0, reverse=True)
         lines = []
         for c in check_ids:
+            chk = self.state.check.get(c)
+            if chk is not None and chk.source == "authored":         # 验收测试：最近一次门禁里的失败
+                lines.append(f"{c} (acceptance test for {chk.req_id}): "
+                             + (chk.last_failure or "no failure recorded"))
+                continue
             for j in jobs:
                 r = (j.result or {}).get("reasons", {}).get(c)
                 st = (j.result or {}).get("tests", {}).get(c)
@@ -314,8 +313,9 @@ class Orchestrator:
                 "candidates": len(cands), "rejections": sum(c.verdict == "rejected" for c in cands),
                 "dropped_test_files": sorted({p for c in cands for p in c.dropped_tests})[:50],
                 "reports": {k: sum(r.kind == k for r in st.report.values())
-                            for k in ("test_conflict", "insufficient_info", "environment")},
+                            for k in ("test_conflict", "wrong_test", "insufficient_info", "environment")},
                 "reports_approved": sum(r.verdict == "approved" for r in st.report.values()),
-                "independent_tests": {s: sum(c.status == s for c in st.authored(active_only=False))
-                                      for s in ("active", "pending", "rejected")},
+                "acceptance_tests": {s: sum(c.status == s for c in st.authored(active_only=False))
+                                     for s in ("active", "queued", "pending", "rejected", "withdrawn")},
+                "final_bounces": sum(w.final_bounces for w in st.work.values()),
                 "jobs": len(st.job), "isolation": self.isolation, "notes": st.run.notes}

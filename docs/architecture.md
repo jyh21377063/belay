@@ -23,12 +23,12 @@ belay/                      # 仓库根目录
 │   │   ├── files.py  shell.py  #   文件工具（含读后被改检测）、bash、todo、submit
 │   │   ├── agents.py       #   explore：只读探索子 agent，经 ToolContext.subagent 由 worker 注入
 │   │   ├── output.py       #   工具输出截断（保留报错行）
-│   │   └── runtime.py      #   run_check / wait / ledger / submit / request_test / report_conflict
+│   │   └── runtime.py      #   run_check / wait / ledger / submit / report_conflict
 │   │                       #   （M5 加 spawn_work），只负责把请求交给 ctx.runtime
 │   │
 │   ├── graph/              # 证据图：数据模型 + 存储，不含调度逻辑
 │   │   ├── model.py        #   节点、状态常量、GraphState、变更（Put / Delete / Event）与事务 Tx
-│   │   ├── evidence.py     #   证据规则：按基线归类、相关测试、失败签名、独立测试的收录（纯函数）
+│   │   ├── evidence.py     #   证据规则：按基线归类、相关测试、失败签名、验收测试的收录（纯函数）
 │   │   ├── ledger.py       #   需求状态的计算，账本与作业结果的文字（纯函数）
 │   │   ├── requirements.py #   需求抽取（release notes 机械切分）与引文校验
 │   │   ├── build.py        #   初始图
@@ -48,7 +48,7 @@ belay/                      # 仓库根目录
 │   │   └── recovery.py     #   M6：重启对账
 │   │
 │   ├── container/          # 上传到容器里执行的脚本：只用标准库，兼容 Python 3.6
-│   │   └── runner.py       #   跑测试（临时切换候选树、放入独立测试、结束后恢复）、解析结果、剔除测试改动
+│   │   └── runner.py       #   跑测试（临时切换候选树、放入验收测试、结束后恢复）、解析结果、剔除测试改动
 │   │
 │   └── observe/            # M6：读事件表生成回放页面
 │
@@ -103,11 +103,16 @@ async def orchestrator(inbox, state, effects):
    | --- | --- | --- |
    | `belay-m2` | 证据图、作业（`run_check` / `wait`）、基线（setup 阶段两次）、`ledger`、需求切分；`submit` 直接合并 | worker 用 `wait` 代替 `sleep`，`ledger` 能看到基线 |
    | `belay-m3` | + 门禁（检查点跑相关子集、最终跑全量）、集成分支比较并交换推进、剔除测试路径下的改动、截止保护、交付 HEAD、DONE / INCOMPLETE、OS 层隔离 | conan 上回归被拦下、补丁里没有测试改动 |
-   | `belay` | + `request_test`（Test Author，原始代码上断言失败才收录）、`report_conflict`（Reviewer，引文逐字校验） | 一次上报从提交到裁决、再到账本更新完整跑通 |
+   | `belay` | + 完成门（开工时 Test Author 为每条需求写一个验收测试，原始代码上断言失败才收录；最终提交要求全部通过）、申诉 `report_conflict`（Reviewer，引文逐字校验；可豁免旧测试或作废验收测试） | 一次最终提交被验收测试退回、再通过；一次申诉从提交到裁决完整跑通 |
+
+   整体逻辑是**两道门、一个申诉通道、一个存档点**：合并门（原来能过的测试必须还能过，被跳过也算回归）决定能不能存档；
+   完成门（验收测试全部通过）决定 worker 能不能停；申诉处理测试与任务原文冲突；集成分支是存档，截止时交付它。
+   `run_check` / `wait` / `ledger` 只是帮 worker 干得快的工具，没有决定权。
 
    另有 `gate: advise`（只提示不拒绝）用于"约束力"的消融。设计上的取舍：
    - **单 worker 时门禁在规范工作区原地运行。** worker 在 `submit` 期间阻塞；runner 临时把工作区切换为候选树（测试文件恢复为原始版本、放入独立测试），跑完原样恢复。独立门禁工作区要靠 `PYTHONPATH` 指向副本，旧式 `easy-install.pth` 与就地编译的扩展会让测试 import 到错误的代码，放到 M5 与 worker 的 worktree 一起做（作业的 `workspace` 字段已经留好）。
-   - **Test Author 在原始代码副本上验证。** setup 阶段检查副本里 `sys.path` 的顺序，import 会落到工作区时关闭独立测试并记录原因。
+   - **Test Author 在原始代码副本上验证。** setup 阶段检查副本里 `sys.path` 的顺序，import 会落到工作区时关闭验收测试（完成门）并记录原因。
+   - **验收测试只写一次、不设数量上限。** 开工时按需求顺序排队，同时在写的数量受 `test_author_parallel` 限制（只影响先后）；最终提交先等它们写完。写不出有效测试的需求记为 UNKNOWN，不挡完成；测试与原文不符时由 worker 申诉（`wrong_test`）。
    - **每一步失败只关闭对应机制**（没有测试配置、基线跑不出结果、建不了低权限用户），原因写进 `setup.json` 与账本。
 4. **M5 并发（2 天）**：`spawn_work`、每个 worker 一个 worktree、合并队列（`merge-tree` + CAS）、失败签名广播。因为 M2 的数据模型已经按多 worker 设计，这一步主要是加 worker 协程和合并逻辑。**完成标准**：一道可分解的开发题上 3 个 worker 的改动都合并成功。
 5. **M6 恢复、回放（1.5 天）**：见下文第三点。

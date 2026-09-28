@@ -168,7 +168,8 @@ TASK_M4 = """The repository contains a small calculator package.
 - `mul(a, b)` now returns `a * b + 1`
 </release_notes>"""
 
-AUTHORED = """```python
+AUTHORED = {
+    "R1": """```python
 import pkg.calc as calc
 
 
@@ -176,10 +177,31 @@ def test_sub():
     assert hasattr(calc, "sub")
     assert calc.sub(5, 3) == 2
 ```
-Checks the new sub()."""
+Checks the new sub().""",
+    "R2": """```python
+from pkg.calc import mul
 
 
-def test_independent_test_and_report_update_the_ledger(tmp_path):
+def test_mul_adds_one():
+    assert mul(2, 3) == 7
+```
+Checks the new mul().""",
+}
+
+
+class AuthorLLM:
+    """Test Author 按需求并发运行：按任务里的需求 id 分给各自的脚本。"""
+
+    def __init__(self, answers: dict[str, str]):
+        self.scripts = {rid: ScriptedLLM([[{"type": "text", "text": text}]]) for rid, text in answers.items()}
+
+    async def call(self, system, tools, messages, tool_choice=None):
+        first = json.dumps(messages[0]["content"])
+        rid = next(r for r in self.scripts if f'id=\\"{r}\\"' in first)
+        return await self.scripts[rid].call(system, tools, messages, tool_choice)
+
+
+def test_acceptance_tests_gate_the_final_submission_and_reports_waive_old_tests(tmp_path):
     repo = make_repo(tmp_path / "repo")
     paths = local_paths(tmp_path)
     env = LocalEnv(str(repo))
@@ -187,19 +209,16 @@ def test_independent_test_and_report_update_the_ledger(tmp_path):
     info = run(setup_container(env, str(repo), SPEC, rc, paths, log=lambda m: None))
     assert info.test_author_available, info.notes
     worker = ScriptedLLM([
-        [tool_use("w1", "request_test", requirement="R1", interface="pkg.calc.sub(a, b) -> a - b")],
-        [tool_use("w2", "read_file", file_path="pkg/calc.py")],
-        [tool_use("w3", "edit_file", file_path="pkg/calc.py", old_string="    return a * b\n",
+        [tool_use("w1", "read_file", file_path="pkg/calc.py")],
+        [tool_use("w2", "edit_file", file_path="pkg/calc.py", old_string="    return a * b\n",
                   new_string="    return a * b + 1\n\n\ndef sub(a, b):\n    return a - b\n")],
-        [tool_use("w4", "report_conflict", kind="test_conflict", requirement="R2",
+        [tool_use("w3", "report_conflict", kind="test_conflict", requirement="R2",
                   checks=["tests/test_calc.py::test_mul"], reason="R2 changes what mul returns")],
-        [tool_use("w5", "bash", command="sleep 6")],
-        [tool_use("w6", "submit", summary="done", final=True)],
+        [tool_use("w4", "submit", summary="done", final=True)],
     ])
-    author = ScriptedLLM([[{"type": "text", "text": AUTHORED}]])
     reviewer = ScriptedLLM([[{"type": "text", "text": json.dumps({
         "decision": "approve", "quote": "`mul(a, b)` now returns `a * b + 1`", "reason": "explicit change"})}]])
-    llm = RoutingLLM(worker, author, reviewer)
+    llm = RoutingLLM(worker, AuthorLLM(AUTHORED), reviewer)
     out = tmp_path / "out"
 
     def factory(work_id, runtime, task_refresh, deadline):
@@ -218,11 +237,12 @@ def test_independent_test_and_report_update_the_ledger(tmp_path):
     status, orch = run(go())
     ledger = json.loads((out / "ledger.json").read_text())
     assert status == "DONE", (orch.final_reason, ledger)
-    assert {r["id"]: r["status"] for r in ledger["requirements"]} == {"R1": "SUPPORTED", "R2": "WAIVED"}
-    report_reply = worker.requests[4]["messages"][-1]["content"][0]["content"]
+    # 两条需求都由开工时写好的验收测试证明；test_mul 的失败经申诉豁免，不挡合并
+    assert {r["id"]: r["status"] for r in ledger["requirements"]} == {"R1": "SUPPORTED", "R2": "SUPPORTED"}
+    report_reply = worker.requests[3]["messages"][-1]["content"][0]["content"]
     assert "approved" in report_reply
-    seen = json.dumps([r["messages"][-1] for r in worker.requests])
-    assert "Independent test T1 for R1 was accepted" in seen            # 通知注入到 worker 的下一轮
+    types = [json.loads(line)["type"] for line in (out / "events.jsonl").read_text().splitlines()]
+    assert types.count("test_requested") == 2 and "merged" in types
     calc = (repo / "pkg" / "calc.py").read_text()
     assert "def sub" in calc and "a * b + 1" in calc
     assert (out / "reviews.jsonl").exists() and list(out.glob("test_author-T1-*.jsonl"))

@@ -251,6 +251,9 @@ class Effects:
         o.spawn(go(), f"review {a.report_id}")
 
     async def _test_source(self, node_id: str, max_chars: int = 6000) -> str:
+        chk = self.o.state.check.get(node_id)
+        if chk is not None and chk.source == "authored":            # 验收测试：Test Author 写的文件
+            return f"# acceptance test {chk.id} for {chk.req_id}\n" + chk.content[:max_chars]
         path, _, rest = node_id.partition("::")
         text = await self.o.repo.show(self.o.state.run.base_tree, path, max_chars=400_000)
         if not text:

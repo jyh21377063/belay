@@ -59,7 +59,7 @@ def baseline_status(runs: list[dict[str, str]]) -> dict[str, str]:
 class Classified:
     total: int = 0
     passed: int = 0
-    regressions: list[str] = field(default_factory=list)      # 基线通过、现在失败或没跑出来
+    regressions: list[str] = field(default_factory=list)      # 基线通过、现在失败、被跳过或没跑出来
     waived: list[str] = field(default_factory=list)           # 回归但已获批例外
     known: list[str] = field(default_factory=list)            # 基线就失败
     flaky: list[str] = field(default_factory=list)            # 基线不稳定，现在失败
@@ -91,7 +91,9 @@ def classify(baseline: dict[str, str], results: dict[str, str], selected_files: 
                 c.fixed.append(t)
             continue
         if s not in FAILING:
-            continue                                   # SKIPPED 等
+            if b == PASS:                              # 原来通过、现在被跳过：也是回归（不许用跳过绕过合并门）
+                (c.waived if t in waived else c.regressions).append(t)
+            continue
         if b == PASS:
             (c.waived if t in waived else c.regressions).append(t)
         elif b == FAIL:

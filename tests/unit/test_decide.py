@@ -9,7 +9,7 @@ from belay.graph.model import FAIL, MERGED, PASS, RUNNING, Requirement
 from belay.runtime.decide import decide
 from belay.runtime.messages import (Advance, AuthoredDraft, CallReviewer, CallTestAuthor, CancelJob,
                                     FinalizeWorkspace, Finish, JobFinished, LedgerQuery, Merged, Notify, Reply,
-                                    ReportConflict, RequestTest, ReviewDone, RunCheck, Start, StartJob, StartWorker,
+                                    ReportConflict, ReviewDone, RunCheck, Start, StartJob, StartWorker,
                                     StopWorker, Submit, Tick, Wait, WorkerExited)
 
 T0 = 1_000_000.0
@@ -91,15 +91,26 @@ def submit(d: Driver, rid: str, tree: str, final: bool, changed=("pkg/widget.py"
                   changed=list(changed), changed_since_base=list(changed), dropped_tests=list(dropped))
 
 
-def gate_ok(d: Driver, job: str, fail: tuple = ()) -> list:
+def gate_ok(d: Driver, job: str, fail: tuple = (), failing_checks: tuple = ()) -> list:
     tests = {t: ("FAILED" if t in fail else "PASSED") for t in BASELINE if t.startswith(W) or d.state.job[job].level
              == "full"}
     tests[f"{O}::test_3"] = "FAILED"
+    reasons = {t: "AssertionError: boom" for t in fail}
     for c in d.state.authored():
         for n in c.nodes:
-            tests[n] = "PASSED"
-    return d.send(JobFinished, job, "DONE", {"status": "ok", "tests": tests,
-                                             "reasons": {t: "AssertionError: boom" for t in fail}})
+            tests[n] = "FAILED" if c.id in failing_checks else "PASSED"
+            if c.id in failing_checks:
+                reasons[n] = "assert render() == 'w'"
+    return d.send(JobFinished, job, "DONE", {"status": "ok", "tests": tests, "reasons": reasons})
+
+
+def accept(d: Driver, cid: str) -> list:
+    """Test Author 交卷 → 在原始代码上以断言失败 → 收录。"""
+    f = d.state.check[cid].selector
+    val = d.job(d.send(AuthoredDraft, cid, True, stored_at=f"/opt/belay/checks/{cid}/x.py",
+                       content=f"def test_{cid.lower()}(): ..."))
+    return d.send(JobFinished, val, "DONE", {"status": "ok", "tests": {f"{f}::test_x": "FAILED"},
+                                             "reasons": {f"{f}::test_x": "assert None == 'w'"}})
 
 
 def test_checkpoint_rejected_then_merged_then_final_finishes():
@@ -134,14 +145,111 @@ def test_checkpoint_rejected_then_merged_then_final_finishes():
     assert [i.commit for i in d.state.integration_chain()] == ["c2", "c3"]
 
 
-def test_final_info_bounce_once_then_finish_on_unchanged_tree():
+def test_start_queues_one_acceptance_test_per_requirement():
+    d = Driver(RuntimeConfig(test_author_parallel=1))
+    acts = d.send(Start)
+    assert [a.check_id for a in of(acts, CallTestAuthor)] == ["T1"]          # 并发 1：先写 R1 的
+    assert [(c.id, c.req_id, c.status) for c in d.state.authored(active_only=False)] == [
+        ("T1", "R1", "pending"), ("T2", "R2", "queued")]
+    acts = accept(d, "T1")
+    assert "ready" in of(acts, Notify)[0].text and 'ledger(requirement="R1")' in of(acts, Notify)[0].text
+    assert [a.check_id for a in of(acts, CallTestAuthor)] == ["T2"]          # 写完一个，排下一个
+    assert [s.status for s in statuses(d.state)] == ["FAILED", "OPEN"]       # 集成分支还是原始代码：R1 的测试失败
+
+
+def test_acceptance_test_runs_in_every_gate_and_supports_the_requirement():
     d = Driver()
-    gate = d.job(submit(d, "s1", "t1", final=True))
-    acts = d.send(Merged, of(gate_ok(d, gate), Advance)[0].candidate_id, True)
+    d.send(Start)
+    accept(d, "T1")
+    f = d.state.check["T1"].selector
+    gate = d.job(submit(d, "s1", "t1", final=False))
+    assert f in d.state.job[gate].selection and f in d.state.job[gate].overlay
+    acts = gate_ok(d, gate, failing_checks=("T1",))                           # 验收测试失败不挡检查点
+    acts = d.send(Merged, of(acts, Advance)[0].candidate_id, True)
+    assert "Merged" in replies(acts)["s1"].text and "Acceptance test T1 (R1): FAILS" in replies(acts)["s1"].text
+    assert d.state.check["T1"].last_failure
+    gate = d.job(submit(d, "s2", "t2", final=False))
+    d.send(Merged, of(gate_ok(d, gate), Advance)[0].candidate_id, True)
+    assert [s.status for s in statuses(d.state)][0] == "SUPPORTED"
+
+
+def test_acceptance_test_retried_then_rejected_does_not_block():
+    d = Driver(RuntimeConfig(test_author_parallel=1))
+    d.send(Start)
+    f = d.state.check["T1"].selector
+    bad = {"status": "ok", "tests": {f"{f}::t": "FAILED"}, "reasons": {f"{f}::t": "AttributeError: no widget"}}
+    val = d.job(d.send(AuthoredDraft, "T1", True, stored_at="/s/x.py", content="c"))
+    acts = d.send(JobFinished, val, "DONE", bad)
+    assert of(acts, CallTestAuthor)[0].feedback                           # 退回重写一次，附上原因
+    val = d.job(d.send(AuthoredDraft, "T1", True, stored_at="/s/x.py", content="c"))
+    acts = d.send(JobFinished, val, "DONE", bad)
+    assert "No valid acceptance test" in of(acts, Notify)[0].text and d.state.check["T1"].status == "rejected"
+    assert of(acts, CallTestAuthor)[0].check_id == "T2"
+    assert [s.status for s in statuses(d.state)][0] == "UNKNOWN"
+
+
+def test_final_submission_waits_for_acceptance_tests_and_bounces_until_they_pass():
+    d = Driver()
+    d.send(Start)                                                          # T1、T2 在写
+    acts = submit(d, "s1", "t1", final=True)
+    assert not of(acts, StartJob) and not replies(acts)                    # 等验收测试写完，worker 在 submit 上等
+    assert d.state.candidate["C1"].waiting_tests
+    assert not of(accept(d, "T1"), StartJob)
+    assert d.state.candidate["C1"].waiting_tests                           # T2 还在写
+    acts = d.send(AuthoredDraft, "T2", False, error="NOT TESTABLE")         # T2 写不出：不挡完成
+    gate = [a.job_id for a in of(acts, StartJob) if d.state.job[a.job_id].purpose == "gate"][0]
+    assert d.state.job[gate].level == "full" and d.state.check["T1"].selector in d.state.job[gate].overlay
+    acts = d.send(Merged, of(gate_ok(d, gate, failing_checks=("T1",)), Advance)[0].candidate_id, True)
     r = replies(acts)["s1"]
-    assert not r.finished and "no independent evidence" in r.text and "R1, R2" in r.text
-    acts = submit(d, "s2", "t1", final=True)                               # 没有新改动：不再跑门禁
-    assert not of(acts, StartJob) and replies(acts)["s2"].finished and of(acts, Finish)[0].status == "DONE"
+    assert not r.finished and "Not finished" in r.text and "R1" in r.text and "wrong_test" in r.text
+    assert d.state.run.head_commit == "c1" and d.state.work["W1"].state == RUNNING   # 进度已经存档
+    assert d.state.work["W1"].final_bounces == 1
+    gate = d.job(submit(d, "s2", "t2", final=True))
+    acts = d.send(Merged, of(gate_ok(d, gate), Advance)[0].candidate_id, True)
+    assert replies(acts)["s2"].finished and of(acts, Finish)[0].status == "DONE"
+    assert [s.status for s in statuses(d.state)] == ["SUPPORTED", "UNKNOWN"]
+
+
+def test_wrong_test_appeal_withdraws_the_acceptance_test():
+    d = Driver(RuntimeConfig(test_author_parallel=1))
+    d.send(Start)
+    accept(d, "T1")
+    d.send(AuthoredDraft, "T2", False, error="NOT TESTABLE")
+    assert replies(d.send(ReportConflict, "p0", "W1", "wrong_test", "R2", [], "x"))["p0"].error   # R2 没有验收测试
+    acts = d.send(ReportConflict, "p1", "W1", "wrong_test", "R1", [], "the test expects a string, the task says option")
+    call = of(acts, CallReviewer)[0]
+    assert d.state.report[call.report_id].check_ids == ["T1"]
+    acts = d.send(ReviewDone, call.report_id, True, quote="Add a `widget` option to `render`", reason="ok")
+    assert "withdrawn" in replies(acts)["p1"].text and d.state.check["T1"].status == "withdrawn"
+    assert [s.status for s in statuses(d.state)][0] == "UNKNOWN"
+    gate = d.job(submit(d, "s1", "t1", final=True))
+    assert d.state.job[gate].overlay == {}                                  # 作废的测试不再运行
+    acts = d.send(Merged, of(gate_ok(d, gate), Advance)[0].candidate_id, True)
+    assert of(acts, Finish)[0].status == "DONE"
+
+
+def test_deadline_releases_a_final_submission_waiting_for_tests():
+    d = Driver()
+    d.send(Start)
+    accept(d, "T1")
+    submit(d, "s1", "t1", final=True)
+    assert d.state.candidate["C1"].waiting_tests
+    d.now = T0 + 3600 - 250
+    acts = d.send(Tick)
+    assert of(acts, StopWorker) and not d.state.candidate["C1"].waiting_tests
+    gate = [a.job_id for a in of(acts, StartJob)][0]
+    acts = d.send(Merged, of(gate_ok(d, gate), Advance)[0].candidate_id, True)
+    assert of(acts, Finish)[0].status == "INCOMPLETE"                      # T2 没写完，不算完成
+    assert d.state.run.head_commit == "c1"
+
+
+def test_ledger_shows_a_requirement_with_its_acceptance_test():
+    d = Driver()
+    d.send(Start)
+    accept(d, "T1")
+    text = replies(d.send(LedgerQuery, "l", "W1", "R1"))["l"].text
+    assert "Acceptance test T1: active" in text and "def test_t1" in text and "Add a `widget` option" in text
+    assert "Unknown requirement" in replies(d.send(LedgerQuery, "m", "W1", "R9"))["m"].text
 
 
 def test_deadline_stops_worker_and_finalizes_workspace():
@@ -178,40 +286,6 @@ def test_budget_exhausted_finishes_and_cancels_jobs():
     assert of(acts, Finish)[0].status == "INCOMPLETE" and of(acts, CancelJob)[0].job_id == job
     acts = d.send(RunCheck, "late", "W1", "t2", [], full=True)
     assert replies(acts)["late"].finished
-
-
-def test_independent_test_accepted_and_supports_requirement():
-    d = Driver()
-    acts = d.send(RequestTest, "r1", "W1", "R1", interface="render(widget=None)")
-    call = of(acts, CallTestAuthor)[0]
-    assert call.check_id == "T1" and "Test Author" in replies(acts)["r1"].text
-    assert replies(d.send(RequestTest, "r2", "W1", "R1"))["r2"].error        # 同一需求不重复请求
-    f = d.state.check["T1"].selector
-    acts = d.send(AuthoredDraft, "T1", True, stored_at="/opt/belay/checks/T1/x.py", content="def test_x(): ...")
-    val = d.job(acts)
-    assert d.state.job[val].purpose == "validate" and d.state.job[val].overlay == {f: "/opt/belay/checks/T1/x.py"}
-    acts = d.send(JobFinished, val, "DONE", {"status": "ok", "tests": {f"{f}::test_x": "FAILED"},
-                                             "reasons": {f"{f}::test_x": "assert None == 'w'"}})
-    assert "accepted" in of(acts, Notify)[0].text and d.state.check["T1"].status == "active"
-    assert [s.status for s in statuses(d.state)] == ["OPEN", "OPEN"]
-    gate = d.job(submit(d, "s1", "t1", final=False))
-    assert f in d.state.job[gate].selection and f in d.state.job[gate].overlay   # 独立测试进入每次门禁
-    acts = d.send(Merged, of(gate_ok(d, gate), Advance)[0].candidate_id, True)
-    assert "Merged" in replies(acts)["s1"].text
-    assert [s.status for s in statuses(d.state)] == ["SUPPORTED", "OPEN"]
-
-
-def test_independent_test_retried_then_rejected_when_not_assertion_level():
-    d = Driver()
-    d.send(RequestTest, "r1", "W1", "R1")
-    f = d.state.check["T1"].selector
-    bad = {"status": "ok", "tests": {f"{f}::t": "FAILED"}, "reasons": {f"{f}::t": "AttributeError: no widget"}}
-    val = d.job(d.send(AuthoredDraft, "T1", True, stored_at="/s/x.py", content="c"))
-    acts = d.send(JobFinished, val, "DONE", bad)
-    assert of(acts, CallTestAuthor)[0].feedback                           # 退回重写一次，附上原因
-    val = d.job(d.send(AuthoredDraft, "T1", True, stored_at="/s/x.py", content="c"))
-    acts = d.send(JobFinished, val, "DONE", bad)
-    assert "rejected" in of(acts, Notify)[0].text and d.state.check["T1"].status == "rejected"
 
 
 def test_report_needs_verbatim_quote_and_waives_the_test():

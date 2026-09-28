@@ -26,6 +26,12 @@ def test_classify_against_baseline():
     assert "u.py::other" in full.regressions                   # 全量运行时都算
 
 
+def test_skipping_a_test_that_passed_on_the_original_code_is_a_regression():
+    base = {"t.py::a": PASS, "t.py::b": NONE}
+    c = classify(base, {"t.py::a": "SKIPPED", "t.py::b": "SKIPPED"}, ["t.py"])
+    assert c.regressions == ["t.py::a"]                        # b 在原始代码上就被跳过：不算
+
+
 def test_classify_node_selection_only_checks_selected_nodes():
     base = {"t.py::a": PASS, "t.py::b": PASS}
     c = classify(base, {"t.py::a": "PASSED"}, ["t.py::a"])

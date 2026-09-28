@@ -1,11 +1,11 @@
 """需求账本：按证据计算需求状态，并把账本、作业结果格式化为给模型看的文字（纯函数）。
 
-需求状态（v4）：
-  SUPPORTED  至少一项独立检查在集成分支 HEAD 上通过（独立检查在收录时已经证明在原始代码上以断言失败）
-  FAILED     独立检查在 HEAD 上失败
-  WAIVED     测试冲突的上报获批：reviewer 引用了需求原文中明确要求的行为变化
-  UNKNOWN    worker 上报信息不足且获批；或运行结束时仍没有任何独立证据
-  OPEN       运行中、还没有独立证据
+每条需求开工时由 Test Author 写一个验收测试（完成门）。需求状态：
+  SUPPORTED  验收测试在集成分支 HEAD 上通过
+  FAILED     验收测试在 HEAD 上失败（挡住最终提交）
+  WAIVED     没有验收测试，但"旧测试与需求冲突"的申诉获批
+  UNKNOWN    没有可用的验收测试（写不出有效测试、申诉后作废）；信息不足的申诉获批；或运行结束时仍没有结论
+  OPEN       运行中、还没有结论（验收测试在写，或还没在 HEAD 上跑过）
 """
 from __future__ import annotations
 
@@ -26,31 +26,44 @@ class ReqStatus:
 
 def requirement_status(state: GraphState, req: Requirement, finished: bool | None = None) -> ReqStatus:
     finished = state.run.phase == "finished" if finished is None else finished
+    later = UNKNOWN if finished else OPEN
     head = state.run.head_tree
-    checks = state.authored(req.id)
-    results = {c.id: c.results.get(head) for c in checks}
-    passed = [cid for cid, r in results.items() if r == PASS]
-    failed = [cid for cid, r in results.items() if r == FAIL]
-    if passed:
-        return ReqStatus(req.id, SUPPORTED, f"independent test {', '.join(passed)} passes on the integration branch",
-                         passed)
-    if failed:
-        return ReqStatus(req.id, FAILED, f"independent test {', '.join(failed)} fails on the integration branch",
-                         failed)
+    tests = state.authored(req.id, active_only=False)
+    active = [c for c in tests if c.status == "active"]
     approved = [r for r in state.report.values() if r.req_id == req.id and r.verdict == "approved"]
+    info = [r for r in approved if r.kind == "insufficient_info"]
+    if active:
+        results = {c.id: c.results.get(head) for c in active}
+        passed = [cid for cid, r in results.items() if r == PASS]
+        failed = [cid for cid, r in results.items() if r == FAIL]
+        if passed and not failed:
+            return ReqStatus(req.id, SUPPORTED, f"acceptance test {', '.join(passed)} passes on the integration "
+                                                "branch", passed)
+        if info:
+            return ReqStatus(req.id, UNKNOWN, f"report {info[0].id} approved: not enough information", [info[0].id])
+        if failed:
+            return ReqStatus(req.id, FAILED, f"acceptance test {', '.join(failed)} fails on the integration branch",
+                             failed)
+        return ReqStatus(req.id, later, f"acceptance test {', '.join(results)} has not run on the integration "
+                                        "branch yet")
+    if info:
+        return ReqStatus(req.id, UNKNOWN, f"report {info[0].id} approved: not enough information", [info[0].id])
     for r in approved:
         if r.kind == "test_conflict":
             return ReqStatus(req.id, WAIVED, f"report {r.id} approved: {', '.join(r.check_ids)} may change", [r.id])
-    for r in approved:
-        if r.kind == "insufficient_info":
-            return ReqStatus(req.id, UNKNOWN, f"report {r.id} approved: not enough information", [r.id])
-    if checks:
-        return ReqStatus(req.id, UNKNOWN if finished else OPEN,
-                         f"independent test {', '.join(c.id for c in checks)} has not run on the integration branch")
-    pending = [c.id for c in state.authored(req.id, active_only=False) if c.status == "pending"]
-    if pending:
-        return ReqStatus(req.id, UNKNOWN if finished else OPEN, f"independent test {pending[0]} is being written")
-    return ReqStatus(req.id, UNKNOWN if finished else OPEN, "no independent evidence")
+    waiting = [c for c in tests if c.status in ("queued", "pending")]
+    if waiting:
+        c = waiting[0]
+        return ReqStatus(req.id, later, f"acceptance test {c.id} is " +
+                         ("being written" if c.status == "pending" else "waiting to be written"))
+    withdrawn = [c for c in tests if c.status == "withdrawn"]
+    if withdrawn:
+        return ReqStatus(req.id, UNKNOWN, f"acceptance test {withdrawn[0].id} was withdrawn ({withdrawn[0].note})")
+    rejected = [c for c in tests if c.status == "rejected"]
+    if rejected:
+        return ReqStatus(req.id, UNKNOWN,
+                         f"no valid acceptance test could be written ({_short(rejected[-1].note, 160)})")
+    return ReqStatus(req.id, later, "no acceptance test")
 
 
 def statuses(state: GraphState, finished: bool | None = None) -> list[ReqStatus]:
@@ -95,11 +108,11 @@ def ledger_text(state: GraphState, now: float, max_reqs: int = 80) -> str:
     if len(sts) > max_reqs:
         lines.append(f"  ... {len(sts) - max_reqs} more")
     authored = state.authored(active_only=False)
-    if run.test_author_available:
-        acc = sum(c.status == "active" for c in authored)
-        pend = sum(c.status == "pending" for c in authored)
-        rej = sum(c.status == "rejected" for c in authored)
-        lines.append(f"Independent tests: {acc} accepted, {pend} being written, {rej} rejected.")
+    if authored:
+        n = {k: sum(c.status == k for c in authored) for k in ("active", "queued", "pending", "rejected", "withdrawn")}
+        lines.append(f"Acceptance tests: {n['active']} accepted, {n['queued'] + n['pending']} still being written, "
+                     f"{n['rejected']} could not be written, {n['withdrawn']} withdrawn. "
+                     "ledger(requirement=\"R<n>\") shows a requirement's acceptance test.")
     base = state.baseline()
     if base:
         n_pass = sum(v == PASS for v in base.values())
@@ -116,6 +129,28 @@ def ledger_text(state: GraphState, now: float, max_reqs: int = 80) -> str:
     running = [j for j in state.job.values() if j.state in ("QUEUED", "RUNNING")]
     for j in running:
         lines.append(f"Job {j.id} ({j.purpose}) is {j.state.lower()}.")
+    return "\n".join(lines)
+
+
+def requirement_text(state: GraphState, req_id: str) -> str:
+    """一条需求的详情：原文、状态、验收测试的内容与最近一次失败原因（ledger(requirement=...)）。"""
+    req = state.requirement.get(req_id)
+    if req is None:
+        ids = sorted(state.requirement.values(), key=lambda r: r.order)
+        return f"Unknown requirement {req_id!r}. Ids: {', '.join(r.id for r in ids)}."
+    st = requirement_status(state, req)
+    lines = [f"{req.id} [{req.kind}] {st.status}: {st.why}", f"Requirement: {req.text}"]
+    if req.original().strip() != req.text.strip():
+        lines.append(f"Task text: {req.original()}")
+    for c in state.authored(req.id, active_only=False):
+        lines.append(f"Acceptance test {c.id}: {c.status}" + (f" ({_short(c.note, 300)})" if c.note else ""))
+        if c.status == "active":
+            res = c.results.get(state.run.head_tree)
+            lines.append(f"  On the integration branch: {res or 'not run yet'}")
+            if c.last_failure:
+                lines.append(f"  Last failure in a gate: {_short(c.last_failure, 800)}")
+            code = c.content if len(c.content) <= 8000 else c.content[:8000] + "\n# ... truncated"
+            lines.append(f"  Content (it runs from outside your working tree):\n```python\n{code}\n```")
     return "\n".join(lines)
 
 
@@ -160,7 +195,7 @@ def job_text(job: Job, cl: Classified | None, authored: dict[str, str] | None = 
     if cl.flaky:
         lines.append(f"Flaky on the original code ({len(cl.flaky)}), failing now: " + ", ".join(cl.flaky[:5]))
     for cid, st in (authored or {}).items():
-        lines.append(f"Independent test {cid}: {st}")
+        lines.append(f"Acceptance test {cid}: {st}")
     if job.log:
         lines.append(f"Full log: {job.log}")
     return "\n".join(lines)

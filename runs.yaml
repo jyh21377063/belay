@@ -129,9 +129,8 @@ agents:
         gate: block                     # block | advise（只提示不拒绝）| off
         checkpoint_gate: related        # 检查点只跑与改动相关的测试文件
         final_gate: full                # 最终提交跑全量；剩余时间不够时自动降为 related
-        test_author: true
-        test_author_quota: 8
-        reports: true
+        test_author: true               # 完成门：开工时为每条需求写一个验收测试，最终提交要求全部通过
+        reports: true                   # 申诉：report_conflict → reviewer 按任务原文裁决
         isolation: true                 # worker 以低权限用户运行；建不了用户时自动退回 root 并记录
 
   # 分阶段验收：同一套 runtime 关掉部分机制（对应 M2 / M3）

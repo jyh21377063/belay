@@ -91,7 +91,7 @@ python -m eval.report results/<run_id>                    # 重新生成汇总
 | `belay/llm.py` | DeepSeek Anthropic 兼容接口：流式调用、重试、保留 thinking 块、用量统计、录制与回放 |
 | `belay/tools/` | 9 个工具（含只读探索子 agent `explore`）、读后被改检测、行动边界策略、输出截断、与 Orchestrator 的 `RuntimeClient` 接口 |
 | `belay/worker/` | 主循环（也用来跑探索子 agent）、上下文清理与交接重建、提示词、轨迹 |
-| `belay/config.py` | `RuntimeConfig`：每个机制一个开关（门禁、独立测试、上报、隔离……）；容器内路径 |
+| `belay/config.py` | `RuntimeConfig`：每个机制一个开关（合并门、完成门 / 验收测试、申诉、隔离……）；容器内路径 |
 | `belay/graph/` | 证据图：模型、证据规则、需求账本、需求切分、不变量（纯函数）；SQLite 存储 |
 | `belay/runtime/` | Orchestrator（单写者循环 + 纯函数 `decide()`）、作业、影子仓库与集成分支、setup、Test Author / Reviewer |
 | `belay/container/runner.py` | 容器内的检查运行器（标准库、Python 3.6）：临时切换候选树跑测试、解析结果、剔除测试改动 |

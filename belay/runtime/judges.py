@@ -46,12 +46,21 @@ async def write_test(llm, env: Env, *, orig: str, selector: str, req_id: str, re
                     transcript=transcript, system_prompt=system)
     res = await worker.run(test_author_task(req_id, req_text, section, task_context, interface, feedback))
     text = res.final_text
-    if res.status == "max_turns" or (res.status == "no_tool_call" and extract_code(text) is None):
+    if res.status == "max_turns" or (res.status == "no_tool_call" and extract_code(text) is None
+                                     and not _not_testable(text)):
         text = await worker.conclude(WRAPUP)
     code = extract_code(text)
     if code is None:
+        why = _not_testable(text)
+        if why:
+            return None, f"the Test Author found nothing testable: {why}"
         return None, f"no test file in the Test Author's answer (status {res.status})"
     return code, ""
+
+
+def _not_testable(text: str) -> str:
+    m = re.search(r"NOT TESTABLE[:\s-]*(.*)", text or "", re.S)
+    return (" ".join(m.group(1).split())[:300] or "no reason given") if m else ""
 
 
 def parse_verdict(text: str) -> dict:

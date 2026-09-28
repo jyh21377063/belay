@@ -12,29 +12,31 @@ BELAY_RULES = """This run is managed by a harness that keeps a ledger of the tas
 integration branch that holds your verified work. Only the harness decides when the task is complete.
 - submit hands your current working tree in as a candidate. The harness runs the tests that passed on the \
 original code (the tests related to your changes for a checkpoint, the full suite for a final submission) and \
-merges the candidate into the deliverable only if none of them fail now. If some do, you get the list back and \
-keep working. What is not merged is not delivered, except that shortly before the deadline the harness stops you \
-and tries your working tree once more.
+merges the candidate into the deliverable only if none of them fail or are skipped now. If some do, you get the list \
+back and keep working. What is not merged is not delivered, except that shortly before the deadline the harness stops \
+you and tries your working tree once more.
 - Call submit(final=false) as a checkpoint whenever a coherent part of the work is done: it keeps that progress \
 safe. Call submit(final=true) when you have finished everything.
+- Every requirement gets an acceptance test, written from the task text by an independent Test Author who never sees \
+your code. You are notified as each one is ready, and ledger(requirement="R3") shows it. Acceptance tests run in \
+every gate; a failing one does not block checkpoints, but the final submission is accepted only when all of them \
+pass. Make the code pass them; do not special-case their inputs.
 - Test files are part of the acceptance criteria. Changes under test paths are never delivered, and every check \
 runs the original tests. You can still write tests for your own development.
-- If an existing test encodes behaviour that the task explicitly asks to change, or a requirement cannot be \
-implemented from the information available, or a failure comes from the environment, call report_conflict instead \
-of editing the test or forcing a workaround. A reviewer decides, using the task text.
+- If an existing test encodes behaviour that the task explicitly asks to change, if an acceptance test contradicts \
+the task text, if a requirement cannot be implemented from the information available, or if a failure comes from \
+the environment, call report_conflict instead of working around it. A reviewer decides, using the task text.
 - For test runs and builds that take more than a minute, use run_check and then wait, instead of bash with sleep. \
 Results are compared with the original code, so you see at once which failures you caused and which already \
-existed.
-- request_test asks an independent Test Author to write a test for one requirement. A requirement counts as \
-SUPPORTED only with independent evidence like this; without it the ledger reports it as UNKNOWN. ledger shows every \
-requirement's status, the time left and the failures that already exist on the original code."""
+existed. ledger shows every requirement's status, the time left and the failures that already exist on the \
+original code."""
 
 
 def worker_task(instruction: str, state: GraphState, now: float) -> str:
     reqs = sorted(state.requirement.values(), key=lambda r: r.order)
     lines = [instruction.strip(), "", "<requirements>",
-             "The harness split the task into these requirements; use the ids with request_test and "
-             "report_conflict."]
+             "The harness split the task into these requirements; each gets an acceptance test. Use the ids "
+             "with ledger and report_conflict."]
     for r in reqs:
         text = " ".join(r.text.split())
         lines.append(f"{r.id} [{r.kind}]: {text[:400]}{'...' if len(text) > 400 else ''}")
@@ -73,13 +75,17 @@ the requirement adds a new function, option or class, import the module (not the
 inside the test after asserting it exists, e.g. `assert hasattr(module, "new_name")`.
 - The test must PASS once the requirement is implemented correctly, whatever reasonable implementation is chosen. \
 Keep it small: a few focused test functions. Do not test other requirements.
-- If the implementer declared an interface, use exactly those names and signatures.
+- Use the public names and signatures the task text gives. Where it gives none, choose the most natural ones for \
+this codebase (follow its conventions) and keep the test tolerant of details the requirement does not fix.
+- If the requirement has no observable behaviour that a test can check (documentation, CI, packaging, internal \
+refactoring), do not write a test: reply with NOT TESTABLE and one sentence explaining why.
 - The file will be placed at `{selector}` under the repository root and run with the project's pytest \
 configuration from the repository root.
 
 # Answer
 When you are done investigating, reply with the complete test file in a single ```python code block, followed by \
-one or two sentences on what it checks. Do not call tools in that final reply."""
+one or two sentences on what it checks (or with NOT TESTABLE as described above). Do not call tools in that final \
+reply."""
 
 
 def test_author_task(req_id: str, req_text: str, section: str, task_context: str, interface: str,
@@ -106,6 +112,11 @@ Kinds of report:
 requirement explicitly asks for the behaviour change that makes it fail. Approve ONLY if the requirement text \
 explicitly describes that change (for example it says a default, an output format, an error or a name changes). \
 A requirement that merely touches the same area does not justify breaking the test.
+- wrong_test: the acceptance test that an independent Test Author wrote for the requirement fails, and the \
+implementer says the test contradicts the task text or checks something the task does not ask for. Approve only if \
+the test's expectation really differs from what the requirement text says (a different value, name or behaviour \
+than stated, or a detail the text does not fix and the implementation reasonably chose otherwise). Approving \
+withdraws the test.
 - insufficient_info: the implementer says the requirement cannot be implemented from the information given. Approve \
 only if the requirement text really lacks information that a careful engineer would need and cannot find in the \
 repository.
@@ -116,8 +127,8 @@ Costs are asymmetric: wrongly approving a test_conflict can let a real regressio
 task, while wrongly rejecting costs at most one test. When in doubt, reject.
 
 To approve you MUST quote, verbatim, the passage that justifies the approval: from the task's original wording of \
-the requirement (the "Original task text" when one is given, otherwise the requirement text) for test_conflict and \
-insufficient_info, from the failure output for environment. The harness checks that the quote \
+the requirement (the "Original task text" when one is given, otherwise the requirement text) for test_conflict, \
+wrong_test and insufficient_info, from the failure output for environment. The harness checks that the quote \
 appears exactly in that text and rejects the approval otherwise.
 
 Reply with a JSON object only:

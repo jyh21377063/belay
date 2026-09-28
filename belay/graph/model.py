@@ -5,7 +5,7 @@
 
 节点（v4）：
   Requirement      任务原文中一条可单独核对的承诺；没有"完成"状态，状态由证据计算（ledger.py）
-  Check            可执行、结果确定的判定：已有测试（基线）或 Test Author 的测试
+  Check            可执行、结果确定的判定：已有测试（基线，合并门用）或验收测试（Test Author 写，完成门用）
   Work             一个 worker 负责的一段工作
   Candidate        一次 submit 产生的候选
   Job              一次耗时的外部操作（开发检查、门禁、测试验证）
@@ -67,15 +67,17 @@ class Check:
     baseline: str = NONE            # PASS | FAIL | FLAKY | NONE
     req_id: str | None = None       # authored：验证哪条需求
     nodes: list[str] = field(default_factory=list)      # authored：在原始代码上以断言失败的测试
-    status: str = "active"          # active | pending | rejected
+    status: str = "active"          # 验收测试：queued（排队）| pending（在写、在验证）| active | rejected
+                                    #           （写不出有效测试）| withdrawn（申诉获批后作废）
     stored_at: str = ""             # authored：runtime 保存测试文件的位置（worker 不可见）
     results: dict[str, str] = field(default_factory=dict)   # authored：树哈希 → PASS / FAIL
+    last_failure: str = ""          # authored：最近一次在门禁里失败的原因（ledger 显示给 worker）
     note: str = ""
     digest: str = ""                # authored：冻结时的定义摘要（不变量：检查定义不可改）
     attempts: int = 0
-    requested_by: str = ""          # authored：请求它的工作节点
-    interface: str = ""             # authored：请求方声明的公开接口
-    content: str = ""               # authored：测试文件内容（审计用；收录后发给实现者参考）
+    requested_by: str = ""          # authored：接收通知的工作节点
+    interface: str = ""             # authored：（保留）声明的公开接口
+    content: str = ""               # authored：测试文件内容（收录后 worker 可以查看）
 
 
 @dataclass
@@ -108,8 +110,7 @@ class Work:
     workspace: str = ""
     base_commit: str = ""
     rejections: int = 0
-    final_bounces: int = 0
-    info_bounced: bool = False
+    final_bounces: int = 0          # 最终提交因验收测试失败被退回的次数（只记录，不设上限）
     last_rejection: str = ""        # 上次被拒的差分证据（重建上下文时带上）
     summary: str = ""
 
@@ -122,14 +123,16 @@ class Candidate:
     commit: str
     tree: str
     base_commit: str
-    changed: list[str] = field(default_factory=list)
+    changed: list[str] = field(default_factory=list)            # 相对原始代码
+    changed_since_head: list[str] = field(default_factory=list)  # 相对提交时的集成分支（选相关测试用）
     dropped_tests: list[str] = field(default_factory=list)
     summary: str = ""
     by_runtime: str = ""            # 空 = worker 提交；否则为 runtime 代为提交的原因（deadline / worker_exit）
     rid: str | None = None          # 等待裁决的工具请求
     job_id: str | None = None
     level: str = ""
-    verdict: str = "pending"        # pending | merged | rejected | error
+    verdict: str = "pending"        # pending | merged | rejected | error | unchanged
+    waiting_tests: bool = False     # 最终提交：等验收测试写完再跑门禁
     regressions: list[str] = field(default_factory=list)
     gate_note: str = ""             # 门禁结果的说明（合并后回复给 worker）
     created_t: float = 0.0
@@ -148,7 +151,7 @@ class FailureSignature:
 @dataclass
 class Report:
     id: str
-    kind: str                       # test_conflict | insufficient_info | environment
+    kind: str                       # test_conflict | wrong_test | insufficient_info | environment
     work_id: str
     req_id: str | None
     check_ids: list[str]
