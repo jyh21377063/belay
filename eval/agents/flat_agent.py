@@ -27,7 +27,7 @@ from pier.agents.base import BaseAgent
 from belay.env import PierEnv
 from belay.llm import LLM, ReplayLLM
 from belay.tools import Policy
-from belay.transcript import Transcript
+from belay.worker.transcript import Transcript
 from belay.worker import Worker, WorkerConfig
 from eval.agents.patch_capture import PatchCaptureMixin
 

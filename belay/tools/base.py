@@ -5,7 +5,7 @@ import posixpath
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol
 
 from belay.env import Env
 
@@ -55,11 +55,23 @@ _DISK = re.compile(r"\b(find|locate|rg|grep\s+-[a-zA-Z]*r[a-zA-Z]*)\s+(?:[^|;&]*
                    r"/(?:\s|$|usr\b|opt\b|root\b|home\b|var\b|srv\b|etc\b|tmp\b|logs\b)")
 
 
+class RuntimeClient(Protocol):
+    """工具与 Orchestrator 之间唯一的接口（M2 起实现）。
+
+    工具把请求投进 Orchestrator 的收件箱并等待回复；工具不认识 Orchestrator 的内部实现。
+    B 组（FlatAgent）没有 runtime，ToolContext.runtime 为 None，runtime 工具不会注册。
+    """
+
+    async def request(self, kind: str, **payload: Any) -> dict: ...
+
+
 @dataclass
 class ToolContext:
     env: Env
     workdir: str
     policy: Policy = field(default_factory=Policy)
+    runtime: RuntimeClient | None = None                  # M2 起由 Belay 传入
+    work_id: str | None = None                            # M5 起：本 worker 负责的工作节点
     read_files: set[str] = field(default_factory=set)     # 读过或写过的文件，编辑前必须在这里
     todos: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)      # 越界等事件，由 worker 写入轨迹

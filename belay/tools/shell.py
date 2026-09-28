@@ -4,7 +4,7 @@ from __future__ import annotations
 import shlex
 import uuid
 
-from belay.context import truncate_output
+from belay.tools.output import truncate_output
 from belay.tools.base import Tool, ToolContext, ToolError
 
 DEFAULT_TIMEOUT = 120

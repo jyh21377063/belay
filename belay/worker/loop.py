@@ -14,12 +14,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from belay.context import HANDOFF_REQUEST, clear_stale_results
+from belay.worker.context import HANDOFF_REQUEST, clear_stale_results
 from belay.env import Env
 from belay.llm import Response, Usage
-from belay.prompts import initial_message, system_prompt
-from belay.tools import Policy, Tool, ToolContext, ToolError, get_tools
-from belay.transcript import Transcript
+from belay.worker.prompts import initial_message, system_prompt
+from belay.tools import Policy, RuntimeClient, Tool, ToolContext, ToolError, get_tools
+from belay.worker.transcript import Transcript
 
 
 @dataclass
@@ -46,12 +46,14 @@ class WorkerResult:
 class Worker:
     def __init__(self, llm, env: Env, tools: list[Tool] | None = None, config: WorkerConfig | None = None,
                  policy: Policy | None = None, transcript: Transcript | None = None,
-                 on_progress: Callable[["Worker"], None] | None = None):
+                 on_progress: Callable[["Worker"], None] | None = None,
+                 runtime: RuntimeClient | None = None, work_id: str | None = None):
         self.llm = llm
         self.env = env
         self.tools = {t.name: t for t in (tools or get_tools())}
         self.config = config or WorkerConfig()
-        self.ctx = ToolContext(env=env, workdir=env.workdir, policy=policy or Policy())
+        self.ctx = ToolContext(env=env, workdir=env.workdir, policy=policy or Policy(),
+                               runtime=runtime, work_id=work_id)
         self.transcript = transcript or Transcript(None)
         self.on_progress = on_progress
         self.usage = Usage()

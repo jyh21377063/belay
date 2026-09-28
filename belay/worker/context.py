@@ -1,53 +1,12 @@
-"""上下文管理的三个小工具：输出截断、清理过期的工具结果、交接说明的提示词。
+"""worker 的上下文管理：清理过期的工具结果、交接说明的提示词。
 
 不做原地摘要压缩：上下文过长时由 worker 结束当前上下文，让模型写一份交接说明，
 再从任务原文 + 交接说明 + 仓库当前状态重建（见 worker.py 的 _reset_context）。
-截断与清理的思路参考 mini_claude（MIT），测试日志的截断改为保留报错块。
+清理的思路参考 mini_claude（MIT）。工具输出的截断在 belay/tools/output.py。
 """
 from __future__ import annotations
 
-import re
-
-# 测试与构建日志里值得保留的行
-_SIGNAL = re.compile(
-    r"(FAILED|FAIL\b|ERROR|Error|error:|Exception|Traceback|AssertionError|assert |panicked|"
-    r"^E\s|^>\s|\bfailed\b|short test summary|passed|warning:)"
-)
-
 CLEARED = "[Old tool result cleared: the file was read or modified again later, or the result is stale. Re-run the tool if you need it.]"
-
-
-def truncate_output(text: str, max_chars: int = 30000, head: int = 60, tail: int = 120,
-                    max_signal: int = 120) -> str:
-    """保留开头、结尾，以及中间的报错相关行；其余折叠为“省略 N 行”。"""
-    if len(text) <= max_chars:
-        return text
-    lines = text.split("\n")
-    if len(lines) <= head + tail:
-        keep = (max_chars - 100) // 2
-        return f"{text[:keep]}\n\n[... {len(text) - 2 * keep} characters omitted ...]\n\n{text[-keep:]}"
-
-    middle = lines[head:len(lines) - tail]
-    out = lines[:head]
-    skipped = 0
-    picked = 0
-    for line in middle:
-        if picked < max_signal and _SIGNAL.search(line):
-            if skipped:
-                out.append(f"[... {skipped} lines omitted ...]")
-                skipped = 0
-            out.append(line[:500])
-            picked += 1
-        else:
-            skipped += 1
-    if skipped:
-        out.append(f"[... {skipped} lines omitted ...]")
-    out.extend(lines[len(lines) - tail:])
-    result = "\n".join(out)
-    if len(result) > max_chars:                       # 单行极长等情况的兜底
-        keep = (max_chars - 100) // 2
-        result = f"{result[:keep]}\n\n[... {len(result) - 2 * keep} characters omitted ...]\n\n{result[-keep:]}"
-    return result
 
 
 def clear_stale_results(messages: list[dict], keep_recent: int = 12) -> int:
