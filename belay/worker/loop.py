@@ -150,13 +150,14 @@ class Worker:
             if self.last_context > self.config.reset_tokens:
                 await self._reset()
 
-    async def _call(self, tool_choice: dict | None = None) -> Response:
+    async def _call(self, tool_choice: dict | None = None, purpose: str = "turn") -> Response:
+        """purpose 写进轨迹：turn 为正常的一轮；handoff、wrapup 为不计轮数的收尾调用。"""
         resp = await self.llm.call(self.system, self.schemas, self.messages, tool_choice=tool_choice)
         self.usage.add(resp.usage)
         self.last_context = resp.usage.context_tokens + resp.usage.output_tokens
         self.peak_context = max(self.peak_context, resp.usage.context_tokens)
         self.transcript.write("assistant", content=resp.content, stop_reason=resp.stop_reason,
-                              usage=resp.usage.__dict__, context=self.last_context)
+                              usage=resp.usage.__dict__, context=self.last_context, purpose=purpose)
         return resp
 
     # ---- 工具执行：连续的只读调用并行，其余按顺序
@@ -230,7 +231,7 @@ class Worker:
     async def _reset(self) -> None:
         last = self.messages[-1]
         last["content"] = list(last["content"]) + [{"type": "text", "text": HANDOFF_REQUEST}]
-        resp = await self._call(tool_choice={"type": "none"})
+        resp = await self._call(tool_choice={"type": "none"}, purpose="handoff")
         handoff = resp.text or "(no handoff note was written)"
         self.resets += 1
         self.ctx.file_digests.clear()                # 上下文已丢失，编辑前需要重新读取
@@ -247,7 +248,7 @@ class Worker:
             last["content"] = list(last["content"]) + [{"type": "text", "text": prompt}]
         else:
             self.messages.append({"role": "user", "content": prompt})
-        resp = await self._call(tool_choice={"type": "none"})
+        resp = await self._call(tool_choice={"type": "none"}, purpose="wrapup")
         self.final_text = resp.text
         return resp.text
 
