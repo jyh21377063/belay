@@ -278,3 +278,16 @@ def test_resubmitting_a_rejected_tree_reuses_the_gate_result():
     acts = submit(d, "s2", "t1", final=True)                              # 同一个树再次提交
     assert not of(acts, StartJob) and "rejected" in replies(acts)["s2"].text
     assert d.state.candidate["C2"].verdict == "rejected"                   # 裁决落在新候选上，而不是旧的
+
+
+def test_final_submit_without_changes_still_runs_the_full_gate_on_head():
+    d = Driver(test_author=False)
+    gate = d.job(submit(d, "s1", "t1", final=False))                      # 检查点只过了相关子集
+    d.send(Merged, of(gate_ok(d, gate), Advance)[0].candidate_id, True)
+    acts = submit(d, "s2", "t1", final=True)                               # 没有新改动的最终提交
+    gate = d.job(acts)
+    assert d.state.job[gate].level == "full" and d.state.job[gate].tree == "t1"
+    acts = gate_ok(d, gate)
+    assert not of(acts, Advance)                                           # HEAD 不动，只是复核
+    assert of(acts, Finish)[0].status == "DONE" and d.state.candidate["C2"].verdict == "unchanged"
+    assert len(d.state.integration) == 1

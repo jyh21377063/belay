@@ -351,12 +351,17 @@ def on_submit(tx: Tx, msg: Submit, cfg) -> None:
     tx.event("submit", candidate=cand.id, final=msg.final, by_runtime=msg.by_runtime, changed=len(msg.changed),
              dropped_tests=msg.dropped_tests[:20])
     if msg.tree == tx.run.head_tree:
-        tx.put(replace(cand, verdict="unchanged"))
-        if msg.final or msg.by_runtime:
-            _after_final(tx, cfg, tx.get("candidate", cand.id), work, "No changes since the last merge.")
-        else:
-            _reply(tx, msg.rid, "No changes since the last merge; nothing to check.")
-        return
+        # 没有新改动。最终提交时，如果集成分支还没在全量测试上验证过，照样对 HEAD 跑一次全量门禁
+        chain = tx.state.integration_chain()
+        recheck = (bool(msg.final or msg.by_runtime) and bool(chain) and chain[-1].level != "full"
+                   and _gate_level(tx, cfg, True) == "full")
+        if not recheck:
+            tx.put(replace(cand, verdict="unchanged"))
+            if msg.final or msg.by_runtime:
+                _after_final(tx, cfg, tx.get("candidate", cand.id), work, "No changes since the last merge.")
+            else:
+                _reply(tx, msg.rid, "No changes since the last merge; nothing to check.")
+            return
 
     level = _gate_level(tx, cfg, msg.final or bool(msg.by_runtime))
     authored = tx.state.authored() if level != "none" else []
@@ -456,6 +461,13 @@ def _on_gate_done(tx: Tx, cfg, job: Job, candidate_id: str | None = None) -> Non
                     "verified state", rid=cand.rid, text=text, stop=True)
         else:
             _reply(tx, cand.rid, text)
+        return
+    if cand.commit == run.head_commit:                  # 对 HEAD 的全量复核通过（最终提交没有新改动）
+        tx.update(cand, verdict="unchanged", gate_note=f"Gate ({job.level}): {cl.total} tests ran, no regressions.")
+        tx.event("gate_passed", candidate=cand.id, job=job.id, level=job.level, tests=cl.total, recheck=True)
+        _after_final(tx, cfg, tx.get("candidate", cand.id), work,
+                     f"No changes since the last merge; the full gate passed on the integration branch "
+                     f"({cl.total} tests)." + ("\n" + note if note else ""))
         return
     extra = ""
     if cl.regressions:                                  # advise 模式：只提示
