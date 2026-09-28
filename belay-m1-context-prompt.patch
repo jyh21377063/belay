@@ -1,0 +1,439 @@
+diff --git a/belay/tools/shell.py b/belay/tools/shell.py
+index 99a2340..436eca6 100644
+--- a/belay/tools/shell.py
++++ b/belay/tools/shell.py
+@@ -65,17 +65,32 @@ async def submit(inp: dict, ctx: ToolContext) -> str:
+ 
+ TOOLS = [
+     Tool("bash",
+-         "Run a bash command in the repository root and return combined stdout/stderr. Default timeout 120s, max 1800s. "
+-         "Prefer the dedicated tools for reading, editing, finding files and searching content. "
+-         "Long-running commands can use run_in_background.",
++         "Run a bash command and return its combined stdout and stderr.\n"
++         "- Every call starts in a fresh shell at the repository root: `cd` and exported variables do not persist "
++         "between calls. Chain dependent commands with `&&` in a single call.\n"
++         "- Default timeout is 120 seconds, maximum 1800. Give long test runs and builds a timeout that covers them; "
++         "the call returns as soon as the command finishes.\n"
++         "- run_in_background is for servers or commands longer than 1800 seconds: output goes to a log file you can "
++         "read later. Do not poll it with long fixed sleeps.\n"
++         "- Use non-interactive flags and never open an editor or a pager (use `git --no-pager`, `PAGER=cat`). "
++         "Quote paths that contain spaces.\n"
++         "- Prefer the dedicated tools for reading, editing, finding and searching files.",
+          {"type": "object", "properties": {
+              "command": {"type": "string"},
+-             "timeout": {"type": "integer", "description": "Timeout in seconds"},
++             "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 1800)"},
+              "run_in_background": {"type": "boolean", "description": "Run in the background, writing output to a log file"}},
+           "required": ["command"]},
+          bash),
+     Tool("todo_write",
+-         "Maintain your own todo list (replaces the whole list). Useful for tracking progress on multi-step tasks.",
++         "Create and maintain your task list (each call replaces the whole list).\n"
++         "Use it for any task with three or more steps, and whenever the task statement lists several requirements: "
++         "capture every requirement as an item before you start, so none is forgotten.\n"
++         "- Keep exactly one item in_progress; mark it in_progress before you start on it.\n"
++         "- Mark an item completed immediately after finishing it, and only when it is fully done. Keep it "
++         "in_progress if its tests fail, the implementation is partial, or errors are unresolved; add a new item for "
++         "whatever blocks it.\n"
++         "- Add follow-up items you discover along the way; remove items that no longer apply.\n"
++         "Skip it for a single, simple change.",
+          {"type": "object", "properties": {"todos": {"type": "array", "items": {
+              "type": "object", "properties": {
+                  "content": {"type": "string"},
+@@ -84,8 +99,9 @@ TOOLS = [
+           "required": ["todos"]},
+          todo_write, read_only=True),
+     Tool("submit",
+-         "Call this when the task is complete to submit your work and finish. In summary, state what you changed, "
+-         "how you verified it, and anything left unfinished.",
++         "Finish the task. Call it once, after you have checked every requirement, run the relevant tests and "
++         "reviewed your diff. The summary must report what actually happened: say first which requirements are not "
++         "done, which tests fail and which checks you skipped, then what you changed and how you verified it.",
+          {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
+          submit),
+ ]
+diff --git a/belay/worker/context.py b/belay/worker/context.py
+index 06361b4..12265f5 100644
+--- a/belay/worker/context.py
++++ b/belay/worker/context.py
+@@ -48,13 +48,22 @@ def clear_stale_results(messages: list[dict], keep_recent: int = 12) -> int:
+     return len(stale)
+ 
+ 
+-HANDOFF_REQUEST = """Your context window is almost full, so this session will be reset. Write a handoff note for yourself. \
+-After the reset you will only see the original task, this note, and the current state of the repository.
+-
+-Include:
+-1. Changes already made (files and key points).
+-2. Conclusions you have confirmed, including approaches you ruled out.
+-3. Open problems and failing tests, with their causes if known.
+-4. What to do next, in order.
++HANDOFF_REQUEST = """Your context window is nearly full, so this session will be reset now. Write a handoff note \
++that lets you resume the work efficiently in a fresh session. After the reset you will see only the original task \
++statement, this note, your current todo list, and the repository state (`git status` and the full `git diff` of your \
++changes). Nothing else from this conversation survives, including the contents of files you read.
++
++Write these sections, concise but complete. Err on the side of including anything that prevents duplicate work or \
++repeated mistakes.
++
++1. Task status: which requirements are done and verified, which are partly done, which are not started. Say how \
++each "done" item was verified.
++2. Code map: the files, functions and tests that matter for the remaining work, with paths and line numbers, and \
++what each one does. The diff already shows your own edits; describe the code around them that you will need again.
++3. Discoveries: constraints and conventions you found, decisions you made and why, errors you hit and how you fixed \
++them, approaches that did not work and why.
++4. Verification: the exact commands that run the relevant tests, and their latest results (which tests pass, which \
++fail and why, which failures already existed before your changes).
++5. Next steps: the specific actions left, in order, including the one you were in the middle of.
+ 
+ Output only the handoff note. Do not call any tools."""
+diff --git a/belay/worker/loop.py b/belay/worker/loop.py
+index 34e8f50..588770d 100644
+--- a/belay/worker/loop.py
++++ b/belay/worker/loop.py
+@@ -27,8 +27,12 @@ from belay.worker.transcript import Transcript
+ @dataclass
+ class WorkerConfig:
+     max_turns: int = 2000
+-    clear_tokens: int = 120_000          # 上下文超过该值后开始清理过期的工具结果
+-    reset_tokens: int = 250_000          # 上下文超过该值时写交接说明并重建
++    # 上下文阈值与 A 组对齐：Claude Code（deepseek-flash[1m]）约在 78.6 万 token 压缩，baseline 峰值 58 万从未触发。
++    # 过早重建会让 B 组与 A 组的差异混入上下文策略；更积极的重建留给 Belay（M2 起从证据图重建）。
++    clear_tokens: int = 500_000          # 上下文超过该值后开始清理过期的工具结果（改写旧消息会让前缀缓存失效）
++    reset_tokens: int = 750_000          # 上下文超过该值时写交接说明并重建
++    reset_diff_chars: int = 60_000       # 重建时附上的 git diff 长度上限
++    todo_reminder_turns: int = 30        # 这么多轮没更新任务清单时，提醒一次（Claude Code 也有同样的提醒）
+     deadline: float | None = None        # time.monotonic() 表示的截止时间
+     time_reminders: bool = False         # 是否在工具结果中提示剩余时间（B 组关闭，与 Claude Code 一致）
+     extra_rules: str = ""
+@@ -73,6 +77,7 @@ class Worker:
+         self.last_context = 0
+         self.messages: list[dict] = []
+         self.final_text = ""
++        self._last_todo_turn = 0
+         self._events_written = 0
+         self._explorers = 0
+ 
+@@ -87,7 +92,7 @@ class Worker:
+         else:
+             self.system = system_prompt(self.env.workdir, platform, self.config.extra_rules,
+                                         has_explore="explore" in self.tools)
+-            first = initial_message(task, await self._snapshot())
++            first = initial_message(task, await self._snapshot(with_diff=False))
+         self.messages = [{"role": "user", "content": first}]
+         self.transcript.write("start", system=self.system, tools=[t.name for t in self.tools.values()],
+                               first_message=self.messages[0]["content"])
+@@ -130,7 +135,7 @@ class Worker:
+             results = await self._execute(tool_uses)
+             content: list[dict] = [{"type": "tool_result", "tool_use_id": tu["id"], "content": out, "is_error": err}
+                                    for tu, (out, err) in zip(tool_uses, results)]
+-            reminder = self._reminder()
++            reminder = self._reminder(tool_uses)
+             if reminder:
+                 content.append({"type": "text", "text": reminder})
+             self.messages.append({"role": "user", "content": content})
+@@ -189,13 +194,20 @@ class Worker:
+             self.ctx.event("tool_crash", tool=tu["name"], error=f"{type(e).__name__}: {e}")
+             return f"Error: {type(e).__name__}: {e}", True
+ 
+-    def _reminder(self) -> str:
+-        if not (self.config.time_reminders and self.config.deadline):
+-            return ""
+-        left = (self.config.deadline - time.monotonic()) / 60
+-        if self.turns % 20 == 0 or left < 15:
+-            return f"<system-reminder>About {max(0, left):.0f} minutes of the time budget remain.</system-reminder>"
+-        return ""
++    def _reminder(self, tool_uses: list[dict]) -> str:
++        notes = []
++        if any(tu["name"] == "todo_write" for tu in tool_uses):
++            self._last_todo_turn = self.turns
++        elif ("todo_write" in self.tools and self.role == "main"
++              and self.turns - self._last_todo_turn >= self.config.todo_reminder_turns):
++            self._last_todo_turn = self.turns
++            notes.append("The todo list has not been updated recently. If it no longer matches what you are doing, "
++                         "update it; if it is not useful for this task, ignore this note.")
++        if self.config.time_reminders and self.config.deadline:
++            left = (self.config.deadline - time.monotonic()) / 60
++            if self.turns % 20 == 0 or left < 15:
++                notes.append(f"About {max(0, left):.0f} minutes of the time budget remain.")
++        return "".join(f"<system-reminder>{n}</system-reminder>" for n in notes)
+ 
+     def _flush_events(self) -> None:
+         for e in self.ctx.events[self._events_written:]:
+@@ -203,11 +215,16 @@ class Worker:
+         self._events_written = len(self.ctx.events)
+ 
+     # ---- 上下文重建
+-    async def _snapshot(self) -> str:
++    async def _snapshot(self, with_diff: bool) -> str:
++        """仓库状态。首次只给 status 与 stat；重建时附上完整 diff，让模型看到自己改成了什么。"""
++        diff = (f"echo; echo '$ git --no-pager diff'; git --no-pager diff | head -c {self.config.reset_diff_chars}; "
++                f"[ $(git --no-pager diff | wc -c) -gt {self.config.reset_diff_chars} ] && "
++                "echo && echo '[... diff truncated; run git diff to see the rest]'; ") if with_diff else ""
+         res = await self.env.run("git rev-parse --is-inside-work-tree >/dev/null 2>&1 && "
+-                                 "{ echo '$ git status --short'; git status --short | head -40; "
+-                                 "echo; echo '$ git diff --stat'; git diff --stat | tail -40; } "
+-                                 "|| { echo '$ ls'; ls -la | head -60; }", timeout=60)
++                                 "{ echo '$ git status --short'; git status --short | head -60; "
++                                 "echo; echo '$ git diff --stat'; git --no-pager diff --stat | tail -40; "
++                                 f"{diff}true; }} "
++                                 "|| { echo '$ ls'; ls -la | head -60; }", timeout=120)
+         return f"Repository root: {self.env.workdir}\n{res.output.strip()}"
+ 
+     async def _reset(self) -> None:
+@@ -217,7 +234,9 @@ class Worker:
+         handoff = resp.text or "(no handoff note was written)"
+         self.resets += 1
+         self.ctx.file_digests.clear()                # 上下文已丢失，编辑前需要重新读取
+-        self.messages = [{"role": "user", "content": initial_message(self.task, await self._snapshot(), handoff)}]
++        self.messages = [{"role": "user", "content": initial_message(self.task, await self._snapshot(with_diff=True),
++                                                                     handoff, self.ctx.todos)}]
++        self._last_todo_turn = self.turns                # 任务清单已在首条消息里，不必马上提醒
+         self.last_context = 0
+         self.transcript.write("reset", handoff=handoff, resets=self.resets)
+ 
+diff --git a/belay/worker/prompts.py b/belay/worker/prompts.py
+index e2822f2..d209900 100644
+--- a/belay/worker/prompts.py
++++ b/belay/worker/prompts.py
+@@ -1,44 +1,95 @@
+ """worker 与探索子 agent 的系统提示和首条消息。
+ 
+-改写自 Claude Code / mini_claude（MIT）的编码指引，去掉了交互式内容（权限确认、向用户提问、
+-斜杠命令、plan mode 等），改为无人值守的设定。B 组要与原版 Claude Code 可比，
+-所以这里不加入 Belay 特有的规则；M3 起的规则通过 extra_rules 追加。
++内容来源（均为改写，不是原文照搬）：
++  - Claude Code v2.1.282 的系统提示与工具说明（Piebald-AI/claude-code-system-prompts 的整理）：
++    按全部范围交付、如实报告结果、自主运行、不做多余改动、todo 用法、子 agent 的使用克制、压缩摘要的结构；
++  - OpenAI Codex CLI 的 gpt_5_2_prompt.md（Apache-2.0）：从根因修复、不修无关的 bug 与测试、先窄后宽地验证；
++  - OpenHands CodeAct 的系统提示（MIT）：探索 → 复现 → 实现 → 验证的流程、反复失败时列出多个可能原因。
++去掉了交互式内容（权限确认、向用户提问、斜杠命令、plan mode、提交与 PR 流程），改为无人值守的设定，
++并写明本环境与 Claude Code 不同的地方（每次 bash 都从仓库根目录开始、不联网、改动自动收集）。
++
++边界：这里只放通用的好做法。针对 baseline 失败模式的规则（如不许修改测试、完成须有证据）
++属于 Belay 的机制，不放进 B 组，M3 起经 extra_rules 追加，否则 B 组与 A 组不可比。
+ """
+ from __future__ import annotations
+ 
+-SYSTEM_PROMPT = """You are an autonomous software engineering agent. You work alone on a task in a code repository. \
+-No human will answer questions or review intermediate steps, so make reasonable decisions yourself and keep working \
+-until the task is done.
++SYSTEM_PROMPT = """You are an autonomous software engineering agent working alone on a task in a code repository. \
++No human is watching or will answer questions, so make reasonable decisions yourself and keep working until the task \
++is completely done. Do not stop to ask for permission or confirmation.
+ 
+ # Environment
+-- Repository root: {workdir}
+-- Your tools run inside the task's container ({platform}). There is no network access.
++- Repository root: {workdir}. Your tools run inside the task's container ({platform}).
++- Every bash call starts in a fresh shell at the repository root: `cd` and environment variables do not carry over \
++to the next call. Use paths relative to the root, or chain commands with `&&` in one call.
++- There is no network access. The project's dependencies are already installed; do not try to download or install \
++packages from the internet.
++- Your changes to the working tree are collected automatically when you finish. Do not commit, create branches, \
++or otherwise rewrite git history.
+ - Tool results may include notes from the system in <system-reminder> tags.
+ 
+ # Doing the task
+-- Read the task carefully and make sure you address every part of it.
+-- Do not change code you have not read. Understand the existing code, its conventions and its tests before modifying it.
+-- Prefer editing existing files to creating new ones. Keep changes focused on what the task requires; do not refactor \
+-unrelated code or add features that were not asked for.
+-- Verify your work: run the relevant tests or commands and check the results before you finish.
+-- If an approach fails, diagnose why before switching tactics: read the error, check your assumptions, try a focused \
+-fix. Do not retry the identical action blindly, and do not abandon a viable approach after a single failure.
+-- When the task is complete, call submit with a summary of what you changed, how you verified it, and anything you \
+-could not finish.
++- Read the whole task statement before starting. When it lists several requirements (for example release notes \
++with many items), treat every item as part of the deliverable and track each one in your todo list.
++- The requested scope is the deliverable. Do not quietly narrow it. When something is ambiguous, make the reading \
++a careful engineer would make and carry on. If part of the task turns out to be impossible, finish everything else \
++and say exactly what you could not do and why.
++- Understand before you change: read the relevant code, its callers and its tests, and follow the existing \
++conventions, libraries and style. Do not assume a library is available; check how the code base already does it.
++- A good order of work: explore the relevant code → reproduce the problem or pin down the expected behaviour \
++(a failing test or a small script) → implement → verify → review your diff → submit.
++- When you have enough information to act, act. Do not keep re-reading what you already know.
++
++# Making changes
++- Fix problems at their root cause rather than papering over symptoms.
++- Keep changes focused on the task. Do not refactor unrelated code, add features nobody asked for, add error \
++handling for cases that cannot happen, or leave half-finished implementations.
++- Prefer editing existing files to creating new ones. Do not add comments that only restate the code.
++- Remove temporary files, debug prints and scratch scripts before you finish.
++
++# Verifying your work
++- Find out how the project runs its tests (README, CI configuration, pyproject/setup.cfg/tox.ini, Makefile, \
++package.json) and use the same commands.
++- Start with the tests closest to the code you changed, then run the broader related tests to catch regressions \
++in existing behaviour.
++- When a test fails, find out whether it also fails without your change before assuming you caused it (for \
++example, run it on a pristine copy made with `git archive HEAD | tar -x -C /tmp/orig`). Do not spend time fixing \
++unrelated failures that existed before your change; mention them in your summary.
++- Run tests in the foreground with a timeout long enough for them to finish (up to 1800 seconds); the call returns \
++as soon as they are done. Use run_in_background only for servers or runs longer than that, and do not poll them \
++with long fixed sleeps.
++
++# When you are stuck
++- Read the full error, check your assumptions, and try a focused fix. Do not retry the identical action, and do not \
++retry a failing command in a sleep loop.
++- If repeated attempts fail, step back: list several possible causes, judge which is most likely, and test them in \
++that order. Do not abandon a viable approach after a single failure either.
+ 
+ # Using your tools
+-- Use the dedicated tools instead of bash for file operations: read_file instead of cat/head/tail, edit_file instead \
+-of sed/awk, write_file instead of echo or heredoc redirection, list_files instead of find/ls, grep_search instead of \
+-grep/rg. Reserve bash for running programs, tests, builds and other system commands.
+-- You can call several tools in one response. When calls are independent of each other, make them in parallel.
+-- Long outputs are truncated in the middle; error lines are kept.
+-- For multi-step tasks, use todo_write to track your progress.
+-{explore_hint}{extra_rules}"""
+-
+-EXPLORE_HINT = """- For broad investigations (where something is implemented, how data flows through the code, which tests \
+-cover a behaviour), you can use explore to delegate the question to a read-only subagent with its own context; it \
+-returns a concise report. Launch several in parallel for independent questions. For a known file or symbol, read or \
+-search directly instead.
++- Use the dedicated tools instead of bash for file operations: read_file instead of cat/head/tail, edit_file \
++instead of sed/awk, write_file instead of echo or heredoc redirection, list_files instead of find/ls, grep_search \
++instead of grep/rg. Reserve bash for running programs, tests, builds and other system commands.
++- In bash, use non-interactive options (for example `--no-pager`, `-y`) and never start an editor or a pager. Quote \
++paths that contain spaces.
++- You can call several tools in one response. When calls do not depend on each other, make them in parallel.
++- Long outputs are truncated in the middle; lines that look like errors are kept.
++- Use todo_write for any task with several steps or requirements. Keep exactly one item in progress, and mark an item \
++completed as soon as it is done, and only when it is fully done.
++{explore_hint}
++# Finishing
++Before you call submit:
++1. Go back to the task statement and check every requirement against what you actually did.
++2. Run the relevant tests and read the results.
++3. Review `git status` and `git diff` for unintended changes, debug code and leftover files.
++
++Then call submit. In the summary, report what actually happened, not what you intended: a claim that something \
++works must rest on a result you observed. If any requirement is not done, or any test fails, or you skipped a check, \
++say so first, before listing what succeeded.
++{extra_rules}"""
++
++EXPLORE_HINT = """- explore delegates a broad investigation (where something is implemented, how data flows \
++through the code, which tests cover a behaviour) to a read-only subagent with its own context, and returns a concise \
++report. It costs time and tokens, so use it only when the investigation is sizeable: do small, bounded lookups (a few \
++reads, one search) yourself. Several independent investigations can run in parallel. Do not redo work you delegated.
+ """
+ 
+ EXPLORE_SYSTEM_PROMPT = """You are a read-only exploration agent. Another agent working on a coding task in this \
+@@ -81,11 +132,17 @@ def explore_message(question: str) -> str:
+     return f"<question>\n{question.strip()}\n</question>"
+ 
+ 
+-def initial_message(task: str, snapshot: str, handoff: str | None = None) -> str:
++def initial_message(task: str, snapshot: str, handoff: str | None = None, todos: list[dict] | None = None) -> str:
+     parts = [f"<task>\n{task.strip()}\n</task>"]
+     if handoff is not None:
+-        parts.append("Your previous session was reset because its context grew too long. "
+-                     "This is the handoff note you wrote before the reset:\n"
++        parts.append("Your previous session was reset because its context grew too long. Below are the handoff note "
++                     "you wrote just before the reset, your todo list, and the current repository state including "
++                     "the full diff of your changes. Files you read earlier are no longer in your context: read a "
++                     "file again before editing it.\n"
+                      f"<handoff_note>\n{handoff.strip()}\n</handoff_note>")
++        if todos:
++            mark = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
++            items = "\n".join(f"{mark.get(t['status'], '[ ]')} {t['content']}" for t in todos)
++            parts.append(f"<todo_list>\n{items}\n</todo_list>")
+     parts.append(f"<repository_state>\n{snapshot.strip()}\n</repository_state>")
+     return "\n\n".join(parts)
+diff --git a/eval/agents/flat_agent.py b/eval/agents/flat_agent.py
+index 90544a5..af70b2f 100644
+--- a/eval/agents/flat_agent.py
++++ b/eval/agents/flat_agent.py
+@@ -10,7 +10,7 @@ runs.yaml 中可用的 kwargs：
+   effort          DeepSeek 的 output_config.effort，默认 max（与 A 组的 --effort max 对应）
+   thinking        是否开启思考模式，默认 true
+   budget_min      预算分钟数，worker 在截止前 30 秒自行结束；Pier 的超时仍是最终兜底
+-  clear_tokens / reset_tokens   上下文管理阈值
++  clear_tokens / reset_tokens   上下文管理阈值，默认 50 万 / 75 万，与 A 组的压缩点对齐
+   explore         是否提供只读探索子 agent（explore 工具），默认 true；模型可以不用
+   policy          行动边界，如 {git_write: deny}；默认只记录不拦截，与 Claude Code 可比
+   record          是否录制模型回复（写到 trial 日志目录的 llm_record.jsonl）
+@@ -41,7 +41,7 @@ class FlatAgent(PatchCaptureMixin, BaseAgent):
+ 
+     def __init__(self, logs_dir, model_name=None, repo_dir=None, extra_env=None, max_tokens: int = 64000,
+                  effort: str | None = "max", thinking: bool = True, budget_min: float = 90,
+-                 clear_tokens: int = 120_000, reset_tokens: int = 250_000, policy: dict | None = None,
++                 clear_tokens: int = 500_000, reset_tokens: int = 750_000, policy: dict | None = None,
+                  record: bool = False, replay: str | None = None, explore: bool = True, **kwargs):
+         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
+         self.repo_dir = repo_dir
+diff --git a/runs.yaml b/runs.yaml
+index 4f725c0..c42f09f 100644
+--- a/runs.yaml
++++ b/runs.yaml
+@@ -110,6 +110,8 @@ agents:
+       budget_min: 90                    # 与 timeout_min 保持一致
+       record: true                      # 录制模型回复，调试 runtime 时可回放
+       explore: true                     # 提供只读探索子 agent（对应 Claude Code 的 Explore）；模型可以不用
++      clear_tokens: 500000              # 与 A 组对齐：Claude Code 约在 78.6 万 token 压缩
++      reset_tokens: 750000
+       # policy: {git_write: audit, network: audit, disk_search: audit, harness_paths: deny}   # 默认值
+     pricing: *claude_code_pricing
+ 
+diff --git a/tests/integration/test_worker.py b/tests/integration/test_worker.py
+index 84c94ba..f4a66aa 100644
+--- a/tests/integration/test_worker.py
++++ b/tests/integration/test_worker.py
+@@ -151,3 +151,55 @@ def test_explore_can_be_disabled(repo):
+     run(Worker(llm, LocalEnv(str(repo)), tools=tools).run("task"))
+     assert "explore" not in [t["name"] for t in llm.requests[0]["tools"]]
+     assert "use explore" not in llm.requests[0]["system"]
++
++
++# ---- 上下文重建、任务清单提醒、系统提示 ------------------------------------------------------
++
++def test_rebuild_carries_todos_and_full_diff(repo):
++    llm = ScriptedLLM([
++        [tool_use("a", "read_file", file_path="pkg/mod.py")],
++        [tool_use("b", "edit_file", file_path="pkg/mod.py", old_string="a - b", new_string="a + b"),
++         tool_use("c", "todo_write", todos=[{"content": "Fix add()", "status": "completed"},
++                                            {"content": "Run the tests", "status": "in_progress"}])],
++        [{"type": "text", "text": "1. Task status: add() fixed, tests not run yet."}],
++        [tool_use("d", "submit", summary="ok")],
++    ], context_tokens=[1000, 9000])                          # 第二步超过重建阈值
++    worker = Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(reset_tokens=5000))
++    res = run(worker.run("Fix add()"))
++    assert res.status == "submitted" and res.resets == 1
++    assert "Code map" in llm.requests[2]["messages"][-1]["content"][-1]["text"]      # 交接提示是新的五段结构
++    rebuilt = llm.requests[3]["messages"][0]["content"]
++    assert "add() fixed, tests not run yet" in rebuilt
++    assert "<todo_list>\n[x] Fix add()\n[~] Run the tests\n</todo_list>" in rebuilt
++    assert "+    return a + b" in rebuilt and "-    return a - b" in rebuilt              # 带上了完整 diff
++
++
++def test_first_message_has_no_full_diff(repo):
++    (repo / "pkg" / "mod.py").write_text("changed before the run\n")
++    llm = ScriptedLLM([[tool_use("a", "submit", summary="ok")]])
++    run(Worker(llm, LocalEnv(str(repo))).run("task"))
++    first = llm.requests[0]["messages"][0]["content"]
++    assert "git status --short" in first and "git --no-pager diff'" not in first
++
++
++def test_todo_reminder_after_quiet_turns(repo):
++    llm = ScriptedLLM([
++        [tool_use("t", "todo_write", todos=[{"content": "x", "status": "in_progress"}])],
++        [tool_use("a", "bash", command="true")],
++        [tool_use("b", "bash", command="true")],
++        [tool_use("c", "submit", summary="ok")],
++    ])
++    run(Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(todo_reminder_turns=2)).run("task"))
++    texts = [[b.get("text", "") for b in r["messages"][-1]["content"] if b.get("type") == "text"]
++             for r in llm.requests[1:]]
++    assert texts[0] == [] and texts[1] == []                                          # 刚更新过，不提醒
++    assert "todo list has not been updated" in texts[2][0]
++
++
++def test_system_prompt_states_environment_rules(repo):
++    llm = ScriptedLLM([[tool_use("a", "submit", summary="ok")]])
++    run(Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(extra_rules="Never touch tests.")).run("task"))
++    system = llm.requests[0]["system"]
++    for phrase in ["fresh shell at the repository root", "no network access", "Do not commit",
++                   "check every requirement", "report what actually happened", "# Additional rules\nNever touch tests."]:
++        assert phrase in system, phrase
