@@ -6,7 +6,8 @@
 
 DeepSWE、LHTB 是原生 Harbor 格式，直接复制；ProMax / SWE-EVO 调用各自的转换器。
 所有任务统一强制 [environment] allow_internet = false：Pier 只会放行 agent 声明的模型 API。
-LHTB 另外关闭 continue_until_timeout（它相当于用隐藏评分器当裁判，只允许在上界对照组中开启）。
+LHTB 另外关闭 continue_until_timeout（它相当于用隐藏评分器当裁判，只允许在上界对照组中开启）；
+独立评分容器（verifier.environment_mode = "separate"）Pier 不支持，改为在 agent 容器中评分。
 """
 from __future__ import annotations
 
@@ -56,6 +57,42 @@ def disable_continue_until_timeout(toml_path: Path) -> None:
     assert agent.get("continue_until_timeout", False) is False, toml_path
 
 
+def use_shared_verifier(toml_path: Path) -> bool:
+    """把 verifier.environment_mode = "separate"（独立评分容器）改为在 agent 容器中评分。
+
+    Pier 不启动独立评分容器（LHTB 的 langchain-version-migration 因此报 RewardFileNotFoundError）。
+    只在评分镜像与 agent 镜像相同时改写：此时评分脚本依赖的东西 agent 容器里都有；隐藏测试仍只在评分时上传。
+    镜像不同则报错，需要单独处理。返回是否做了改写。
+    """
+    text = toml_path.read_text()
+    cfg = tomllib.loads(text)
+    ver = cfg.get("verifier", {})
+    if ver.get("environment_mode") != "separate":
+        return False
+    v_img = (ver.get("environment") or {}).get("docker_image")
+    a_img = (cfg.get("environment") or {}).get("docker_image")
+    if v_img and v_img != a_img:
+        raise ValueError(f"独立评分镜像 {v_img} 与 agent 镜像 {a_img} 不同，不能直接改为共用容器评分")
+    out, section = [], None
+    for line in text.splitlines():
+        m = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+        if m:
+            section = m.group(1).strip()
+            if section == "verifier.environment" or section.startswith("verifier.environment."):
+                continue
+            out.append(line)
+            continue
+        if section is not None and (section == "verifier.environment" or section.startswith("verifier.environment.")):
+            continue
+        if section == "verifier" and re.match(r"^\s*environment_mode\s*=", line):
+            continue
+        out.append(line)
+    toml_path.write_text("\n".join(out) + "\n")
+    ver = tomllib.loads(toml_path.read_text()).get("verifier", {})
+    assert "environment_mode" not in ver and "environment" not in ver, toml_path
+    return True
+
+
 def prepare_one(bm: str, tid: str, bench_cfg: dict, entry: dict, dst: Path) -> str:
     if bench_cfg.get("task_format") == "native":
         src = Path(bench_cfg["data"]) / tid
@@ -71,6 +108,8 @@ def prepare_one(bm: str, tid: str, bench_cfg: dict, entry: dict, dst: Path) -> s
         mod.convert(tid, bench_cfg, entry, dst)
     force_no_internet(dst / "task.toml")
     disable_continue_until_timeout(dst / "task.toml")
+    if use_shared_verifier(dst / "task.toml"):
+        print(f"    {bm}/{tid}: 独立评分容器改为在 agent 容器中评分")
     return "ok"
 
 
