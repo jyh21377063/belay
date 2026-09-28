@@ -6,14 +6,16 @@
   - 上下文过长时不做原地摘要压缩，而是让模型写交接说明后重建上下文；
   - 每一步写入只追加的轨迹，被取消时不丢记录；
   - 同一个 Worker 类也用来跑只读的探索子 agent（role="explore"），由 explore 工具调起。
-M2 起，run_check / submit 等工具会把请求投递给 Orchestrator；循环本身不变。
+Belay（M2 起）：run_check / submit 等工具经 ToolContext.runtime 把请求投递给 Orchestrator；循环本身不变，
+只多两个可注入的钩子：runtime 的通知在每轮工具结果后以 <system-reminder> 注入（drain_notices），
+上下文重开时的任务说明由 task_refresh 从证据图重建。Test Author 复用本循环，并用 system_prompt 换掉系统提示。
 """
 from __future__ import annotations
 
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Awaitable, Callable
 
 from belay.worker.context import HANDOFF_REQUEST, clear_stale_results
 from belay.env import Env
@@ -56,10 +58,13 @@ class Worker:
     def __init__(self, llm, env: Env, tools: list[Tool] | None = None, config: WorkerConfig | None = None,
                  policy: Policy | None = None, transcript: Transcript | None = None,
                  on_progress: Callable[["Worker"], None] | None = None,
-                 runtime: RuntimeClient | None = None, work_id: str | None = None, role: str = "main"):
+                 runtime: RuntimeClient | None = None, work_id: str | None = None, role: str = "main",
+                 system_prompt: str | None = None, task_refresh: Callable[[], Awaitable[str]] | None = None):
         self.llm = llm
         self.env = env
         self.role = role                                  # main | explore
+        self.system_prompt = system_prompt                # 自定义系统提示（Test Author）；首条消息即任务原文
+        self.task_refresh = task_refresh                  # 上下文重开时重建任务说明（Belay：从证据图）
         self.tools = {t.name: t for t in (tools if tools is not None else get_tools())}
         if role == "explore":                             # 子 agent 不能再开子 agent，也不能提交
             self.tools = {n: t for n, t in self.tools.items() if n in EXPLORE_TOOLS}
@@ -86,7 +91,10 @@ class Worker:
         platform = (await self.env.run("uname -sm", timeout=30)).output.strip()
         self.schemas = [t.schema() for t in self.tools.values()]
         self.task = task
-        if self.role == "explore":
+        if self.system_prompt is not None:
+            self.system = self.system_prompt
+            first = task
+        elif self.role == "explore":
             self.system = explore_system_prompt(self.env.workdir, platform)
             first = explore_message(task)
         else:
@@ -204,6 +212,9 @@ class Worker:
             self._last_todo_turn = self.turns
             notes.append("The todo list has not been updated recently. If it no longer matches what you are doing, "
                          "update it; if it is not useful for this task, ignore this note.")
+        runtime = self.ctx.runtime
+        if runtime is not None and hasattr(runtime, "drain_notices"):
+            notes.extend(runtime.drain_notices())
         if self.config.time_reminders and self.config.deadline:
             left = (self.config.deadline - time.monotonic()) / 60
             if self.turns % 20 == 0 or left < 15:
@@ -235,7 +246,8 @@ class Worker:
         handoff = resp.text or "(no handoff note was written)"
         self.resets += 1
         self.ctx.file_digests.clear()                # 上下文已丢失，编辑前需要重新读取
-        self.messages = [{"role": "user", "content": initial_message(self.task, await self._snapshot(with_diff=True),
+        task = await self.task_refresh() if self.task_refresh else self.task
+        self.messages = [{"role": "user", "content": initial_message(task, await self._snapshot(with_diff=True),
                                                                      handoff, self.ctx.todos)}]
         self._last_todo_turn = self.turns                # 任务清单已在首条消息里，不必马上提醒
         self.last_context = 0

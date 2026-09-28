@@ -61,13 +61,18 @@ _DISK = re.compile(r"\b(find|locate|rg|grep\s+-[a-zA-Z]*r[a-zA-Z]*)\s+(?:[^|;&]*
 
 
 class RuntimeClient(Protocol):
-    """工具与 Orchestrator 之间唯一的接口（M2 起实现）。
+    """工具与 Orchestrator 之间唯一的接口（实现见 belay/runtime/orchestrator.py 的 WorkerRuntime）。
 
     工具把请求投进 Orchestrator 的收件箱并等待回复；工具不认识 Orchestrator 的内部实现。
+    回复是 {"text": 给模型看的文字, "finished": 运行是否已结束, "error": 是否是错误}。
     B 组（FlatAgent）没有 runtime，ToolContext.runtime 为 None，runtime 工具不会注册。
     """
 
     async def request(self, kind: str, **payload: Any) -> dict: ...
+
+    def drain_notices(self) -> list[str]:
+        """取走 runtime 发给本 worker 的通知（独立测试收录 / 被拒等），由 worker 在下一轮注入。"""
+        ...
 
 
 @dataclass
