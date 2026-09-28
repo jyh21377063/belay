@@ -115,12 +115,35 @@ agents:
       # policy: {git_write: audit, network: audit, disk_search: audit, harness_paths: deny}   # 默认值
     pricing: *claude_code_pricing
 
-  belay:                      # C/D 组：Belay（M1 阶段 = 自研 worker + 严格行动边界 + 剩余时间提示）
+  belay: &belay               # Belay 组：自研 worker + 证据图 runtime（v4）
     <<: *flat
     import_path: "eval.agents.belay_agent:BelayAgent"
-    kwargs:
+    gate: true                          # runner 读取任务目录下的 gate.json 作为测试配置（目前仅 SWE-EVO 生成）
+    setup_timeout_min: 150              # setup 阶段在原始代码上跑两次基线，不计入 90 分钟预算
+    kwargs: &belay_kwargs
       <<: *flat_kwargs
-      workers: 1                        # D 组改为 3（M5 起生效）
+      workers: 1                        # Belay-1；M5 起可改为 3
+      runtime: &belay_runtime           # belay/config.py 的 RuntimeConfig；每个机制都可以关掉
+        gate: block                     # block | advise（只提示不拒绝）| off
+        checkpoint_gate: related        # 检查点只跑与改动相关的测试文件
+        final_gate: full                # 最终提交跑全量；剩余时间不够时自动降为 related
+        test_author: true
+        test_author_quota: 8
+        reports: true
+        isolation: true                 # worker 以低权限用户运行；建不了用户时自动退回 root 并记录
+
+  # 分阶段验收：同一套 runtime 关掉部分机制（对应 M2 / M3）
+  belay-m2:                   # 作业 + 证据图 + run_check / wait / ledger；submit 直接合并，不跑门禁
+    <<: *belay
+    kwargs:
+      <<: *belay_kwargs
+      runtime: {<<: *belay_runtime, gate: "off", protect_tests: false, test_author: false, reports: false}
+
+  belay-m3:                   # 加上门禁、集成分支、测试保护、截止保护；不启用独立测试与上报
+    <<: *belay
+    kwargs:
+      <<: *belay_kwargs
+      runtime: {<<: *belay_runtime, test_author: false, reports: false}
 
 # ---------------------------------------------------------------------
 # Profiles
@@ -186,13 +209,13 @@ profiles:
     repeats: 1
     grading: {inline_verify: false}
 
-  belay-dev:                  # C 组调试
+  belay-dev:                  # Belay 调试（完整机制）；分阶段验收用 --agent belay-m2 / belay-m3
     split: dev
     agent: belay
     repeats: 1
     keep_containers: true
 
-  belay-test:                 # C 组正式评测（D 组改 agents.belay.kwargs.workers）
+  belay-test:                 # Belay 组正式评测（Belay-1 与并发组改 agents.belay.kwargs.workers）
     split: test
     agent: belay
     repeats: 1

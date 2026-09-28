@@ -76,10 +76,13 @@ def test_flat_agent_end_to_end(setup):
     assert (agent_dir / "transcript.jsonl").exists()
 
 
-def test_belay_agent_is_strict(setup):
+def test_belay_agent_is_strict_and_delivers_the_integration_branch(setup):
     repo, agent_dir = setup
     env = FakePierEnvironment(repo, agent_dir)
-    agent = BelayAgent(logs_dir=agent_dir, model_name="deepseek-flash", extra_env={"DEEPSEEK_API_KEY": "x"}, workers=1)
+    tmp = agent_dir.parent
+    paths = {"state": str(tmp / "belay-state"), "bin": str(tmp / "belay-bin"), "dev_jobs": str(tmp / "belay-jobs")}
+    agent = BelayAgent(logs_dir=agent_dir, model_name="deepseek-flash", extra_env={"DEEPSEEK_API_KEY": "x"}, workers=1,
+                       runtime={"isolation": False, "tick_sec": 0.5}, paths=paths)
     llm = ScriptedLLM([list(s) for s in SCRIPT])
     agent._make_llm = lambda: llm
     context = SimpleNamespace(metadata=None)
@@ -91,3 +94,8 @@ def test_belay_agent_is_strict(setup):
     assert context.metadata["violations"] == {"git_write": 1}
     denied = llm.requests[3]["messages"][-1]["content"][0]
     assert denied["is_error"] and "Git write" in denied["content"]
+    # 没有测试配置：提交直接合并；worker 结束后 runtime 把工作区作为最终候选，交付集成分支 HEAD
+    assert context.metadata["belay_status"] == "DONE" and context.metadata["merges"] == 1
+    patch = (agent_dir / "patch.diff").read_text()
+    assert "+    return a + b" in patch
+    assert (agent_dir / "belay" / "ledger.json").exists() and (agent_dir / "belay" / "events.jsonl").exists()

@@ -81,7 +81,7 @@ python -m eval.report results/<run_id>                    # 重新生成汇总
 
 ## belay 模块
 
-架构、目录与依赖规则见 [docs/architecture.md](docs/architecture.md)。当前完成 M0 + M1（自研 worker）：
+架构、目录与依赖规则见 [docs/architecture.md](docs/architecture.md)。当前完成 M0 + M1（自研 worker）与 M2–M4（证据图 runtime，按 v4 计划）：
 循环跑在宿主机进程里，所有工具经由 `environment.exec` 在任务容器中执行；容器里只需要 bash 与 coreutils，不需要联网。
 结构参考 [mini_claude](https://github.com/Windy3f3f3f3f/claude-code-from-scratch/tree/main/python/mini_claude)（MIT）。
 
@@ -91,7 +91,11 @@ python -m eval.report results/<run_id>                    # 重新生成汇总
 | `belay/llm.py` | DeepSeek Anthropic 兼容接口：流式调用、重试、保留 thinking 块、用量统计、录制与回放 |
 | `belay/tools/` | 9 个工具（含只读探索子 agent `explore`）、读后被改检测、行动边界策略、输出截断、与 Orchestrator 的 `RuntimeClient` 接口 |
 | `belay/worker/` | 主循环（也用来跑探索子 agent）、上下文清理与交接重建、提示词、轨迹 |
-| `belay/graph/` `belay/runtime/` `belay/container/` `belay/observe/` | M2 起的证据图、Orchestrator、容器内脚本、回放（目前是带说明的空包） |
+| `belay/config.py` | `RuntimeConfig`：每个机制一个开关（门禁、独立测试、上报、隔离……）；容器内路径 |
+| `belay/graph/` | 证据图：模型、证据规则、需求账本、需求切分、不变量（纯函数）；SQLite 存储 |
+| `belay/runtime/` | Orchestrator（单写者循环 + 纯函数 `decide()`）、作业、影子仓库与集成分支、setup、Test Author / Reviewer |
+| `belay/container/runner.py` | 容器内的检查运行器（标准库、Python 3.6）：临时切换候选树跑测试、解析结果、剔除测试改动 |
+| `belay/observe/` | M6 的回放页面（空包） |
 | `belay/cli.py` | 本地调试入口，不经过 Pier |
 | `eval/agents/flat_agent.py` / `belay_agent.py` | B 组 / Belay 接入 Pier |
 
@@ -104,9 +108,16 @@ python -m eval.run --profile flat-dev --tasks <题目>                   # 通�
 ```
 
 每个 trial 的日志目录下有 `transcript.jsonl`（每轮的模型输出与工具结果）和 `llm_record.jsonl`（录制的模型回复）。
+Belay 组另有 `belay/`：`graph.sqlite` 与 `events.jsonl`（证据图与事件）、`ledger.json` / `ledger.md`（需求账本）、
+`setup.json`（基线与各机制是否可用）、`worktree.diff`、`test_author-*.jsonl`、`reviews.jsonl`。
+
+```bash
+python -m eval.run --profile belay-dev --agent belay-m2 --tasks <题目>   # 分阶段验收：M2 → belay-m3 → belay
+```
 
 ## 待办
 
 - [ ] `eval/convert/promax_to_harbor.py`、`sweevo_to_harbor.py`：instruction.md 只写 problem_statement；SWE-EVO 的单提交重建写进 Dockerfile；`tests/test.sh` 写 `/logs/verifier/reward.json`（`{"resolved": 0|1, "fix_rate": x}`）
-- [ ] `eval/agents/belay_agent.py`：C/D 组接入
+- [x] `eval/agents/belay_agent.py`：Belay 组接入（M2–M4）
+- [ ] M5：`spawn_work`、每个 worker 一个 worktree、`merge-tree` 合并队列
 - [ ] 填写 `task_selection.md` 4.3 节的实测难度
