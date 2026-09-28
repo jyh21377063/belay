@@ -20,7 +20,8 @@ belay/                      # 仓库根目录
 │   │
 │   ├── tools/              # 模型能调用的工具
 │   │   ├── base.py         #   Tool、ToolContext、行动边界策略、RuntimeClient 接口
-│   │   ├── files.py  shell.py
+│   │   ├── files.py  shell.py  #   文件工具（含读后被改检测）、bash、todo、submit
+│   │   ├── agents.py       #   explore：只读探索子 agent，经 ToolContext.subagent 由 worker 注入
 │   │   ├── output.py       #   工具输出截断（保留报错行）
 │   │   └── runtime.py      #   M2 起：run_check / wait / ledger / submit / spawn_work /
 │   │                       #   request_test / report_conflict，只负责把请求投进收件箱

@@ -109,6 +109,7 @@ agents:
       max_tokens: 64000
       budget_min: 90                    # 与 timeout_min 保持一致
       record: true                      # 录制模型回复，调试 runtime 时可回放
+      explore: true                     # 提供只读探索子 agent（对应 Claude Code 的 Explore）；模型可以不用
       # policy: {git_write: audit, network: audit, disk_search: audit, harness_paths: deny}   # 默认值
     pricing: *claude_code_pricing
 

@@ -2,7 +2,9 @@
 
 语义参考 Claude Code 与 mini_claude（MIT）：
   - read_file 带行号，默认最多 2000 行，可用 offset / limit 分段读；
-  - 编辑或覆盖已存在的文件之前必须先读过它；
+  - 编辑或覆盖已存在的文件之前必须先读过它，而且读取之后文件没有被改过（读后被改检测）：
+    读取时记下整个文件的 sha256，编辑前与当前内容比对。bash 里的命令、后台进程、
+    M5 起其他 worker 的合并都可能在读取之后改动文件，按旧内容编辑会覆盖掉这些改动；
   - edit_file 要求 old_string 唯一匹配（或显式 replace_all），并容忍弯引号差异。
 """
 from __future__ import annotations
@@ -11,7 +13,7 @@ import posixpath
 import re
 import shlex
 
-from belay.env import FileMissing
+from belay.env import FileMissing, FileTooLarge
 from belay.tools.base import Tool, ToolContext, ToolError
 
 MAX_LINES = 2000
@@ -27,12 +29,12 @@ async def read_file(inp: dict, ctx: ToolContext) -> str:
     offset = max(1, int(inp.get("offset") or 1))
     limit = max(1, min(int(inp.get("limit") or MAX_LINES), MAX_LINES))
     try:
-        total, text = await ctx.env.read_lines(path, offset, limit)
+        total, text, digest = await ctx.env.read_lines(path, offset, limit)
     except FileMissing:
         raise ToolError(f"File does not exist: {path}")
     if "\x00" in text:
         raise ToolError(f"{path} is a binary file and cannot be read as text.")
-    ctx.read_files.add(path)
+    ctx.file_digests[path] = digest
     if not text:
         return f"({path} is empty)" if total == 0 else f"({path} has {total} lines; nothing after line {offset})"
     lines = text.split("\n")
@@ -55,11 +57,23 @@ async def write_file(inp: dict, ctx: ToolContext) -> str:
     content = inp.get("content")
     if content is None:
         raise ToolError("Missing content")
-    if path not in ctx.read_files and await ctx.env.exists(path):
-        raise ToolError(f"{path} already exists. Read it with read_file before overwriting it; use edit_file for partial changes.")
-    await ctx.env.write_text(path, content)
-    ctx.read_files.add(path)
+    current = await ctx.env.digest(path)
+    if current is not None:
+        if path not in ctx.file_digests:
+            raise ToolError(f"{path} already exists. Read it with read_file before overwriting it; "
+                            "use edit_file for partial changes.")
+        _check_fresh(ctx, path, current)
+    ctx.file_digests[path] = await ctx.env.write_text(path, content)
     return f"Wrote {path} ({content.count(chr(10)) + 1} lines)"
+
+
+def _check_fresh(ctx: ToolContext, path: str, current: str) -> None:
+    """读后被改检测：当前内容与上次读取或写入时不同，就要求先重新读取。"""
+    if ctx.file_digests.get(path) != current:
+        ctx.event("stale_edit", path=path)
+        del ctx.file_digests[path]
+        raise ToolError(f"{path} has been modified since you last read it (by a command, a background process "
+                        "or another change). Read it again with read_file before editing it.")
 
 
 # ---- edit_file ------------------------------------------------------------------
@@ -96,12 +110,15 @@ async def edit_file(inp: dict, ctx: ToolContext) -> str:
         raise ToolError("old_string and new_string are identical; nothing to change")
     if old == "":
         raise ToolError("old_string is empty. Use write_file to create a new file")
-    if path not in ctx.read_files:
+    if path not in ctx.file_digests:
         raise ToolError(f"Read {path} with read_file before editing it")
     try:
-        content = await ctx.env.read_text(path)
+        content, current = await ctx.env.read_text(path)
     except FileMissing:
         raise ToolError(f"File does not exist: {path}")
+    except FileTooLarge as e:
+        raise ToolError(f"{e}. Use bash for targeted changes to very large files.")
+    _check_fresh(ctx, path, current)
     actual = _find_actual(content, old)
     if actual is None:
         raise ToolError(f"old_string not found in {path} (it must match exactly, including indentation and whitespace)")
@@ -111,7 +128,7 @@ async def edit_file(inp: dict, ctx: ToolContext) -> str:
         raise ToolError(f"old_string occurs {count} times in {path}. Add surrounding context to make it unique, or set replace_all")
     start = content.find(actual)
     new_content = content.replace(actual, new) if replace_all else content.replace(actual, new, 1)
-    await ctx.env.write_text(path, new_content)
+    ctx.file_digests[path] = await ctx.env.write_text(path, new_content)
     note = " (matched after normalizing quotes)" if actual != old else ""
     head = f"Edited {path}{note}" + (f", replaced {count} occurrences" if replace_all and count > 1 else "")
     return f"{head}\n\nSnippet after the edit:\n{_snippet(new_content, start, new.count(chr(10)) + 1)}"

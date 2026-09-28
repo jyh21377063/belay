@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import os
 import shlex
 import signal
@@ -35,6 +36,10 @@ class FileMissing(Exception):
     pass
 
 
+class FileTooLarge(Exception):
+    pass
+
+
 class Env:
     """子类只需实现 _exec（执行一条 bash 命令，返回合并输出与退出码）。"""
 
@@ -53,36 +58,58 @@ class Env:
         return await self._exec(wrapped, timeout + 30)
 
     # ---- 文件读写：全部经由 run，因此三种环境行为一致
-    async def read_text(self, path: str, max_bytes: int = 8 * 1024 * 1024) -> str:
-        """读取整个文件（编辑前用）。非 UTF-8 字节用 surrogateescape 保留，写回时原样还原。"""
+    # 读取时在同一条命令里取回整个文件的 sha256，供"读后被改"检测使用，不额外增加 exec。
+    async def read_text(self, path: str, max_bytes: int = 8 * 1024 * 1024) -> tuple[str, str]:
+        """读取整个文件（编辑前用），返回（内容，sha256）。
+
+        非 UTF-8 字节用 surrogateescape 保留，写回时原样还原。
+        """
         q = shlex.quote(path)
         res = await self.run(f"test -f {q} || {{ echo __BELAY_NOFILE__; exit 3; }}; "
-                             f"head -c {max_bytes} {q} | base64 | tr -d '\\n'", timeout=60)
+                             f"size=$(wc -c < {q}); echo $size; [ $size -le {max_bytes} ] || exit 4; "
+                             f"sha256sum {q} | cut -c1-64; base64 < {q} | tr -d '\\n'", timeout=60)
         if res.return_code == 3 and "__BELAY_NOFILE__" in res.output:
             raise FileMissing(path)
+        if res.return_code == 4:                     # 截断后写回会丢内容，所以直接拒绝
+            raise FileTooLarge(f"{path} is {res.output.strip()} bytes; files over {max_bytes} bytes cannot be edited")
         if res.return_code != 0:
             raise OSError(f"read failed rc={res.return_code}: {res.output[-500:]}")
-        return base64.b64decode(res.output.strip()).decode("utf-8", errors="surrogateescape")
+        _size, digest, rest = (res.output.strip().split("\n", 2) + ["", ""])[:3]
+        return base64.b64decode(rest.strip()).decode("utf-8", errors="surrogateescape"), digest.strip()
 
-    async def read_lines(self, path: str, start: int, count: int) -> tuple[int, str]:
-        """返回（文件总行数，第 start 行起 count 行的文本）。行号从 1 开始。"""
+    async def read_lines(self, path: str, start: int, count: int) -> tuple[int, str, str]:
+        """返回（文件总行数，第 start 行起 count 行的文本，整个文件的 sha256）。行号从 1 开始。"""
         q = shlex.quote(path)
         end = start + count - 1
         res = await self.run(f"test -f {q} || {{ echo __BELAY_NOFILE__; exit 3; }}; "
-                             f"wc -l < {q}; sed -n '{start},{end}p' {q} | head -c 2000000 | base64 | tr -d '\\n'",
+                             f"wc -l < {q}; sha256sum {q} | cut -c1-64; "
+                             f"sed -n '{start},{end}p' {q} | head -c 2000000 | base64 | tr -d '\\n'",
                              timeout=60)
         if res.return_code == 3 and "__BELAY_NOFILE__" in res.output:
             raise FileMissing(path)
         if res.return_code != 0:
             raise OSError(f"read failed rc={res.return_code}: {res.output[-500:]}")
-        first, _, rest = res.output.strip().partition("\n")
-        total = int(first.strip() or 0)
-        text = base64.b64decode(rest.strip()).decode("utf-8", errors="replace") if rest.strip() else ""
-        return total, text
+        lines = res.output.strip().split("\n", 2)
+        total = int(lines[0].strip() or 0)
+        digest = lines[1].strip() if len(lines) > 1 else ""
+        rest = lines[2].strip() if len(lines) > 2 else ""
+        text = base64.b64decode(rest).decode("utf-8", errors="replace") if rest else ""
+        return total, text, digest
 
-    async def write_text(self, path: str, text: str) -> None:
-        """写文件：先写到临时文件再 cat 覆盖目标，保留目标文件原有的权限与属主。"""
-        data = base64.b64encode(text.encode("utf-8", errors="surrogateescape")).decode()
+    async def digest(self, path: str) -> str | None:
+        """文件的 sha256；文件不存在时返回 None。"""
+        q = shlex.quote(path)
+        res = await self.run(f"test -f {q} || exit 3; sha256sum {q} | cut -c1-64", timeout=30)
+        if res.return_code == 3:
+            return None
+        if res.return_code != 0:
+            raise OSError(f"digest failed rc={res.return_code}: {res.output[-500:]}")
+        return res.output.strip()
+
+    async def write_text(self, path: str, text: str) -> str:
+        """写文件：先写到临时文件再 cat 覆盖目标，保留目标文件原有的权限与属主。返回写入内容的 sha256。"""
+        raw = text.encode("utf-8", errors="surrogateescape")
+        data = base64.b64encode(raw).decode()
         q = shlex.quote(path)
         tmp = shlex.quote(f"{path}.belay-tmp")
         res = await self.run(f"mkdir -p \"$(dirname {q})\" && : > {tmp}", timeout=30)
@@ -97,6 +124,7 @@ class Env:
         res = await self.run(f"cat {tmp} > {q} && rm -f {tmp}", timeout=30)
         if res.return_code != 0:
             raise OSError(f"write failed: {res.output[-500:]}")
+        return hashlib.sha256(raw).hexdigest()
 
     async def exists(self, path: str) -> bool:
         return (await self.run(f"test -e {shlex.quote(path)}", timeout=30)).return_code == 0

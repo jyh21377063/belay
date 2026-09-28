@@ -17,6 +17,10 @@ async def bash(inp: dict, ctx: ToolContext) -> str:
     if not command:
         raise ToolError("Missing command")
     ctx.check_command(command)
+    if ctx.read_only:
+        if inp.get("run_in_background"):
+            raise ToolError("Background commands are not available to a read-only exploration agent")
+        ctx.check_read_only(command)
 
     if inp.get("run_in_background"):
         # M1 的简单版本：后台启动，输出写到日志文件。M2 起改由 run_check / wait 负责长时间操作。

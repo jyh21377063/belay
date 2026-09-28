@@ -6,6 +6,7 @@ import json
 
 from belay.env import LocalEnv
 from belay.llm import ScriptedLLM
+from belay.tools import DEFAULT_TOOLS, get_tools
 from belay.worker import Worker, WorkerConfig
 from belay.worker.transcript import Transcript
 from tests.conftest import tool_use
@@ -65,3 +66,88 @@ def test_worker_reset_writes_handoff_and_rebuilds_context(repo):
     assert len(rebuilt) == 1 and "HANDOFF: add() subtracts" in rebuilt[0]["content"] and "<task>" in rebuilt[0]["content"]
     # 重建后必须重新读取才能编辑
     assert "before editing" in llm.requests[3]["messages"][-1]["content"][0]["content"]
+
+
+# ---- 只读探索子 agent -----------------------------------------------------------------
+
+def test_explore_subagent_reports_and_stays_read_only(repo, tmp_path_factory):
+    out = tmp_path_factory.mktemp("run")
+    llm = ScriptedLLM([
+        [tool_use("p1", "explore", description="find add", prompt="Where is add() defined and tested?")],
+        [tool_use("c1", "grep_search", pattern="def add"),
+         tool_use("c2", "bash", command="echo hacked > pkg/x.txt"),
+         tool_use("c3", "edit_file", file_path="pkg/mod.py", old_string="a", new_string="b")],
+        [{"type": "text", "text": "add() is in pkg/mod.py:1 and tested in tests/test_mod.py:3"}],
+        [tool_use("p2", "submit", summary="done")],
+    ])
+    worker = Worker(llm, LocalEnv(str(repo)), transcript=Transcript(out / "t.jsonl"))
+    res = run(worker.run("Fix add()"))
+    assert res.status == "submitted"
+    assert "explore" in llm.requests[0]["system"]                        # 主 worker 的提示里有用法说明
+
+    child = llm.requests[1]
+    assert "read-only exploration agent" in child["system"]
+    assert sorted(t["name"] for t in child["tools"]) == ["bash", "grep_search", "list_files", "read_file"]
+    assert child["messages"][0]["content"].startswith("<question>")
+    results = llm.requests[2]["messages"][-1]["content"]
+    assert "mod.py:1" in results[0]["content"]
+    assert results[1]["is_error"] and "read-only" in results[1]["content"]
+    assert results[2]["is_error"] and "unknown tool" in results[2]["content"]
+    assert not (repo / "pkg" / "x.txt").exists()
+
+    report = llm.requests[3]["messages"][-1]["content"][0]
+    assert not report["is_error"] and "tests/test_mod.py:3" in report["content"]
+    assert res.usage.input_tokens == 4000                                # 父 2 次 + 子 2 次，子 agent 用量计入
+    assert (out / "t-explore-1.jsonl").exists()
+    assert any(e.get("category") == "read_only" and e.get("source") == "explore-1" for e in res.events)
+
+
+def test_parallel_explorers(repo, tmp_path_factory):
+    out = tmp_path_factory.mktemp("run")
+    llm = ScriptedLLM([
+        [tool_use("p1", "explore", description="a", prompt="Question A"),
+         tool_use("p2", "explore", description="b", prompt="Question B")],
+        [{"type": "text", "text": "REPORT"}],
+        [{"type": "text", "text": "REPORT"}],
+        [tool_use("p3", "submit", summary="done")],
+    ])
+    res = run(Worker(llm, LocalEnv(str(repo)), transcript=Transcript(out / "t.jsonl")).run("task"))
+    assert res.status == "submitted"
+    results = llm.requests[-1]["messages"][-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["p1", "p2"] and all(r["content"] == "REPORT" for r in results)
+    assert (out / "t-explore-1.jsonl").exists() and (out / "t-explore-2.jsonl").exists()
+
+
+def test_explorer_wraps_up_at_turn_limit(repo):
+    llm = ScriptedLLM([
+        [tool_use("p1", "explore", description="x", prompt="Survey the package")],
+        [tool_use("c1", "list_files", pattern="**/*.py")],
+        [{"type": "text", "text": "Partial report: three python files."}],
+        [tool_use("p2", "submit", summary="done")],
+    ])
+    worker = Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(explore_max_turns=1))
+    run(worker.run("task"))
+    wrapup = llm.requests[2]
+    assert wrapup["tool_choice"] == {"type": "none"} and "limit" in wrapup["messages"][-1]["content"][-1]["text"]
+    assert "Partial report" in llm.requests[3]["messages"][-1]["content"][0]["content"]
+
+
+def test_explorer_worktree_change_is_flagged(repo):
+    llm = ScriptedLLM([
+        [tool_use("p1", "explore", description="x", prompt="Look around")],
+        [tool_use("c1", "bash", command="python3 -c \"open('pkg/new.txt','w').write('x')\"")],   # 绕过了正则
+        [{"type": "text", "text": "done looking"}],
+        [tool_use("p2", "submit", summary="done")],
+    ])
+    res = run(Worker(llm, LocalEnv(str(repo))).run("task"))
+    report = llm.requests[3]["messages"][-1]["content"][0]["content"]
+    assert "working tree changed" in report
+    assert any(e["kind"] == "explore_modified_worktree" for e in res.events)
+
+
+def test_explore_can_be_disabled(repo):
+    llm = ScriptedLLM([[tool_use("p1", "submit", summary="ok")]])
+    tools = get_tools([n for n in DEFAULT_TOOLS if n != "explore"])
+    run(Worker(llm, LocalEnv(str(repo)), tools=tools).run("task"))
+    assert "explore" not in [t["name"] for t in llm.requests[0]["tools"]]
+    assert "use explore" not in llm.requests[0]["system"]

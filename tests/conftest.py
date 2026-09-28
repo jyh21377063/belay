@@ -12,6 +12,10 @@ from pathlib import Path
 import pytest
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "docker: 需要 docker 容器的测试（默认跳过）")
+
+
 def pytest_collection_modifyitems(config, items):
     if config.getoption("-m") and "docker" in config.getoption("-m"):
         return

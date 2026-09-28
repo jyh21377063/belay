@@ -110,3 +110,52 @@ def test_policy_audit_vs_deny(repo):
     with pytest.raises(ToolError, match="evaluation harness"):
         run(read_file({"file_path": "/logs/verifier/reward.json"}, ctx))
     assert run(bash({"command": "git status --short"}, strict)) is not None     # 只读 git 命令放行
+
+
+# ---- 读后被改检测 -----------------------------------------------------------------
+
+def test_stale_edit_after_external_change(repo):
+    ctx = ctx_for(repo)
+    run(read_file({"file_path": "pkg/mod.py"}, ctx))
+    (repo / "pkg" / "mod.py").write_text("def add(a, b):\n    return a - b  # changed elsewhere\n")
+    with pytest.raises(ToolError, match="modified since you last read"):
+        run(edit_file({"file_path": "pkg/mod.py", "old_string": "a - b", "new_string": "a + b"}, ctx))
+    assert ctx.events[-1]["kind"] == "stale_edit"
+    run(read_file({"file_path": "pkg/mod.py"}, ctx))                     # 重新读取后可以编辑
+    run(edit_file({"file_path": "pkg/mod.py", "old_string": "a - b", "new_string": "a + b"}, ctx))
+    assert "a + b  # changed elsewhere" in (repo / "pkg" / "mod.py").read_text()
+
+
+def test_stale_edit_after_own_bash_command(repo):
+    ctx = ctx_for(repo)
+    run(read_file({"file_path": "pkg/mod.py"}, ctx))
+    run(bash({"command": "sed -i 's/a \\* b/b * a/' pkg/mod.py"}, ctx))
+    with pytest.raises(ToolError, match="modified since you last read"):
+        run(edit_file({"file_path": "pkg/mod.py", "old_string": "a - b", "new_string": "a + b"}, ctx))
+
+
+def test_own_edits_do_not_require_rereading(repo):
+    ctx = ctx_for(repo)
+    run(read_file({"file_path": "pkg/mod.py", "offset": 5, "limit": 1}, ctx))   # 只读了一部分也算读过
+    run(edit_file({"file_path": "pkg/mod.py", "old_string": "a - b", "new_string": "a + b"}, ctx))
+    run(edit_file({"file_path": "pkg/mod.py", "old_string": "a * b", "new_string": "b * a"}, ctx))
+    run(write_file({"file_path": "pkg/mod.py", "content": "X = 1\n"}, ctx))
+    assert (repo / "pkg" / "mod.py").read_text() == "X = 1\n"
+
+
+def test_overwrite_checks_freshness(repo):
+    ctx = ctx_for(repo)
+    run(read_file({"file_path": "README.md"}, ctx))
+    (repo / "README.md").write_text("someone else\n")
+    with pytest.raises(ToolError, match="modified since you last read"):
+        run(write_file({"file_path": "README.md", "content": "mine\n"}, ctx))
+    assert (repo / "README.md").read_text() == "someone else\n"
+
+
+def test_edit_refuses_files_too_large_to_round_trip(repo):
+    ctx = ctx_for(repo)
+    (repo / "huge.txt").write_text("x" * (9 * 1024 * 1024))
+    run(read_file({"file_path": "huge.txt", "limit": 1}, ctx))
+    with pytest.raises(ToolError, match="cannot be edited"):
+        run(edit_file({"file_path": "huge.txt", "old_string": "xxx", "new_string": "y"}, ctx))
+    assert (repo / "huge.txt").stat().st_size == 9 * 1024 * 1024        # 没有被截断

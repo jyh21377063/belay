@@ -89,8 +89,8 @@ python -m eval.report results/<run_id>                    # 重新生成汇总
 | --- | --- |
 | `belay/env.py` | 执行环境：`PierEnv`（评测）、`LocalEnv`（本地与测试）、`DockerEnv`（对着保留的容器调试） |
 | `belay/llm.py` | DeepSeek Anthropic 兼容接口：流式调用、重试、保留 thinking 块、用量统计、录制与回放 |
-| `belay/tools/` | 8 个工具、行动边界策略、输出截断、与 Orchestrator 的 `RuntimeClient` 接口 |
-| `belay/worker/` | 主循环、上下文清理与交接重建、提示词、轨迹 |
+| `belay/tools/` | 9 个工具（含只读探索子 agent `explore`）、读后被改检测、行动边界策略、输出截断、与 Orchestrator 的 `RuntimeClient` 接口 |
+| `belay/worker/` | 主循环（也用来跑探索子 agent）、上下文清理与交接重建、提示词、轨迹 |
 | `belay/graph/` `belay/runtime/` `belay/container/` `belay/observe/` | M2 起的证据图、Orchestrator、容器内脚本、回放（目前是带说明的空包） |
 | `belay/cli.py` | 本地调试入口，不经过 Pier |
 | `eval/agents/flat_agent.py` / `belay_agent.py` | B 组 / Belay 接入 Pier |

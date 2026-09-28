@@ -64,3 +64,21 @@ def test_policy_audit_records_but_allows():
     ctx = ToolContext(env=None, workdir="/testbed", policy=Policy())
     ctx.check_command("git stash list")
     assert ctx.events[-1]["action"] == "audit"
+
+
+@pytest.mark.parametrize("cmd", ["echo x > f.txt", "echo \"a\" > f", "cat a >> b", "rm -rf build", "sed -i 's/a/b/' f",
+                                 "pip install x", "git checkout -- .", "tee out.txt", "python x.py > out.log", "touch a"])
+def test_read_only_rejects_writes(cmd):
+    ctx = ToolContext(env=None, workdir="/testbed", read_only=True)
+    with pytest.raises(ToolError, match="read-only"):
+        ctx.check_read_only(cmd)
+    assert ctx.events[-1]["category"] == "read_only"
+
+
+@pytest.mark.parametrize("cmd", ["ls -la", "cat f 2>/dev/null", "grep -rn foo . 2>&1 | head", "git log --oneline -5",
+                                 "python -c 'import x; print(x.__file__)'", "sed -n 1,20p f", "cmd >/dev/null 2>&1",
+                                 "cat a | grep 'x -> y'", "grep -n \"a > b\" f.py", "git diff HEAD~1"])
+def test_read_only_allows_reads(cmd):
+    ctx = ToolContext(env=None, workdir="/testbed", read_only=True)
+    ctx.check_read_only(cmd)
+    assert not ctx.events

@@ -11,6 +11,7 @@ runs.yaml 中可用的 kwargs：
   thinking        是否开启思考模式，默认 true
   budget_min      预算分钟数，worker 在截止前 30 秒自行结束；Pier 的超时仍是最终兜底
   clear_tokens / reset_tokens   上下文管理阈值
+  explore         是否提供只读探索子 agent（explore 工具），默认 true；模型可以不用
   policy          行动边界，如 {git_write: deny}；默认只记录不拦截，与 Claude Code 可比
   record          是否录制模型回复（写到 trial 日志目录的 llm_record.jsonl）
   replay          回放文件路径：不调用模型，用于调试
@@ -26,7 +27,7 @@ from pier.agents.base import BaseAgent
 
 from belay.env import PierEnv
 from belay.llm import LLM, ReplayLLM
-from belay.tools import Policy
+from belay.tools import DEFAULT_TOOLS, Policy, get_tools
 from belay.worker.transcript import Transcript
 from belay.worker import Worker, WorkerConfig
 from eval.agents.patch_capture import PatchCaptureMixin
@@ -41,7 +42,7 @@ class FlatAgent(PatchCaptureMixin, BaseAgent):
     def __init__(self, logs_dir, model_name=None, repo_dir=None, extra_env=None, max_tokens: int = 64000,
                  effort: str | None = "max", thinking: bool = True, budget_min: float = 90,
                  clear_tokens: int = 120_000, reset_tokens: int = 250_000, policy: dict | None = None,
-                 record: bool = False, replay: str | None = None, **kwargs):
+                 record: bool = False, replay: str | None = None, explore: bool = True, **kwargs):
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.repo_dir = repo_dir
         self.extra_env = extra_env or {}          # runs.yaml 中的 env（如 DEEPSEEK_API_KEY）
@@ -54,6 +55,7 @@ class FlatAgent(PatchCaptureMixin, BaseAgent):
         self.policy = Policy.from_dict(policy) if policy else self.default_policy
         self.record = bool(record)
         self.replay = replay
+        self.explore = bool(explore)
         self.worker: Worker | None = None
 
     @staticmethod
@@ -105,7 +107,8 @@ class FlatAgent(PatchCaptureMixin, BaseAgent):
         return update
 
     def make_worker(self, env: PierEnv, context, deadline: float) -> Worker:
-        return Worker(self._make_llm(), env,
+        tools = get_tools([n for n in DEFAULT_TOOLS if self.explore or n != "explore"])
+        return Worker(self._make_llm(), env, tools=tools,
                       config=WorkerConfig(deadline=deadline, clear_tokens=self.clear_tokens,
                                           reset_tokens=self.reset_tokens, time_reminders=self.time_reminders),
                       policy=self.policy, transcript=Transcript(Path(self.logs_dir) / "transcript.jsonl"),
