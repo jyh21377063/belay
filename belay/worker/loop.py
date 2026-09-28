@@ -27,8 +27,12 @@ from belay.worker.transcript import Transcript
 @dataclass
 class WorkerConfig:
     max_turns: int = 2000
-    clear_tokens: int = 120_000          # 上下文超过该值后开始清理过期的工具结果
-    reset_tokens: int = 250_000          # 上下文超过该值时写交接说明并重建
+    # 上下文阈值与 A 组对齐：Claude Code（deepseek-flash[1m]）约在 78.6 万 token 压缩，baseline 峰值 58 万从未触发。
+    # 过早重建会让 B 组与 A 组的差异混入上下文策略；更积极的重建留给 Belay（M2 起从证据图重建）。
+    clear_tokens: int = 500_000          # 上下文超过该值后开始清理过期的工具结果（改写旧消息会让前缀缓存失效）
+    reset_tokens: int = 750_000          # 上下文超过该值时写交接说明并重建
+    reset_diff_chars: int = 60_000       # 重建时附上的 git diff 长度上限
+    todo_reminder_turns: int = 30        # 这么多轮没更新任务清单时，提醒一次（Claude Code 也有同样的提醒）
     deadline: float | None = None        # time.monotonic() 表示的截止时间
     time_reminders: bool = False         # 是否在工具结果中提示剩余时间（B 组关闭，与 Claude Code 一致）
     extra_rules: str = ""
@@ -73,6 +77,7 @@ class Worker:
         self.last_context = 0
         self.messages: list[dict] = []
         self.final_text = ""
+        self._last_todo_turn = 0
         self._events_written = 0
         self._explorers = 0
 
@@ -87,7 +92,7 @@ class Worker:
         else:
             self.system = system_prompt(self.env.workdir, platform, self.config.extra_rules,
                                         has_explore="explore" in self.tools)
-            first = initial_message(task, await self._snapshot())
+            first = initial_message(task, await self._snapshot(with_diff=False))
         self.messages = [{"role": "user", "content": first}]
         self.transcript.write("start", system=self.system, tools=[t.name for t in self.tools.values()],
                               first_message=self.messages[0]["content"])
@@ -130,7 +135,7 @@ class Worker:
             results = await self._execute(tool_uses)
             content: list[dict] = [{"type": "tool_result", "tool_use_id": tu["id"], "content": out, "is_error": err}
                                    for tu, (out, err) in zip(tool_uses, results)]
-            reminder = self._reminder()
+            reminder = self._reminder(tool_uses)
             if reminder:
                 content.append({"type": "text", "text": reminder})
             self.messages.append({"role": "user", "content": content})
@@ -189,13 +194,20 @@ class Worker:
             self.ctx.event("tool_crash", tool=tu["name"], error=f"{type(e).__name__}: {e}")
             return f"Error: {type(e).__name__}: {e}", True
 
-    def _reminder(self) -> str:
-        if not (self.config.time_reminders and self.config.deadline):
-            return ""
-        left = (self.config.deadline - time.monotonic()) / 60
-        if self.turns % 20 == 0 or left < 15:
-            return f"<system-reminder>About {max(0, left):.0f} minutes of the time budget remain.</system-reminder>"
-        return ""
+    def _reminder(self, tool_uses: list[dict]) -> str:
+        notes = []
+        if any(tu["name"] == "todo_write" for tu in tool_uses):
+            self._last_todo_turn = self.turns
+        elif ("todo_write" in self.tools and self.role == "main"
+              and self.turns - self._last_todo_turn >= self.config.todo_reminder_turns):
+            self._last_todo_turn = self.turns
+            notes.append("The todo list has not been updated recently. If it no longer matches what you are doing, "
+                         "update it; if it is not useful for this task, ignore this note.")
+        if self.config.time_reminders and self.config.deadline:
+            left = (self.config.deadline - time.monotonic()) / 60
+            if self.turns % 20 == 0 or left < 15:
+                notes.append(f"About {max(0, left):.0f} minutes of the time budget remain.")
+        return "".join(f"<system-reminder>{n}</system-reminder>" for n in notes)
 
     def _flush_events(self) -> None:
         for e in self.ctx.events[self._events_written:]:
@@ -203,11 +215,16 @@ class Worker:
         self._events_written = len(self.ctx.events)
 
     # ---- 上下文重建
-    async def _snapshot(self) -> str:
+    async def _snapshot(self, with_diff: bool) -> str:
+        """仓库状态。首次只给 status 与 stat；重建时附上完整 diff，让模型看到自己改成了什么。"""
+        diff = (f"echo; echo '$ git --no-pager diff'; git --no-pager diff | head -c {self.config.reset_diff_chars}; "
+                f"[ $(git --no-pager diff | wc -c) -gt {self.config.reset_diff_chars} ] && "
+                "echo && echo '[... diff truncated; run git diff to see the rest]'; ") if with_diff else ""
         res = await self.env.run("git rev-parse --is-inside-work-tree >/dev/null 2>&1 && "
-                                 "{ echo '$ git status --short'; git status --short | head -40; "
-                                 "echo; echo '$ git diff --stat'; git diff --stat | tail -40; } "
-                                 "|| { echo '$ ls'; ls -la | head -60; }", timeout=60)
+                                 "{ echo '$ git status --short'; git status --short | head -60; "
+                                 "echo; echo '$ git diff --stat'; git --no-pager diff --stat | tail -40; "
+                                 f"{diff}true; }} "
+                                 "|| { echo '$ ls'; ls -la | head -60; }", timeout=120)
         return f"Repository root: {self.env.workdir}\n{res.output.strip()}"
 
     async def _reset(self) -> None:
@@ -217,7 +234,9 @@ class Worker:
         handoff = resp.text or "(no handoff note was written)"
         self.resets += 1
         self.ctx.file_digests.clear()                # 上下文已丢失，编辑前需要重新读取
-        self.messages = [{"role": "user", "content": initial_message(self.task, await self._snapshot(), handoff)}]
+        self.messages = [{"role": "user", "content": initial_message(self.task, await self._snapshot(with_diff=True),
+                                                                     handoff, self.ctx.todos)}]
+        self._last_todo_turn = self.turns                # 任务清单已在首条消息里，不必马上提醒
         self.last_context = 0
         self.transcript.write("reset", handoff=handoff, resets=self.resets)
 

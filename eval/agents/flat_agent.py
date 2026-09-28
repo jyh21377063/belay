@@ -10,7 +10,7 @@ runs.yaml 中可用的 kwargs：
   effort          DeepSeek 的 output_config.effort，默认 max（与 A 组的 --effort max 对应）
   thinking        是否开启思考模式，默认 true
   budget_min      预算分钟数，worker 在截止前 30 秒自行结束；Pier 的超时仍是最终兜底
-  clear_tokens / reset_tokens   上下文管理阈值
+  clear_tokens / reset_tokens   上下文管理阈值，默认 50 万 / 75 万，与 A 组的压缩点对齐
   explore         是否提供只读探索子 agent（explore 工具），默认 true；模型可以不用
   policy          行动边界，如 {git_write: deny}；默认只记录不拦截，与 Claude Code 可比
   record          是否录制模型回复（写到 trial 日志目录的 llm_record.jsonl）
@@ -41,7 +41,7 @@ class FlatAgent(PatchCaptureMixin, BaseAgent):
 
     def __init__(self, logs_dir, model_name=None, repo_dir=None, extra_env=None, max_tokens: int = 64000,
                  effort: str | None = "max", thinking: bool = True, budget_min: float = 90,
-                 clear_tokens: int = 120_000, reset_tokens: int = 250_000, policy: dict | None = None,
+                 clear_tokens: int = 500_000, reset_tokens: int = 750_000, policy: dict | None = None,
                  record: bool = False, replay: str | None = None, explore: bool = True, **kwargs):
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.repo_dir = repo_dir

@@ -151,3 +151,55 @@ def test_explore_can_be_disabled(repo):
     run(Worker(llm, LocalEnv(str(repo)), tools=tools).run("task"))
     assert "explore" not in [t["name"] for t in llm.requests[0]["tools"]]
     assert "use explore" not in llm.requests[0]["system"]
+
+
+# ---- 上下文重建、任务清单提醒、系统提示 ------------------------------------------------------
+
+def test_rebuild_carries_todos_and_full_diff(repo):
+    llm = ScriptedLLM([
+        [tool_use("a", "read_file", file_path="pkg/mod.py")],
+        [tool_use("b", "edit_file", file_path="pkg/mod.py", old_string="a - b", new_string="a + b"),
+         tool_use("c", "todo_write", todos=[{"content": "Fix add()", "status": "completed"},
+                                            {"content": "Run the tests", "status": "in_progress"}])],
+        [{"type": "text", "text": "1. Task status: add() fixed, tests not run yet."}],
+        [tool_use("d", "submit", summary="ok")],
+    ], context_tokens=[1000, 9000])                          # 第二步超过重建阈值
+    worker = Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(reset_tokens=5000))
+    res = run(worker.run("Fix add()"))
+    assert res.status == "submitted" and res.resets == 1
+    assert "Code map" in llm.requests[2]["messages"][-1]["content"][-1]["text"]      # 交接提示是新的五段结构
+    rebuilt = llm.requests[3]["messages"][0]["content"]
+    assert "add() fixed, tests not run yet" in rebuilt
+    assert "<todo_list>\n[x] Fix add()\n[~] Run the tests\n</todo_list>" in rebuilt
+    assert "+    return a + b" in rebuilt and "-    return a - b" in rebuilt              # 带上了完整 diff
+
+
+def test_first_message_has_no_full_diff(repo):
+    (repo / "pkg" / "mod.py").write_text("changed before the run\n")
+    llm = ScriptedLLM([[tool_use("a", "submit", summary="ok")]])
+    run(Worker(llm, LocalEnv(str(repo))).run("task"))
+    first = llm.requests[0]["messages"][0]["content"]
+    assert "git status --short" in first and "git --no-pager diff'" not in first
+
+
+def test_todo_reminder_after_quiet_turns(repo):
+    llm = ScriptedLLM([
+        [tool_use("t", "todo_write", todos=[{"content": "x", "status": "in_progress"}])],
+        [tool_use("a", "bash", command="true")],
+        [tool_use("b", "bash", command="true")],
+        [tool_use("c", "submit", summary="ok")],
+    ])
+    run(Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(todo_reminder_turns=2)).run("task"))
+    texts = [[b.get("text", "") for b in r["messages"][-1]["content"] if b.get("type") == "text"]
+             for r in llm.requests[1:]]
+    assert texts[0] == [] and texts[1] == []                                          # 刚更新过，不提醒
+    assert "todo list has not been updated" in texts[2][0]
+
+
+def test_system_prompt_states_environment_rules(repo):
+    llm = ScriptedLLM([[tool_use("a", "submit", summary="ok")]])
+    run(Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(extra_rules="Never touch tests.")).run("task"))
+    system = llm.requests[0]["system"]
+    for phrase in ["fresh shell at the repository root", "no network access", "Do not commit",
+                   "check every requirement", "report what actually happened", "# Additional rules\nNever touch tests."]:
+        assert phrase in system, phrase

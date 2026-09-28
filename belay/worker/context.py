@@ -48,13 +48,22 @@ def clear_stale_results(messages: list[dict], keep_recent: int = 12) -> int:
     return len(stale)
 
 
-HANDOFF_REQUEST = """Your context window is almost full, so this session will be reset. Write a handoff note for yourself. \
-After the reset you will only see the original task, this note, and the current state of the repository.
+HANDOFF_REQUEST = """Your context window is nearly full, so this session will be reset now. Write a handoff note \
+that lets you resume the work efficiently in a fresh session. After the reset you will see only the original task \
+statement, this note, your current todo list, and the repository state (`git status` and the full `git diff` of your \
+changes). Nothing else from this conversation survives, including the contents of files you read.
 
-Include:
-1. Changes already made (files and key points).
-2. Conclusions you have confirmed, including approaches you ruled out.
-3. Open problems and failing tests, with their causes if known.
-4. What to do next, in order.
+Write these sections, concise but complete. Err on the side of including anything that prevents duplicate work or \
+repeated mistakes.
+
+1. Task status: which requirements are done and verified, which are partly done, which are not started. Say how \
+each "done" item was verified.
+2. Code map: the files, functions and tests that matter for the remaining work, with paths and line numbers, and \
+what each one does. The diff already shows your own edits; describe the code around them that you will need again.
+3. Discoveries: constraints and conventions you found, decisions you made and why, errors you hit and how you fixed \
+them, approaches that did not work and why.
+4. Verification: the exact commands that run the relevant tests, and their latest results (which tests pass, which \
+fail and why, which failures already existed before your changes).
+5. Next steps: the specific actions left, in order, including the one you were in the middle of.
 
 Output only the handoff note. Do not call any tools."""

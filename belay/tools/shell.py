@@ -65,17 +65,32 @@ async def submit(inp: dict, ctx: ToolContext) -> str:
 
 TOOLS = [
     Tool("bash",
-         "Run a bash command in the repository root and return combined stdout/stderr. Default timeout 120s, max 1800s. "
-         "Prefer the dedicated tools for reading, editing, finding files and searching content. "
-         "Long-running commands can use run_in_background.",
+         "Run a bash command and return its combined stdout and stderr.\n"
+         "- Every call starts in a fresh shell at the repository root: `cd` and exported variables do not persist "
+         "between calls. Chain dependent commands with `&&` in a single call.\n"
+         "- Default timeout is 120 seconds, maximum 1800. Give long test runs and builds a timeout that covers them; "
+         "the call returns as soon as the command finishes.\n"
+         "- run_in_background is for servers or commands longer than 1800 seconds: output goes to a log file you can "
+         "read later. Do not poll it with long fixed sleeps.\n"
+         "- Use non-interactive flags and never open an editor or a pager (use `git --no-pager`, `PAGER=cat`). "
+         "Quote paths that contain spaces.\n"
+         "- Prefer the dedicated tools for reading, editing, finding and searching files.",
          {"type": "object", "properties": {
              "command": {"type": "string"},
-             "timeout": {"type": "integer", "description": "Timeout in seconds"},
+             "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 1800)"},
              "run_in_background": {"type": "boolean", "description": "Run in the background, writing output to a log file"}},
           "required": ["command"]},
          bash),
     Tool("todo_write",
-         "Maintain your own todo list (replaces the whole list). Useful for tracking progress on multi-step tasks.",
+         "Create and maintain your task list (each call replaces the whole list).\n"
+         "Use it for any task with three or more steps, and whenever the task statement lists several requirements: "
+         "capture every requirement as an item before you start, so none is forgotten.\n"
+         "- Keep exactly one item in_progress; mark it in_progress before you start on it.\n"
+         "- Mark an item completed immediately after finishing it, and only when it is fully done. Keep it "
+         "in_progress if its tests fail, the implementation is partial, or errors are unresolved; add a new item for "
+         "whatever blocks it.\n"
+         "- Add follow-up items you discover along the way; remove items that no longer apply.\n"
+         "Skip it for a single, simple change.",
          {"type": "object", "properties": {"todos": {"type": "array", "items": {
              "type": "object", "properties": {
                  "content": {"type": "string"},
@@ -84,8 +99,9 @@ TOOLS = [
           "required": ["todos"]},
          todo_write, read_only=True),
     Tool("submit",
-         "Call this when the task is complete to submit your work and finish. In summary, state what you changed, "
-         "how you verified it, and anything left unfinished.",
+         "Finish the task. Call it once, after you have checked every requirement, run the relevant tests and "
+         "reviewed your diff. The summary must report what actually happened: say first which requirements are not "
+         "done, which tests fail and which checks you skipped, then what you changed and how you verified it.",
          {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
          submit),
 ]
