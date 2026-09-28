@@ -15,7 +15,11 @@ FORBIDDEN = {
     "belay/worker": ["belay.runtime", "belay.graph"],             # 与 Orchestrator 只经由 ToolContext.runtime
     "belay/graph": ["belay.runtime", "belay.worker", "belay.tools", "belay.llm", "belay.env"],
 }
-PURE_DECIDE = {"belay.graph.model", "belay.runtime.messages"}     # decide.py 只允许依赖这些 belay 模块
+# decide.py 只允许依赖图的纯函数部分与消息定义（不能依赖 store：那是 IO）
+PURE_DECIDE = {"belay.graph.model", "belay.graph.evidence", "belay.graph.ledger", "belay.graph.requirements",
+               "belay.runtime.messages"}
+PURE_GRAPH = ["model.py", "evidence.py", "ledger.py", "requirements.py", "build.py", "invariants.py"]
+IO_MODULES = {"asyncio", "subprocess", "sqlite3", "os", "anthropic", "socket", "shutil"}
 
 
 def imports(path: Path) -> list[str]:
@@ -55,5 +59,13 @@ def test_decide_is_pure():
     if not f.exists():
         return
     bad = [n for n in imports(f) if n.startswith("belay") and n not in PURE_DECIDE]
-    bad += [n for n in imports(f) if n.split(".")[0] in {"asyncio", "subprocess", "sqlite3", "os", "anthropic"}]
+    bad += [n for n in imports(f) if n.split(".")[0] in IO_MODULES]
     assert not bad, f"decide.py 必须是纯函数，不能依赖：{bad}"
+
+
+def test_graph_logic_is_pure():
+    bad = []
+    for name in PURE_GRAPH:
+        f = PKG / "graph" / name
+        bad += [f"{name} imports {n}" for n in imports(f) if n.split(".")[0] in IO_MODULES or n == "belay.graph.store"]
+    assert not bad, "\n".join(bad)
