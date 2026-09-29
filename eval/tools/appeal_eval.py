@@ -228,15 +228,34 @@ def cmd_label(a) -> int:
 
 # ---- 模拟申诉与裁决 ---------------------------------------------------------------
 
-def llm_json(client, model: str, system: str, user: str) -> tuple[dict, str]:
-    resp = client.messages.create(model=model, max_tokens=4000, system=system,
-                                  messages=[{"role": "user", "content": user}])
-    text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text")
-    m = re.search(r"\{.*\}", text, re.S)
-    try:
-        return (json.loads(m.group(0)) if m else {}), text
-    except json.JSONDecodeError:
-        return {}, text
+def first_json_object(text: str) -> dict | None:
+    """回复中第一个能解析的 JSON 对象（逐个 { 位置尝试解码，容忍代码块标记和前后的说明文字）。"""
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = dec.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj:
+            return obj
+    return None
+
+
+def llm_json(client, model: str, system: str, user: str, max_tokens: int, tries: int = 3) -> tuple[dict | None, str]:
+    """调模型并解析回复里的 JSON。思考型模型的思考也占 max_tokens，额度不够时正文为空，所以上限要给足；
+    解析失败就重试，仍失败返回 (None, 原始回复)，调用方记为 parse_error，不能当成"放弃"或"驳回"。"""
+    text = ""
+    for _ in range(tries):
+        resp = client.messages.create(model=model, max_tokens=max_tokens, system=system,
+                                      messages=[{"role": "user", "content": user}])
+        text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text")
+        obj = first_json_object(text)
+        if obj:
+            return obj, text
+        text = f"[stop_reason={getattr(resp, 'stop_reason', '?')}] {text}"
+    return None, text
 
 
 def identifiers(quote: str) -> list[str]:
@@ -290,9 +309,12 @@ def cmd_review(a) -> int:
             diff = relevant_diff((out_dir / f"final-{c['task']}.diff").read_text(), c["source"], c["failure"],
                                  a.diff_chars)
             adv, adv_text = llm_json(client, a.model, advocate, ADVOCATE_USER.format(
-                task=task, test=c["test"], source=c["source"], failure=c["failure"], diff=diff))
-            row = {**{k: c[k] for k in ("task", "test", "label")}, "appeal": adv, "stage": "", "decision": "reject"}
-            if not adv.get("appeal"):
+                task=task, test=c["test"], source=c["source"], failure=c["failure"], diff=diff), a.max_tokens)
+            row = {**{k: c[k] for k in ("task", "test", "label")}, "appeal": adv, "stage": "", "decision": "reject",
+                   "raw_appeal": adv_text[-3000:]}
+            if adv is None:
+                row.update(stage="parse_error", decision=None)
+            elif not adv.get("appeal"):
                 row["stage"] = "no_appeal"
             else:
                 ok, why = rule_precheck(adv.get("quote", ""), task, c["source"], c["failure"])
@@ -302,23 +324,28 @@ def cmd_review(a) -> int:
                     msg = reviewer_message("test_conflict", None, task, [c["test"]],
                                            f"{adv.get('reason', '')}\nQuoted task text: \"{adv.get('quote', '')}\"",
                                            diff, c["failure"], c["source"])
-                    rev, rev_text = llm_json(client, a.model, REVIEWER_SYSTEM, msg)
-                    row["review"] = rev
-                    if rev.get("decision") == "approve" and not quote_in(rev.get("quote", ""), task):
+                    rev, rev_text = llm_json(client, a.model, REVIEWER_SYSTEM, msg, a.max_tokens)
+                    row.update(review=rev, raw_review=rev_text[-3000:])
+                    if rev is None:
+                        row.update(stage="parse_error", decision=None)
+                    elif rev.get("decision") == "approve" and not quote_in(rev.get("quote", ""), task):
                         row.update(stage="rule_recheck", rule_reason="reviewer quote not found verbatim")
                     else:
                         row.update(stage="reviewer", decision="approve" if rev.get("decision") == "approve" else "reject")
-            row["correct"] = (row["decision"] == "approve") == (c["label"] == "change")
+            row["correct"] = None if row["decision"] is None else (row["decision"] == "approve") == (c["label"] == "change")
             rows.append(row)
             log.write(json.dumps(row, ensure_ascii=False) + "\n")
             log.flush()
             print(f"[{i}/{len(todo)}] {c['task'][:28]:<28} {c['test'].split('::')[-1][:40]:<40} "
-                  f"label={c['label']:<8} → {row['decision']:<7} ({row['stage']}) {'✓' if row['correct'] else '✗'}")
+                  f"label={c['label']:<8} → {str(row['decision']):<7} ({row['stage']}) "
+                  f"{'?' if row['correct'] is None else '✓' if row['correct'] else '✗'}")
     summarize(rows, out_dir, suffix)
     return 0
 
 
 def summarize(rows: list[dict], out_dir: Path, suffix: str = "") -> None:
+    errors = [r for r in rows if r["decision"] is None]
+    rows_all, rows = rows, [r for r in rows if r["decision"] is not None]
     conf = Counter((r["label"], r["decision"]) for r in rows)
     stages = Counter(r["stage"] for r in rows)
     lines = ["# 申诉离线评估", "",
@@ -326,11 +353,12 @@ def summarize(rows: list[dict], out_dir: Path, suffix: str = "") -> None:
              f"| 批准（release 确实改了这项行为） | {conf[('change', 'approve')]} | {conf[('change', 'reject')]}（误拒） |",
              f"| 驳回（这项行为应当保持） | {conf[('preserve', 'approve')]}（**误放，会漏掉真回归**） | "
              f"{conf[('preserve', 'reject')]} |", "",
-             "裁决落在哪一步：" + "，".join(f"{k} {v}" for k, v in stages.most_common()), "",
+             "裁决落在哪一步：" + "，".join(f"{k} {v}" for k, v in stages.most_common())
+             + (f"；另有 {len(errors)} 条模型回复解析失败，未计入上表" if errors else ""), "",
              "| 题目 | 测试 | 应当 | 结果 | 在哪一步 | 对错 |", "| --- | --- | --- | --- | --- | --- |"]
-    for r in rows:
+    for r in rows_all:
         lines.append(f"| {r['task']} | `{r['test'].split('::', 1)[-1]}` | {r['label']} | {r['decision']} | "
-                     f"{r['stage']} | {'✓' if r['correct'] else '✗'} |")
+                     f"{r['stage']} | {'?' if r['correct'] is None else '✓' if r['correct'] else '✗'} |")
     (out_dir / f"summary{suffix}.md").write_text("\n".join(lines) + "\n")
     print("\n" + "\n".join(lines[:8]))
     print(f"\n明细：{out_dir / f'summary{suffix}.md'}；每条的申诉与裁决原文：{out_dir / f'reviews{suffix}.jsonl'}")
@@ -346,6 +374,7 @@ def main(argv=None) -> int:
     p.add_argument("--build-timeout", type=int, default=3600, help="构建评测镜像的超时（秒）")
     p.add_argument("--model", default="deepseek-flash")
     p.add_argument("--diff-chars", type=int, default=15000)
+    p.add_argument("--max-tokens", type=int, default=16000, help="思考型模型的思考也占这个额度，别设太小")
     p.add_argument("--limit", type=int, default=0, help="只评审前 N 个（试跑用）")
     p.add_argument("--force-appeal", action="store_true",
                    help="对抗测试：申诉方必须申诉并全力争取，检验评审能否守住真回归；结果写到 *-forced 文件")
