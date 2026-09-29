@@ -1,7 +1,7 @@
 """SWE-EVO 逐题对照：以参考解为准，列出各组的 F2P 完成度与每个 P2P 回归的成因。
 
   python -m eval.tools.regressions --oracle gold-check-oracle-test-20260928 \
-      --runs diag-cc-swe-notests-grade diag-gate-swe-notests-grade --gate-run diag-gate-swe
+      --runs diag-cc-swe-notests-grade diag-gate-swe-notests-grade --labels A1 A2 --gate-run diag-gate-swe
 
 对每道题：
   F2P   agent 通过数 / 参考解通过数（参考解都过不了的测试不计）
@@ -62,11 +62,15 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m eval.tools.regressions")
     p.add_argument("--oracle", required=True)
     p.add_argument("--runs", nargs="+", required=True)
+    p.add_argument("--labels", nargs="+", help="各 run 在输出中的列名，与 --runs 一一对应（默认取 run 名的第二段）")
     p.add_argument("--gate-run", help="A-gate 的原始 run（读取基线与拦截记录）")
     p.add_argument("--results", type=Path, default=ROOT / "results")
     p.add_argument("--task-dirs", type=Path, default=ROOT / "tasks")
     a = p.parse_args(argv)
 
+    if a.labels and len(a.labels) != len(a.runs):
+        p.error("--labels 的个数必须与 --runs 相同")
+    label = dict(zip(a.runs, a.labels or [r.split("-")[1] if "-" in r else r for r in a.runs]))
     oracle_root = a.results / a.oracle
     tids = sorted({d.name for r in a.runs for d in (a.results / r / "swe_evo").glob("*") if d.is_dir()})
     for tid in tids:
@@ -85,7 +89,7 @@ def main(argv=None) -> int:
                 print(f"  {r}: 没有评分日志")
                 continue
             n = sum(1 for t in f2p_ok if st.get(t) in OK)
-            print(f"  F2P {n:>4}/{len(f2p_ok):<4} {r}")
+            print(f"  F2P {n:>4}/{len(f2p_ok):<4} {label[r]}")
         rows = []
         for t in tests["PASS_TO_PASS"]:
             per = {r: (st or {}).get(t) for r, st in runs.items()}
@@ -108,13 +112,18 @@ def main(argv=None) -> int:
         real = [x for x in rows if x[0] != "env"]
         print(f"  P2P 失败：共 {len(rows)} 个，其中环境问题 {len(rows) - len(real)} 个；以下只列非环境的")
         for cls, t, per in sorted(real):
-            marks = "  ".join(f"{r.split('-')[1] if '-' in r else r}={'✗' if fail(s) else '✓'}" for r, s in per.items())
+            marks = "  ".join(f"{label[r]}={'✗' if fail(s) else '✓'}" for r, s in per.items())
             print(f"   {cls:<13} {marks}  {t}")
         if checks:
             blocks = [c for c in checks if c.get("decision") == "block"]
             last = checks[-1]
             print(f"  A-gate：检查 {len(checks)} 次，拦截 {len(blocks)} 次；最后一次 {last.get('decision')}"
                   f"（{last.get('why', '')}）" + (f"，基线被篡改" if any(c.get("baseline_tampered") for c in checks) else ""))
+            for i, c in enumerate(checks, 1):
+                regs = c.get("regressions") or []
+                shown = "、".join(t.split("::")[-1] for t in regs[:6]) + (" 等" if len(regs) > 6 else "")
+                print(f"    第 {i} 次：{c.get('decision')}，回归 {c.get('n_regressions', 0)} 个"
+                      + (f"（{shown}）" if regs else "") + (f"，{c.get('why')}" if c.get("why") else ""))
     return 0
 
 
