@@ -74,7 +74,9 @@ ADVOCATE_USER = """<task_text>
 
 <your_diff>
 {diff}
-</your_diff>"""
+</your_diff>
+
+{evidence}"""
 
 
 # ---- 读取已有运行 ---------------------------------------------------------------
@@ -114,19 +116,41 @@ def final_patch(results: Path, gate_run: str, tid: str) -> str:
 
 # ---- 容器内跑测试 ---------------------------------------------------------------
 
-def run_in_image(image: str, gate: dict, patch: str, tests: list[str], timeout: int) -> tuple[str, dict[str, str]]:
-    """在全新容器里（不联网）应用补丁、跑指定测试；同时把这些测试文件的源码拷出来。返回（pytest 输出，{文件: 源码}）。"""
-    files = sorted({t.split("::")[0] for t in tests})
+ENV_PROBE = r"""
+import json, sys, importlib.metadata as md
+mods = sys.argv[1:]
+dists = md.packages_distributions()
+out = {"python": sys.version.split()[0]}
+for m in mods:
+    for d in dists.get(m, [m]):
+        try:
+            out[d] = md.version(d)
+        except Exception:
+            pass
+print(json.dumps(out))
+"""
+
+
+def run_in_image(image: str, gate: dict, patch: str, tests: list[str], timeout: int,
+                 extra_files: list[str] | None = None, env_modules: list[str] | None = None
+                 ) -> tuple[str, dict[str, str], str]:
+    """在全新容器里（不联网）应用补丁、跑指定测试；同时拷出测试文件与 extra_files 的源码，并探测 env_modules 的版本。
+    返回（pytest 输出，{文件: 源码}，环境版本 JSON）。"""
+    files = sorted({t.split("::")[0] for t in tests} | set(extra_files or []))
     with tempfile.TemporaryDirectory() as tmp:
         Path(tmp, "p.diff").write_text(patch)
+        Path(tmp, "probe.py").write_text(ENV_PROBE)
         apply = ("if [ -s /work/p.diff ]; then git apply --whitespace=nowarn /work/p.diff || "
-                 "patch --batch -p1 -i /work/p.diff || echo 'PATCH FAILED'; fi")
+                 "patch --batch -p1 -i /work/p.diff || echo 'PATCH FAILED' > /work/patch_failed; fi")
         script = "; ".join([
             f"cd {shlex.quote(gate.get('workdir', '/testbed'))}",
             gate.get("prelude") or "true",
             *(gate.get("commands") or []),
             apply,
-            "mkdir -p /work/src && cp --parents " + " ".join(shlex.quote(f) for f in files) + " /work/src/ 2>/dev/null",
+            "mkdir -p /work/src && for f in " + " ".join(shlex.quote(f) for f in files)
+            + '; do [ -f "$f" ] && cp --parents "$f" /work/src/; done',
+            ("python /work/probe.py " + " ".join(shlex.quote(m) for m in env_modules) + " > /work/env.json 2>/dev/null"
+             if env_modules else "true"),
             "python -m pytest -rA -p no:cacheprovider " + " ".join(shlex.quote(t) for t in tests)
             + " > /work/out.txt 2>&1",
             "chmod -R a+rwX /work",
@@ -136,21 +160,35 @@ def run_in_image(image: str, gate: dict, patch: str, tests: list[str], timeout: 
         try:
             subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
         except subprocess.TimeoutExpired:
-            return "TIMEOUT", {}
+            return "TIMEOUT", {}, ""
         out = Path(tmp, "out.txt").read_text(errors="replace") if Path(tmp, "out.txt").exists() else ""
+        if Path(tmp, "patch_failed").exists():
+            out = "PATCH FAILED\n" + out
         srcs = {f: Path(tmp, "src", f).read_text(errors="replace") for f in files if Path(tmp, "src", f).exists()}
-        return out, srcs
+        env = Path(tmp, "env.json").read_text().strip() if Path(tmp, "env.json").exists() else ""
+        return out, srcs, env
 
 
-def failure_section(out: str, test: str, limit: int = 2500) -> str:
-    """从 pytest 输出里取某个测试的失败详情（____ name ____ 段落），取不到时退回简短摘要行。"""
+def failure_section(out: str, test: str, status: str | None, limit: int = 3000) -> str:
+    """某个测试失败的证据。依次尝试：pytest 的逐测试段落（____ name ____）；测试文件的收集错误段落
+    （ERROR collecting <file>，整个文件导入失败时 pytest 只报这一段）；都没有时给整个输出的末尾。开头注明状态。"""
+    head = f"[status: {status or 'not run / not collected'}]\n"
     name = test.split("::", 1)[1].replace("::", ".") if "::" in test else test
+
+    def clip(body: str) -> str:
+        body = body.strip()
+        return head + (body if len(body) <= limit else "...\n" + body[-limit:])
+
     m = re.search(r"(?m)^_{3,} " + re.escape(name) + r" _{3,}\n(.*?)(?=^_{3,} |^={3,})", out, re.S)
     if m:
-        body = m.group(1).strip()
-        return body if len(body) <= limit else "...\n" + body[-limit:]
-    line = next((l for l in out.splitlines() if l.startswith(("FAILED", "ERROR")) and test in l), "")
-    return line or "(no failure details captured)"
+        return clip(m.group(1))
+    f = test.split("::")[0]
+    m = re.search(r"(?m)^_{3,} ERROR collecting " + re.escape(f) + r" _{3,}\n(.*?)(?=^_{3,} |^={3,})", out, re.S)
+    if m:
+        return clip("ERROR collecting " + f + "\n" + m.group(1))
+    if "PATCH FAILED" in out[:50]:
+        return head + "The patch could not be applied in the evaluation container."
+    return clip("(no per-test section found; tail of the pytest output)\n" + out[-limit:])
 
 
 def test_source(srcs: dict[str, str], test: str, limit: int = 4000) -> str:
@@ -174,6 +212,51 @@ def test_source(srcs: dict[str, str], test: str, limit: int = 4000) -> str:
         block = "\n".join(lines[j:k])
         return f"# {f}\n{block[:limit]}"
     return f"# {f} (function not found)\n" + "\n".join(lines[:120])[:limit]
+
+
+def changed_code_files(diff: str) -> list[str]:
+    files = re.findall(r"(?m)^diff --git a/(\S+) b/\S+", diff)
+    return [f for f in files if f.endswith(".py") and not re.search(
+        r"(^|/)(tests?|testing)/|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$", f)]
+
+
+def touched_blocks(diff: str, srcs: dict[str, str], limit: int = 12000) -> str:
+    """diff 每个 hunk 所在的函数或类（取改动前的源码），按出现顺序拼接，去重，截到 limit 个字符。"""
+    out, seen, n = [], set(), 0
+    for blk in re.split(r"(?m)^(?=diff --git )", diff):
+        m = re.match(r"diff --git a/(\S+) b/", blk)
+        if not m or m.group(1) not in srcs:
+            continue
+        f, lines = m.group(1), srcs[m.group(1)].splitlines()
+        for h in re.finditer(r"(?m)^@@ -(\d+)(?:,(\d+))? ", blk):
+            start = int(h.group(1)) - 1
+            i = min(start, len(lines) - 1)
+            while i >= 0 and not re.match(r"\s*(async\s+)?(def|class) ", lines[i]):
+                i -= 1
+            if i < 0 or (f, i) in seen:
+                continue
+            seen.add((f, i))
+            ind = len(lines[i]) - len(lines[i].lstrip())
+            j = i
+            while j > 0 and lines[j - 1].strip().startswith("@"):
+                j -= 1
+            k = i + 1
+            while k < len(lines) and (not lines[k].strip() or len(lines[k]) - len(lines[k].lstrip()) > ind):
+                k += 1
+            text = f"# {f}, lines {j + 1}-{k} (original)\n" + "\n".join(lines[j:k])
+            if n + len(text) > limit:
+                out.append(f"# ... more changed functions omitted")
+                return "\n\n".join(out)
+            out.append(text)
+            n += len(text)
+    return "\n\n".join(out) or "(no changed Python functions found)"
+
+
+def imported_modules(*sources: str) -> list[str]:
+    mods = set()
+    for src in sources:
+        mods |= set(re.findall(r"(?m)^\s*(?:from|import)\s+([A-Za-z_]\w*)", src))
+    return sorted(m for m in mods if m not in {"__future__", "os", "sys", "re", "json", "typing"})
 
 
 def label_of(orig: str | None, gold: str | None, gold_ran: bool = True) -> str:
@@ -203,19 +286,36 @@ def cmd_label(a) -> int:
         final = final_patch(results, a.gate_run, tid)
         print(f"== {tid}: {len(tests)} 个被拦过的测试")
         runs = {}
+        code_files = changed_code_files(final)
         for name, patch in (("orig", ""), ("gold", gold), ("final", final)):
-            out, srcs = run_in_image(image, gate, patch, tests, a.timeout)
-            if "PATCH FAILED" in out:
+            extra = code_files if name == "orig" else None
+            mods = None
+            if name == "orig":
+                top = sorted({f.split("/")[0] for f in code_files})
+                mods = top + ["pytest"]
+            out, srcs, env = run_in_image(image, gate, patch, tests, a.timeout, extra, mods)
+            (out_dir / f"raw-{tid}-{name}.txt").write_text(out)
+            if out.startswith("PATCH FAILED"):
                 print(f"   {name}: 补丁应用失败")
-            runs[name] = (parse(out)[0], out, srcs)
+            runs[name] = (parse(out)[0], out, srcs, env)
             print(f"   {name}: 通过 {sum(1 for t in tests if runs[name][0].get(t) in OK)}/{len(tests)}")
+        orig_srcs, env = runs["orig"][2], runs["orig"][3]
+        test_imports = imported_modules(*[orig_srcs.get(t.split("::")[0], "") for t in tests])
+        if test_imports:   # 测试文件导入的包也探测一次版本（第二次只跑探针，很快）
+            _, _, env2 = run_in_image(image, gate, "", tests[:1], a.timeout, None, test_imports)
+            try:
+                env = json.dumps({**json.loads(env or "{}"), **json.loads(env2 or "{}")})
+            except json.JSONDecodeError:
+                pass
+        original_code = touched_blocks(final, orig_srcs)
         instruction = (task_dir / "instruction.md").read_text(errors="replace")
         for t in tests:
             st = {k: runs[k][0].get(t) for k in runs}
             cases.append({"task": tid, "test": t, **st, "label": label_of(st["orig"], st["gold"], bool(runs["gold"][0])),
                           "needs_appeal": st["final"] not in OK,
-                          "failure": failure_section(runs["final"][1], t) if st["final"] not in OK else "",
-                          "source": test_source(runs["orig"][2], t)})
+                          "failure": failure_section(runs["final"][1], t, st["final"]) if st["final"] not in OK else "",
+                          "source": test_source(orig_srcs, t),
+                          "environment": env, "original_code": original_code})
         (out_dir / f"instruction-{tid}.md").write_text(instruction)
         (out_dir / f"final-{tid}.diff").write_text(final)
     (out_dir / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))
@@ -248,7 +348,7 @@ def llm_json(client, model: str, system: str, user: str, max_tokens: int, tries:
     解析失败就重试，仍失败返回 (None, 原始回复)，调用方记为 parse_error，不能当成"放弃"或"驳回"。"""
     text = ""
     for _ in range(tries):
-        resp = client.messages.create(model=model, max_tokens=max_tokens, system=system,
+        resp = client.messages.create(model=model, max_tokens=max_tokens, system=system, timeout=900,
                                       messages=[{"role": "user", "content": user}])
         text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text")
         obj = first_json_object(text)
@@ -289,6 +389,17 @@ def relevant_diff(diff: str, source: str, failure: str, limit: int) -> str:
     return "".join(out)
 
 
+def evidence_text(c: dict) -> str:
+    """runtime 收集的通用证据：环境中相关包的实际版本、被改函数改动前的完整源码。"""
+    parts = []
+    if c.get("environment"):
+        parts.append(f"<environment note=\"versions installed in the evaluation environment\">\n{c['environment']}\n</environment>")
+    if c.get("original_code"):
+        parts.append(f"<original_code note=\"the functions your diff changes, as they were before the change\">\n"
+                     f"{c['original_code']}\n</original_code>")
+    return "\n\n".join(parts)
+
+
 def cmd_review(a) -> int:
     from anthropic import Anthropic
 
@@ -301,7 +412,7 @@ def cmd_review(a) -> int:
     client = Anthropic(api_key=os.environ["DEEPSEEK_API_KEY"],
                        base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"))
     rows = []
-    suffix = "-forced" if a.force_appeal else ""
+    suffix = ("-forced" if a.force_appeal else "") + (f"-{a.tag}" if a.tag else "")
     advocate = ADVOCATE_FORCED_SYSTEM if a.force_appeal else ADVOCATE_SYSTEM
     with open(out_dir / f"reviews{suffix}.jsonl", "w") as log:
         for i, c in enumerate(todo, 1):
@@ -309,7 +420,8 @@ def cmd_review(a) -> int:
             diff = relevant_diff((out_dir / f"final-{c['task']}.diff").read_text(), c["source"], c["failure"],
                                  a.diff_chars)
             adv, adv_text = llm_json(client, a.model, advocate, ADVOCATE_USER.format(
-                task=task, test=c["test"], source=c["source"], failure=c["failure"], diff=diff), a.max_tokens)
+                task=task, test=c["test"], source=c["source"], failure=c["failure"], diff=diff,
+                evidence=evidence_text(c)), a.max_tokens)
             row = {**{k: c[k] for k in ("task", "test", "label")}, "appeal": adv, "stage": "", "decision": "reject",
                    "raw_appeal": adv_text[-3000:]}
             if adv is None:
@@ -324,6 +436,9 @@ def cmd_review(a) -> int:
                     msg = reviewer_message("test_conflict", None, task, [c["test"]],
                                            f"{adv.get('reason', '')}\nQuoted task text: \"{adv.get('quote', '')}\"",
                                            diff, c["failure"], c["source"])
+                    ev = evidence_text(c)
+                    if ev and not a.no_evidence:
+                        msg += "\n\nAdditional evidence collected by the harness:\n\n" + ev
                     rev, rev_text = llm_json(client, a.model, REVIEWER_SYSTEM, msg, a.max_tokens)
                     row.update(review=rev, raw_review=rev_text[-3000:])
                     if rev is None:
@@ -379,6 +494,8 @@ def main(argv=None) -> int:
     p.add_argument("--force-appeal", action="store_true",
                    help="对抗测试：申诉方必须申诉并全力争取，检验评审能否守住真回归；结果写到 *-forced 文件")
     p.add_argument("--only", choices=["change", "preserve"], help="只评审某一类标签")
+    p.add_argument("--no-evidence", action="store_true", help="消融：评审不看环境版本与原始代码（申诉方仍然看）")
+    p.add_argument("--tag", default="", help="结果文件名后缀，区分多次评审（如 evidence → reviews-evidence.jsonl）")
     a = p.parse_args(argv)
     return cmd_label(a) if a.step == "label" else cmd_review(a)
 
