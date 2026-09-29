@@ -89,6 +89,15 @@ def preflight(plan: RunPlan) -> list[str]:
             if public:
                 problems.append(f"{t.key}: task.toml 允许联网；防泄漏要求 [environment] allow_internet = false"
                                 f"（Pier 会只放行 agent 声明的模型 API 域名）")
+    # 门禁配置由 SWE-EVO 转换器生成；旧的任务目录（在转换器生成 gate.json 之前准备的）没有它，
+    # 而 A-gate / Belay 在缺配置时会静默退化为无门禁。这里直接拒绝，避免跑出一组"名为 A-gate 的 A 组"。
+    gated = [s.agent_key for s in plan.steps if s.agent.get("gate")]
+    if gated:
+        for t in plan.tasks:
+            if t.benchmark == "swe_evo" and not (plan.task_dir(t) / "gate.json").exists():
+                problems.append(f"{t.key}: {', '.join(gated)} 需要门禁配置，但任务目录里没有 gate.json"
+                                f"（目录可能是旧版转换器生成的）；运行 python -m eval.prepare --split {plan.split} "
+                                f"--benchmarks swe_evo --tasks {t.id} --force 重新生成")
     if plan.grading_only:
         for t in plan.tasks:
             if not any((plan.results_root / plan.source_run / t.benchmark / t.id).glob("*/patch.diff")):
