@@ -35,8 +35,7 @@ class WorkerConfig:
     reset_tokens: int = 750_000          # 上下文超过该值时写交接说明并重建
     reset_diff_chars: int = 60_000       # 重建时附上的 git diff 长度上限
     todo_reminder_turns: int = 30        # 这么多轮没更新任务清单时，提醒一次（Claude Code 也有同样的提醒）
-    deadline: float | None = None        # time.monotonic() 表示的截止时间
-    time_reminders: bool = False         # 是否在工具结果中提示剩余时间（B 组关闭，与 Claude Code 一致）
+    deadline: float | None = None        # time.monotonic() 表示的截止时间；只用于到点停止，从不告诉模型
     extra_rules: str = ""
     explore_max_turns: int = 40          # 探索子 agent 的轮数上限，到达后要求它根据已有发现写报告
     explore_report_chars: int = 20_000   # 返回给主 worker 的报告长度上限
@@ -215,10 +214,6 @@ class Worker:
         runtime = self.ctx.runtime
         if runtime is not None and hasattr(runtime, "drain_notices"):
             notes.extend(runtime.drain_notices())
-        if self.config.time_reminders and self.config.deadline:
-            left = (self.config.deadline - time.monotonic()) / 60
-            if self.turns % 20 == 0 or left < 15:
-                notes.append(f"About {max(0, left):.0f} minutes of the time budget remain.")
         return "".join(f"<system-reminder>{n}</system-reminder>" for n in notes)
 
     def _flush_events(self) -> None:
@@ -282,7 +277,7 @@ class Worker:
             if res.status == "max_turns":
                 report = await child.conclude(EXPLORE_WRAPUP)
             elif res.status == "deadline":
-                report = report or "(Exploration stopped: the time budget ran out before a report was written.)"
+                report = report or "(Exploration stopped before a report was written.)"
         finally:
             self.usage.add(child.usage)                   # 子 agent 的用量计入本 worker
             for e in child.ctx.events:                    # 越界事件带上来源，一并统计

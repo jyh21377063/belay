@@ -96,8 +96,7 @@ _TASK = {"type": "string", "description": "Task id, e.g. T3"}
 TOOLS = [
     Tool("board",
          "Show the task graph the harness keeps for this run: requirements and their status, every task (who holds "
-         "it, what blocks it), a suggested order, the latest verified checkpoint, your unverified changes and the "
-         "time left.",
+         "it, what blocks it), a suggested order, the latest verified checkpoint and your unverified changes.",
          {"type": "object", "properties": {}}, board, read_only=True),
     Tool("claim",
          "Claim a task before working on it. Claims are leases kept alive by your activity. You may claim any ready "

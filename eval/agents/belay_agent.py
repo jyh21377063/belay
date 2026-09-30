@@ -38,7 +38,6 @@ from eval.agents.flat_agent import FlatAgent
 
 class BelayAgent(FlatAgent):
     default_policy = Policy.strict()
-    time_reminders = True
 
     def __init__(self, *args, workers: int = 1, gate_spec: str | dict | None = None, runtime: dict | None = None,
                  paths: dict | None = None, task_instruction: str | None = None, **kwargs):
@@ -103,7 +102,7 @@ class BelayAgent(FlatAgent):
         names = [n for n in BELAY_TOOLS if self.explore or n != "explore"]
         return Worker(llm, env, tools=get_belay_tools(names),
                       config=WorkerConfig(deadline=deadline, clear_tokens=self.clear_tokens,
-                                          reset_tokens=self.reset_tokens, time_reminders=self.time_reminders,
+                                          reset_tokens=self.reset_tokens,
                                           extra_rules=BELAY_RULES),
                       policy=self.policy, transcript=Transcript(Path(self.logs_dir) / "transcript.jsonl"),
                       on_progress=self._progress(context), runtime=runtime, work_id=work_id,

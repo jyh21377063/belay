@@ -2,7 +2,8 @@
 
 每个请求 = 外壳先观察（需要时给工作区拍快照）→ Runtime.submit(规则) → 需要等结果的请求（checkpoint、
 ready_for_review、wait、rollback）等图满足条件 → 渲染给模型看的文字。规则拒绝的请求以 {"error": True} 返回。
-runtime 发给这个 worker 的通知（停滞提示、截止预留、任务被拆分……）由事件监听收集，在下一轮工具结果后注入。
+runtime 发给这个 worker 的通知（反复被同一回归拒绝、任务被拆分……）由事件监听收集，在下一轮工具结果后注入。
+通知只陈述模型自己看不到的事实，不含剩余时间或已用时间：时间只由 runtime 用来决定何时收尾。
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from belay.core import rules as R
 from belay.core.model import ATT_CREATED, ATT_REJECTED, JOB_RUNNING, REVIEW
-from belay.core.queries import last_checkpoint_t, remaining_sec
+from belay.core.queries import last_checkpoint_t
 from belay.core.render import render_attempt, render_board, render_job, task_line
 from belay.core.rules import Rejected
 
@@ -24,7 +25,6 @@ class WorkerPort:
         self.w = worker
         self._notices: list[str] = []
         self._last_reminder = run.rt.now()
-        self._time_marks: set[float] = set()
         run.rt.listeners.append(self._on_events)
 
     def close(self) -> None:
@@ -34,18 +34,18 @@ class WorkerPort:
     # ---------------------------------------------------------------- 通知
     def _on_events(self, events, g) -> None:
         for e in events:
-            if e.type == "stall_detected" and e.get("worker") == self.w and e.get("action") != "stop":
-                self._notices.append(f"No verified progress: {e.get('detail')}. If you are stuck, consider splitting "
-                                     "the work into smaller tasks (add_task), rolling back to the last checkpoint, "
-                                     "or report_blocked with the reason." +
+            # 按时长判定的停滞（no_progress）只记入日志、驱动规划器，不告诉模型：那等于按时间催促。
+            if (e.type == "stall_detected" and e.get("worker") == self.w and e.get("action") != "stop"
+                    and e.get("kind") == "repeated_failure"):
+                self._notices.append(f"Your recent checkpoint attempts were all rejected for the same reason "
+                                     f"({e.get('detail')}). If your current approach is not converging, it may "
+                                     "help to look at those regressions from a different angle, split the work "
+                                     "(add_task), or roll back to the last checkpoint." +
                                      (" The planner has been asked to propose a split." if e.get("action") == "replan"
                                       else ""))
             elif e.type == "task_split":
                 self._notices.append(f"Task {e.get('task')} was split into "
                                      f"{', '.join(c['id'] for c in e.get('children'))}; claim the one you work on.")
-            elif e.type == "deadline_reserve":
-                self._notices.append("Time is nearly up. Checkpoint your work now; the session will be stopped for "
-                                     "final verification shortly.")
             elif e.type == "lease_expired" and e.get("worker") == self.w:
                 self._notices.append(f"Your lease on {e.get('task')} expired; claim it again if you are still on it.")
 
@@ -54,17 +54,8 @@ class WorkerPort:
         wip = g.wips.get(self.w)
         if (wip and wip.files and now - max(last_checkpoint_t(g), self._last_reminder) > cfg.checkpoint_reminder_sec):
             self._last_reminder = now
-            self._notices.append(f"Your last checkpoint is {int((now - last_checkpoint_t(g)) / 60)} minutes old and "
-                                 "you have unverified changes. Consider calling checkpoint when your work is in a "
-                                 "sound state; only checkpointed work is delivered.")
-        if g.run and g.run.budget_sec > 0:
-            frac = remaining_sec(g, now) / g.run.budget_sec
-            for mark in (0.5, 0.25, 0.1):
-                if frac <= mark and mark not in self._time_marks:
-                    self._time_marks.add(mark)
-                    self._notices.append(f"About {max(0, remaining_sec(g, now)) / 60:.0f} minutes of the time budget "
-                                         "remain.")
-                    break
+            self._notices.append("You have changes that are not in any checkpoint yet. Only checkpointed work is "
+                                 "delivered, so call checkpoint once your work is in a sound state.")
         out, self._notices = self._notices, []
         return out
 

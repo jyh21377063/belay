@@ -6,15 +6,10 @@ from typing import Optional
 from belay.core.config import BelayConfig
 from belay.core.model import (ACTIVE, ATT_CREATED, ATT_REJECTED, BLOCKED, DONE, DONE_UNVERIFIED, JOB_FINISHED,
                               OPEN, SPLIT, Graph)
-from belay.core.queries import (chain, deps_done, holder, num, remaining_sec, requirement_status, reserve_sec,
-                                stranded, workable)
+from belay.core.queries import chain, deps_done, holder, num, requirement_status, stranded, workable
 from belay.core.suggest import suggest
 from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, full_verified, guard_set, head_full_ok,
                                tree_regressions)
-
-
-def _min(sec: float) -> str:
-    return f"{max(0.0, sec) / 60:.0f} min"
 
 
 def task_line(g: Graph, tid: str) -> str:
@@ -40,9 +35,6 @@ def task_line(g: Graph, tid: str) -> str:
 def render_board(g: Graph, worker: str, now: float, cfg: BelayConfig) -> str:
     out = []
     cp = g.head_cp
-    left = remaining_sec(g, now)
-    out.append(f"Time left: {_min(left)} (final {_min(reserve_sec(g, cfg))} reserved)."
-               + (" RESERVE: finish and checkpoint now." if g.run and g.run.reserve else ""))
     if cp is not None:
         out.append(f"Latest checkpoint: {cp.id}" + ("" if cp.id == 0 else f" ({cp.trigger}, tier {cp.tier})")
                    + f"; chain: {' <- '.join(str(c.id) for c in chain(g))}")

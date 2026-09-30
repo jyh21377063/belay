@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -468,5 +469,6 @@ def test_stall_escalates_to_replan_and_split(tmp_path):
     assert g.tasks["T1"].status == "split" and g.tasks["T1"].children == ("T3", "T4")
     assert res.status == "DONE"
     notices = " ".join(json.dumps(r["messages"][-1]["content"]) for r in worker.requests)
-    assert "No verified progress" in notices and "was split into T3, T4" in notices
+    assert "rejected for the same reason" in notices and "was split into T3, T4" in notices
+    assert not re.search(r"\d+ min\b|minutes|time budget|[Tt]ime left", notices)   # 时间不进给模型的文字
     h.verify_log(run)

@@ -244,7 +244,7 @@ def test_deadline_reserve_and_reserve_suggestions():
     s.do(R.tick)
     assert s.g.run.reserve and any(e.type == "deadline_reserve" for e in s.log)
     assert any(e.kind == "stop_workers" for e in s.effects)
-    assert suggest(s.g, "w1", s.now, cfg)[0].kind == "finish"
+    assert suggest(s.g, "w1", s.now, cfg) == []                          # 预留期不给建议，由 runtime 收尾
     assert R.next_step(s.g, "w1", s.now, cfg) == ("finalize", "deadline")
 
 

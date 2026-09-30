@@ -37,7 +37,6 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic"
 
 class FlatAgent(PatchCaptureMixin, BaseAgent):
     default_policy = Policy()
-    time_reminders = False
 
     def __init__(self, logs_dir, model_name=None, repo_dir=None, extra_env=None, max_tokens: int = 64000,
                  effort: str | None = "max", thinking: bool = True, budget_min: float = 90,
@@ -110,7 +109,7 @@ class FlatAgent(PatchCaptureMixin, BaseAgent):
         tools = get_tools([n for n in DEFAULT_TOOLS if self.explore or n != "explore"])
         return Worker(self._make_llm(), env, tools=tools,
                       config=WorkerConfig(deadline=deadline, clear_tokens=self.clear_tokens,
-                                          reset_tokens=self.reset_tokens, time_reminders=self.time_reminders),
+                                          reset_tokens=self.reset_tokens),
                       policy=self.policy, transcript=Transcript(Path(self.logs_dir) / "transcript.jsonl"),
                       on_progress=self._progress(context))
 

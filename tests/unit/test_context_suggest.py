@@ -1,8 +1,11 @@
 """调度建议与上下文构建：只读图的两个纯函数。"""
 from __future__ import annotations
 
+import re
+
 from belay.core import rules as R
 from belay.core.context import build_context
+from belay.core.render import render_board
 from belay.core.suggest import suggest
 from tests.sim import Sim
 
@@ -71,3 +74,17 @@ def test_build_context_includes_wip_diff_from_blobs_and_marks_sources():
     t = ctx.text
     assert "pkg/a.py (+3 -1)" in t and "+ new line in a.py" in t and "tests/test_a.py" in t
     assert "observed by the harness" in t and "rebuilt by the harness" in t
+
+
+def test_time_never_reaches_the_model():
+    """剩余时间只由 runtime 用来收尾：开场上下文和 board 里都不出现时间，进入截止预留后也一样。"""
+    s = sim()
+    s.do(R.claim, "w1", "T1")
+    time_words = re.compile(r"\d+ min\b|minutes|time budget|[Tt]ime left|RESERVE|reserved")
+    for _ in range(2):
+        for mode in ("first", "resume", "compaction"):
+            assert not time_words.search(build_context(s.g, "w1", 100_000, s.now, s.cfg, mode=mode).text)
+        assert not time_words.search(render_board(s.g, "w1", s.now, s.cfg))
+        s.advance(5400)
+        s.do(R.tick)
+    assert s.g.run.reserve

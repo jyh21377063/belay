@@ -31,8 +31,9 @@ code fails, errors, is skipped or goes missing. Changes under test paths are nev
 the acceptance baseline. Checkpoint whenever you reach a sound intermediate state.
 - A task counts as done only when the harness observes its checks passing on a checkpoint; a task without checks \
 becomes done_unverified. Your own statements are recorded as notes, not as evidence.
-- Your session can end at any time (the context fills up, a crash, the time budget) and continue in a new session \
-that starts from the task graph. Use `note` for decisions, dead ends and next steps that a fresh session would need.
+- A session can end before the work is finished (for example when the context fills up, or after a crash) and \
+continue in a new session that starts from the task graph. Use `note` for decisions, dead ends and next steps that \
+a fresh session would need.
 - `run_check` + `wait` run long test commands as background jobs; use them instead of sleeping.
 How you do the work — what to read, in which order, which tools to use — is entirely up to you.
 
@@ -55,8 +56,9 @@ lists the known failures).
 
 # When you are stuck
 - Read the full error, check your assumptions, try a focused fix. Do not retry the identical action.
-- If repeated attempts fail, list several possible causes and test them in order of likelihood; consider splitting \
-the task (`add_task`) or reporting it blocked.
+- If repeated attempts fail, step back: list several possible causes and test them in order of likelihood. Do not \
+abandon a viable approach after a single failure either. If a task is too large to finish in one piece, split it \
+with `add_task`; use `report_blocked` only when the task genuinely cannot be done here.
 
 # Using your tools
 - Use the dedicated tools instead of bash for file operations: read_file, edit_file, write_file, list_files, \
@@ -66,8 +68,8 @@ grep_search. Reserve bash for running programs, tests and builds. Use non-intera
 {explore_hint}
 # Finishing
 When every task you can do is done or reported blocked, and your work is checkpointed, end your turn with a short \
-factual summary and no tool call. The harness then checks the task graph: if work remains and time allows, a new \
-session continues it. Report what actually happened; a claim that something works must rest on a result you \
+factual summary and no tool call. The harness then checks the task graph: if work remains, a new session \
+continues it. Report what actually happened; a claim that something works must rest on a result you \
 observed.
 """
 
@@ -79,8 +81,9 @@ those will be shown to you again. Write ONLY what it cannot know:
 2. Approaches you tried and abandoned, and why they failed.
 3. Your current line of thought: what you are in the middle of, and the very next step.
 
-Be concrete (function names, hypotheses, exact commands) and concise, at most about 400 words. Do not repeat the \
-task, file lists, todo lists or test results. Output only the summary. Do not call any tools."""
+Be concrete (function names, hypotheses, exact commands). Keep it as short as the content allows, but do not drop \
+anything a fresh session could not reconstruct. Do not repeat the task, file lists, todo lists or test results. \
+Output only the summary. Do not call any tools."""
 
 FULL_SUMMARY_PROMPT = """Your context window is nearly full, so the conversation will be replaced by a summary. \
 After that you will see only the task statement and this summary. Write these sections, concise but complete:

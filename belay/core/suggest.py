@@ -5,7 +5,8 @@
   2. 解锁下游任务越多越靠前；
   3. 所链接的需求还没有任何进展的靠前，让覆盖面先铺开；
   4. 规划器的优先级提示只用来打破平局。
-剩余时间低于截止预留时，只建议“先存档、收尾待验证的任务”。
+剩余时间低于截止预留时不给建议：此时 runtime 会停下 worker 并自行做全量存档，不需要模型配合，
+也不把剩余时间写进给模型的文字。
 """
 from __future__ import annotations
 
@@ -28,7 +29,6 @@ class Suggestion:
     task: Optional[str]
     rank: int
     reason: str
-    kind: str = "task"                 # task | finish
 
 
 def _key(g: Graph, t: Task) -> tuple:
@@ -57,12 +57,9 @@ def _reason(g: Graph, t: Task, worker: str) -> str:
 def suggest(g: Graph, worker: str, now: float, cfg: BelayConfig) -> list[Suggestion]:
     if not cfg.suggest or g.run is None:
         return []
-    held = held_tasks(g, worker)
     if g.run.reserve or remaining_sec(g, now) <= reserve_sec(g, cfg):
-        out = [Suggestion(None, 1, "time is nearly up: checkpoint your work now and finish the tasks you hold; "
-                                   "do not start new tasks", kind="finish")]
-        out += [Suggestion(t.id, i + 2, "finish it", kind="finish") for i, t in enumerate(held)]
-        return out
+        return []
+    held = held_tasks(g, worker)
     cands = {t.id: t for t in ready_tasks(g)}
     cands.update({t.id: t for t in held if t.status == ACTIVE})
     ranked = sorted(cands.values(), key=lambda t: _key(g, t))

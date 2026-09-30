@@ -13,7 +13,7 @@ from typing import Mapping, Optional
 from belay.core.config import BelayConfig
 from belay.core.model import DONE, DONE_UNVERIFIED, REVIEW, Graph
 from belay.core.queries import (compactions_of_session, held_tasks, last_session, notes_of_session, num,
-                                remaining_sec, requirement_status, reserve_sec, sessions_of, task_files)
+                                requirement_status, sessions_of, task_files)
 from belay.core.suggest import suggest
 from belay.core.verify import B_FAIL, B_FLAKY, guard_set, results_for_tree
 
@@ -66,7 +66,7 @@ def _render(s: Section) -> str:
 def _clip(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
-    return text[:max(0, max_chars - 60)].rstrip() + "\n[... truncated to fit the context budget]"
+    return text[:max(0, max_chars - 60)].rstrip() + "\n[... truncated]"
 
 
 def _fmt_files(files, limit: int = 40) -> str:
@@ -74,10 +74,6 @@ def _fmt_files(files, limit: int = 40) -> str:
     if len(files) > limit:
         lines.append(f"  ... and {len(files) - limit} more files")
     return "\n".join(lines)
-
-
-def _minutes(sec: float) -> str:
-    return f"{max(0, sec) / 60:.0f} min"
 
 
 # ---------------------------------------------------------------- 各段
@@ -215,15 +211,14 @@ def _summaries(g: Graph, worker: str, mode: str) -> str:
 
 
 def _suggestions(g: Graph, worker: str, now: float, cfg: BelayConfig) -> str:
-    left = remaining_sec(g, now)
-    lines = [f"Time left: about {_minutes(left)} (the last {_minutes(reserve_sec(g, cfg))} are reserved for final "
-             "verification)."]
+    # 剩余时间只由 runtime 用来决定何时收尾，不写进给模型的文字（避免催促模型缩小范围）。
     ss = suggest(g, worker, now, cfg)
-    if ss:
-        lines.append("Suggested order (you may claim any ready task):")
-        for s in ss:
-            t = g.tasks.get(s.task) if s.task else None
-            lines.append(f"{s.rank}. " + (f"{t.id} {t.title} — {s.reason}" if t else s.reason))
+    if not ss:
+        return ""
+    lines = ["Suggested order (you may claim any ready task):"]
+    for s in ss:
+        t = g.tasks.get(s.task) if s.task else None
+        lines.append(f"{s.rank}. " + (f"{t.id} {t.title} — {s.reason}" if t else s.reason))
     return "\n".join(lines)
 
 
@@ -244,7 +239,7 @@ def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: Be
         Section("notes", "Your notes in this session" if mode == "compaction" else "Notes from your previous session",
                 "self_report", _notes(g, worker, mode)),
         Section("summary", "Summary of your earlier reasoning", "llm", _summaries(g, worker, mode)),
-        Section("suggestions", "Suggestions and time", "rule", _suggestions(g, worker, now, cfg)),
+        Section("suggestions", "Suggestions", "rule", _suggestions(g, worker, now, cfg)),
     ]
     secs = [s for s in secs if s.text.strip()]
     intro = INTRO.get(mode, INTRO["first"])
