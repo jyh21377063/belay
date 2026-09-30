@@ -92,8 +92,9 @@ class BelaySession:
             if resp.stop_reason == "max_tokens" and tool_uses:
                 kept = [b for b in resp.content if b.get("type") != "tool_use"] or [{"type": "text", "text": "(truncated)"}]
                 self.messages.append({"role": "assistant", "content": kept})
-                self.messages.append({"role": "user", "content": "Your previous response hit the output token limit "
-                                      "and its tool calls were dropped. Continue, keeping each response shorter."})
+                self.messages.append({"role": "user", "content": "Your previous response was cut off before its tool "
+                                      "calls were complete, so none of them ran. Continue from there; if a single "
+                                      "call is very large (for example writing a big file), split it into several."})
                 continue
             self.messages.append({"role": "assistant", "content": resp.content or [{"type": "text", "text": "(empty)"}]})
             if not tool_uses:

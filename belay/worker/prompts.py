@@ -23,6 +23,8 @@ is completely done. Do not stop to ask for permission or confirmation.
 to the next call. Use paths relative to the root, or chain commands with `&&` in one call.
 - There is no network access. The project's dependencies are already installed; do not try to download or install \
 packages from the internet.
+- The harness manages your context automatically: when the conversation grows long, you write a handoff note and \
+the work continues in a fresh context, so the length of the conversation does not limit how much work you can do.
 - Your changes to the working tree are collected automatically when you finish. Do not commit, create branches, \
 or otherwise rewrite git history.
 - Tool results may include notes from the system in <system-reminder> tags.
@@ -116,8 +118,8 @@ make it self-contained:
 - anything you are unsure about.
 Make it as long as the answer needs and no longer."""
 
-EXPLORE_WRAPUP = """You have reached the limit for this exploration. Stop investigating and write your final report \
-now from what you have found so far, following the report format. Do not call any tools."""
+EXPLORE_WRAPUP = """Stop investigating now and write your final report from what you have found so far, following \
+the report format. Do not call any tools."""
 
 
 def system_prompt(workdir: str, platform: str, extra_rules: str = "", has_explore: bool = False) -> str:
@@ -137,7 +139,7 @@ def explore_message(question: str) -> str:
 def initial_message(task: str, snapshot: str, handoff: str | None = None, todos: list[dict] | None = None) -> str:
     parts = [f"<task>\n{task.strip()}\n</task>"]
     if handoff is not None:
-        parts.append("Your previous session was reset because its context grew too long. Below are the handoff note "
+        parts.append("You are continuing this task in a fresh context. Below are the handoff note "
                      "you wrote just before the reset, your todo list, and the current repository state including "
                      "the full diff of your changes. Files you read earlier are no longer in your context: read a "
                      "file again before editing it.\n"

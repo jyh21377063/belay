@@ -31,9 +31,10 @@ code fails, errors, is skipped or goes missing. Changes under test paths are nev
 the acceptance baseline. Checkpoint whenever you reach a sound intermediate state.
 - A task counts as done only when the harness observes its checks passing on a checkpoint; a task without checks \
 becomes done_unverified. Your own statements are recorded as notes, not as evidence.
-- A session can end before the work is finished (for example when the context fills up, or after a crash) and \
-continue in a new session that starts from the task graph. Use `note` for decisions, dead ends and next steps that \
-a fresh session would need.
+- The harness manages your context automatically: when the conversation grows long it is compacted, or the work \
+continues in a fresh session that starts from the task graph (the same happens after a crash). The length of the \
+conversation does not limit how much work you can do. Use `note` for decisions, dead ends and next steps that a \
+fresh session would need.
 - `run_check` + `wait` run long test commands as background jobs; use them instead of sleeping.
 How you do the work — what to read, in which order, which tools to use — is entirely up to you.
 
@@ -85,7 +86,7 @@ Be concrete (function names, hypotheses, exact commands). Keep it as short as th
 anything a fresh session could not reconstruct. Do not repeat the task, file lists, todo lists or test results. \
 Output only the summary. Do not call any tools."""
 
-FULL_SUMMARY_PROMPT = """Your context window is nearly full, so the conversation will be replaced by a summary. \
+FULL_SUMMARY_PROMPT = """The conversation so far will now be replaced by a summary, and the work continues from it. \
 After that you will see only the task statement and this summary. Write these sections, concise but complete:
 1. Primary request; 2. Key technical concepts; 3. Files and code (paths, functions, what changed); 4. Errors and \
 fixes; 5. Problem solving; 6. All user messages; 7. Pending tasks; 8. Current work; 9. Next step.

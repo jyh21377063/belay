@@ -48,8 +48,8 @@ def clear_stale_results(messages: list[dict], keep_recent: int = 12) -> int:
     return len(stale)
 
 
-HANDOFF_REQUEST = """Your context window is nearly full, so this session will be reset now. Write a handoff note \
-that lets you resume the work efficiently in a fresh session. After the reset you will see only the original task \
+HANDOFF_REQUEST = """The work will now continue in a fresh context. Write a handoff note that lets you resume it \
+efficiently there. After the reset you will see only the original task \
 statement, this note, your current todo list, and the repository state (`git status` and the full `git diff` of your \
 changes). Nothing else from this conversation survives, including the contents of files you read.
 

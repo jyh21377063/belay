@@ -128,7 +128,7 @@ def test_explorer_wraps_up_at_turn_limit(repo):
     worker = Worker(llm, LocalEnv(str(repo)), config=WorkerConfig(explore_max_turns=1))
     run(worker.run("task"))
     wrapup = llm.requests[2]
-    assert wrapup["tool_choice"] == {"type": "none"} and "limit" in wrapup["messages"][-1]["content"][-1]["text"]
+    assert wrapup["tool_choice"] == {"type": "none"} and "final report" in wrapup["messages"][-1]["content"][-1]["text"]
     assert "Partial report" in llm.requests[3]["messages"][-1]["content"][0]["content"]
 
 
