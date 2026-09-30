@@ -1,19 +1,18 @@
 """工具注册表。
 
-DEFAULT_TOOLS 是 B 组（FlatAgent）的工具集；BELAY_TOOLS 用 runtime 版的 submit 替换 B 组的 submit，
-并加入 run_check / wait / ledger / report_conflict（见 belay/tools/runtime.py）。
+DEFAULT_TOOLS 是 B 组（FlatAgent）的工具集；BELAY_TOOLS = B 组的工具（去掉 submit：运行何时结束由 runtime 的图决定）
++ Belay 工具（见 belay/tools/belay.py）。
 """
 from __future__ import annotations
 
-from belay.tools import agents, files, runtime, shell
+from belay.tools import agents, belay, files, shell
 from belay.tools.base import Policy, RuntimeClient, Tool, ToolContext, ToolError
 
 ALL_TOOLS: dict[str, Tool] = {t.name: t for t in files.TOOLS + shell.TOOLS + agents.TOOLS}
-RUNTIME_TOOLS: dict[str, Tool] = {t.name: t for t in runtime.TOOLS}
+RUNTIME_TOOLS: dict[str, Tool] = {t.name: t for t in belay.TOOLS}
 DEFAULT_TOOLS = ["read_file", "edit_file", "write_file", "list_files", "grep_search", "bash", "todo_write",
                  "explore", "submit"]
-BELAY_TOOLS = [n for n in DEFAULT_TOOLS if n != "submit"] + ["run_check", "wait", "ledger", "submit",
-                                                             "report_conflict"]
+BELAY_TOOLS = [n for n in DEFAULT_TOOLS if n != "submit"] + [t.name for t in belay.TOOLS]
 EXPLORE_TOOLS = ["read_file", "list_files", "grep_search", "bash"]        # 探索子 agent：只读，不能再开子 agent
 
 
@@ -22,7 +21,6 @@ def get_tools(names: list[str] | None = None) -> list[Tool]:
 
 
 def get_belay_tools(names: list[str] | None = None) -> list[Tool]:
-    """runtime 工具优先（submit 用 runtime 版）。"""
     registry = {**ALL_TOOLS, **RUNTIME_TOOLS}
     return [registry[n] for n in (BELAY_TOOLS if names is None else names)]
 

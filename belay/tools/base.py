@@ -61,17 +61,17 @@ _DISK = re.compile(r"\b(find|locate|rg|grep\s+-[a-zA-Z]*r[a-zA-Z]*)\s+(?:[^|;&]*
 
 
 class RuntimeClient(Protocol):
-    """工具与 Orchestrator 之间唯一的接口（实现见 belay/runtime/orchestrator.py 的 WorkerRuntime）。
+    """工具与 runtime 之间唯一的接口（实现见 belay/runtime/port.py 的 WorkerPort）。
 
-    工具把请求投进 Orchestrator 的收件箱并等待回复；工具不认识 Orchestrator 的内部实现。
-    回复是 {"text": 给模型看的文字, "finished": 运行是否已结束, "error": 是否是错误}。
+    工具把请求交给 runtime 并等待回复；工具不认识 runtime 的内部实现。
+    回复是 {"text": 给模型看的文字, "error": 是否被拒绝}。
     B 组（FlatAgent）没有 runtime，ToolContext.runtime 为 None，runtime 工具不会注册。
     """
 
-    async def request(self, kind: str, **payload: Any) -> dict: ...
+    async def request(self, name: str, /, **payload: Any) -> dict: ...
 
     def drain_notices(self) -> list[str]:
-        """取走 runtime 发给本 worker 的通知（独立测试收录 / 被拒等），由 worker 在下一轮注入。"""
+        """取走 runtime 发给本 worker 的通知（停滞提示、截止预留等），由 worker 在下一轮注入。"""
         ...
 
 
@@ -80,8 +80,8 @@ class ToolContext:
     env: Env
     workdir: str
     policy: Policy = field(default_factory=Policy)
-    runtime: RuntimeClient | None = None                  # M2 起由 Belay 传入
-    work_id: str | None = None                            # M5 起：本 worker 负责的工作节点
+    runtime: RuntimeClient | None = None                  # Belay 传入 WorkerPort；B 组为 None
+    work_id: str | None = None                            # 多 worker 时：本 worker 的标识（预留）
     # 读后被改检测：路径 → 最近一次读取或写入时的 sha256。编辑前文件必须在这里，且内容未变
     file_digests: dict[str, str] = field(default_factory=dict)
     # 只读探索子 agent 的入口，由 worker 注入（tools 不依赖 worker）；参数为任务描述，返回报告

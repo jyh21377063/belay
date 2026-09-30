@@ -1,67 +1,141 @@
-"""本地调试入口：不经过 Pier，直接对一个目录或一个保留下来的容器运行 worker。
+"""本地调试入口：不经过 Pier，直接对一个目录或一个保留下来的容器运行。
 
-  python -m belay.cli --workdir /path/to/repo --task-file task.md
-  python -m belay.cli --docker <容器> --workdir /testbed --task "..." --record run.jsonl
-  python -m belay.cli --workdir /tmp/repo --task-file task.md --replay run.jsonl   # 回放，不调用模型
+  python -m belay.cli run    --workdir /path/to/repo --task-file task.md [--gate gate.json] [--run-dir runs/x]
+  python -m belay.cli run    --docker <容器> --workdir /testbed --task-file task.md --gate gate.json --record rec.jsonl
+  python -m belay.cli resume --run-dir runs/x                 # runtime 崩溃后：重放事件 → 对账 → 继续
+  python -m belay.cli ledger --run-dir runs/x                 # 从事件库重放出账本
+  python -m belay.cli flat   --workdir /path/to/repo --task-file task.md   # B 组：同一个 worker，不用图
 
 模型配置从环境变量读取：DEEPSEEK_API_KEY（或 ANTHROPIC_API_KEY）、ANTHROPIC_BASE_URL、BELAY_MODEL。
+--gate 兼容 eval 的 gate.json（test_cmd / parser / prelude / commands / timeout_sec，可加 public_checks）。
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
 
-from belay.env import DockerEnv, LocalEnv
-from belay.llm import LLM, ReplayLLM
-from belay.tools import Policy
-from belay.worker.transcript import Transcript
-from belay.worker import Worker, WorkerConfig
+
+def _llm(args, record: str | None):
+    from belay.llm import LLM, ReplayLLM
+    if getattr(args, "replay", None):
+        return ReplayLLM(args.replay)
+    key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise SystemExit("需要设置 DEEPSEEK_API_KEY")
+    return LLM(args.model, key, base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
+               effort=args.effort or None, thinking=not args.no_thinking, record_path=record, log=print)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="运行单个 Belay worker（本地调试）")
-    ap.add_argument("--workdir", required=True, help="仓库目录（--docker 时为容器内路径）")
-    ap.add_argument("--docker", help="容器名或 ID；不填则在本机目录上执行")
-    ap.add_argument("--task", help="任务文本")
-    ap.add_argument("--task-file", help="任务文件")
+def _env(docker: str | None, workdir: str):
+    from belay.env import DockerEnv, LocalEnv
+    return DockerEnv(docker, workdir) if docker else LocalEnv(workdir)
+
+
+def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--model", default=os.environ.get("BELAY_MODEL", "deepseek-flash"))
     ap.add_argument("--effort", default="max")
     ap.add_argument("--no-thinking", action="store_true")
-    ap.add_argument("--budget-min", type=float, default=90)
-    ap.add_argument("--strict", action="store_true", help="使用 Belay 的严格行动边界")
     ap.add_argument("--record", help="把模型回复录制到该文件")
     ap.add_argument("--replay", help="回放录制的模型回复，不调用模型")
-    ap.add_argument("--out", default="belay-local-run", help="轨迹输出目录")
-    args = ap.parse_args()
 
-    task = Path(args.task_file).read_text() if args.task_file else args.task
-    if not task:
-        ap.error("需要 --task 或 --task-file")
-    env = DockerEnv(args.docker, args.workdir) if args.docker else LocalEnv(args.workdir)
-    if args.replay:
-        llm = ReplayLLM(args.replay)
+
+def _run_belay(args, resume: bool) -> None:
+    from belay.core.config import BelayConfig
+    from belay.runtime.driver import BelayRun, RunSettings
+    from belay.runtime.verifier import VerifierSpec
+
+    run_dir = Path(args.run_dir)
+    saved = run_dir / "cli.json"
+    if resume:
+        conf = json.loads(saved.read_text())
     else:
-        key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-        if not key:
-            ap.error("需要设置 DEEPSEEK_API_KEY")
-        llm = LLM(args.model, key, base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
-                  effort=args.effort or None, thinking=not args.no_thinking, record_path=args.record, log=print)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        state = "/opt/belay" if args.docker else str((run_dir / "state").resolve())
+        conf = {"workdir": args.workdir, "docker": args.docker, "budget_sec": args.budget_min * 60,
+                "git_dir": f"{state}/git", "jobs_dir": f"{state}/jobs",
+                "gate": json.loads(Path(args.gate).read_text()) if args.gate else {},
+                "config": json.loads(Path(args.config).read_text()) if args.config else {}}
+        saved.write_text(json.dumps(conf, indent=1))
+    env = _env(conf["docker"], conf["workdir"])
+    record = args.record or str(run_dir / "llm_record.jsonl")
+    settings = RunSettings(run_dir=str(run_dir), budget_sec=conf["budget_sec"], git_dir=conf["git_dir"],
+                           jobs_dir=conf["jobs_dir"])
+    run = BelayRun(_llm(args, record), env, settings, BelayConfig.from_dict(conf["config"]),
+                   VerifierSpec.from_dict(conf["gate"]), log=print)
+    if resume:
+        res = asyncio.run(run.resume())
+    else:
+        task = Path(args.task_file).read_text() if args.task_file else args.task
+        if not task:
+            raise SystemExit("需要 --task 或 --task-file")
+        res = asyncio.run(run.start(task, run_id=run_dir.name))
+    print(f"\nstatus={res.status} delivered checkpoint={res.checkpoint}\nledger: {run_dir / 'ledger.md'}\n"
+          f"deliverable: {run_dir / 'deliverable.diff'}")
 
+
+def _ledger(args) -> None:
+    from belay.core.reduce import replay
+    from belay.core.render import ledger_markdown
+    from belay.runtime.store import EventStore
+    store = EventStore(args.run_dir)
+    print(ledger_markdown(replay(store.events())))
+
+
+def _flat(args) -> None:
+    from belay.tools import Policy
+    from belay.worker import Worker, WorkerConfig
+    from belay.worker.transcript import Transcript
+    task = Path(args.task_file).read_text() if args.task_file else args.task
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-
-    def progress(w: Worker) -> None:
-        print(f"[turn {w.turns}] context={w.last_context} out_tokens={w.usage.output_tokens}", flush=True)
-
-    worker = Worker(llm, env, config=WorkerConfig(deadline=time.monotonic() + args.budget_min * 60),
-                    policy=Policy.strict() if args.strict else Policy(),
-                    transcript=Transcript(out / "transcript.jsonl"), on_progress=progress)
+    worker = Worker(_llm(args, args.record), _env(args.docker, args.workdir),
+                    config=WorkerConfig(deadline=time.monotonic() + args.budget_min * 60),
+                    policy=Policy.strict() if args.strict else Policy(), transcript=Transcript(out / "transcript.jsonl"),
+                    on_progress=lambda w: print(f"[turn {w.turns}] context={w.last_context}", flush=True))
     result = asyncio.run(worker.run(task))
     print(f"\nstatus={result.status} turns={result.turns} resets={result.resets} peak_context={result.peak_context}")
-    print(f"summary: {result.summary}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Belay 本地调试入口")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    run = sub.add_parser("run", help="运行 Belay（runtime + worker）")
+    run.add_argument("--workdir", required=True)
+    run.add_argument("--docker")
+    run.add_argument("--task")
+    run.add_argument("--task-file")
+    run.add_argument("--gate", help="检查配置（gate.json）")
+    run.add_argument("--config", help="BelayConfig 的 JSON")
+    run.add_argument("--run-dir", default="belay-run")
+    run.add_argument("--budget-min", type=float, default=90)
+    _common(run)
+    res = sub.add_parser("resume", help="runtime 崩溃后继续")
+    res.add_argument("--run-dir", required=True)
+    _common(res)
+    led = sub.add_parser("ledger", help="从事件库重放出账本")
+    led.add_argument("--run-dir", required=True)
+    flat = sub.add_parser("flat", help="B 组：只有 worker，不用图")
+    flat.add_argument("--workdir", required=True)
+    flat.add_argument("--docker")
+    flat.add_argument("--task")
+    flat.add_argument("--task-file")
+    flat.add_argument("--budget-min", type=float, default=90)
+    flat.add_argument("--strict", action="store_true")
+    flat.add_argument("--out", default="belay-flat-run")
+    _common(flat)
+    args = ap.parse_args()
+    if args.cmd == "run":
+        _run_belay(args, resume=False)
+    elif args.cmd == "resume":
+        _run_belay(args, resume=True)
+    elif args.cmd == "ledger":
+        _ledger(args)
+    else:
+        _flat(args)
 
 
 if __name__ == "__main__":

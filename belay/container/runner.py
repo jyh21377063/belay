@@ -1,6 +1,7 @@
 """容器内的检查运行器：只用标准库，兼容 Python 3.6；不 import belay 的其他模块（由宿主机上传执行）。
 
-  python3 runner.py pytest SPEC OUT_DIR       跑一次测试，写 OUT_DIR/result.json 与 OUT_DIR/log
+  python3 runner.py run SPEC OUT_DIR          跑一次检查（pytest 与命令检查），写 OUT_DIR/result.json 与 OUT_DIR/log
+                                               （pytest 是 run 的别名）
   python3 runner.py strip-tests GIT_DIR BASE_TREE TREE   把 TREE 中测试路径下的改动恢复为 BASE_TREE 的版本，
                                                          输出 {"tree": 新树, "dropped": [路径]}
   python3 runner.py probe SPEC                 在工作区的测试环境里打印 sys.path（检查 import 到的是哪份代码）
@@ -19,8 +20,10 @@ SPEC（JSON）：
   pythonpath   是否把工作区放到 PYTHONPATH 最前面（在原始代码副本上验证测试时用）
   timeout      秒
   chown        结束后把工作区改回给这个用户（runtime 以 root 运行门禁时用）
+  skip_tests   不跑测试命令（选择里只有命令检查时）
+  checks       命令检查 [{"id": "cmd:build", "command": "..."}]：在同一个候选树上执行，退出码 0 记为 PASSED
 
-测试路径的规则与 belay/graph/evidence.py 的 TEST_PATH 保持一致；解析器移植自 eval/agents/gate_script.py
+测试路径的规则与 belay/core/verify.py 的 TEST_PATH 保持一致；解析器移植自 eval/agents/gate_script.py
 （SWE-EVO 官方 SWE-bench 分支的 parse_log_pytest / parse_log_pytest_pydantic）。
 """
 import json
@@ -84,24 +87,38 @@ def failure_reasons(log):
 
 # ---- 命令 -------------------------------------------------------------------------
 
-def _looks_like_path(tok):
-    return not tok.startswith("-") and ("/" in tok or tok.split("::")[0].endswith(".py"))
+_ARG_OPTS = ("-m", "-p", "-k", "-c", "-o", "--rootdir", "--confcutdir", "-W")
+
+
+def _looks_like_path(tok, ws=None, prev=None):
+    if tok.startswith("-") or prev in _ARG_OPTS:
+        return False
+    if "/" in tok or "::" in tok or tok.split("::")[0].endswith(".py"):
+        return True
+    return bool(ws) and os.path.isdir(os.path.join(ws, tok))
 
 
 def build_command(spec):
-    """返回（命令，是否有测试目标，被去掉的参数）。"""
+    """返回（命令，是否有测试目标，被去掉的参数）。
+
+    test_cmd 里的路径参数（含 /、::、以 .py 结尾，或工作区里存在的目录）在 select 非空时被替换；
+    test_cmd 本身不带路径参数时（例如 `python -m pytest`），全量运行就原样执行。
+    """
     ws = spec["workspace"]
     toks = shlex.split(spec["test_cmd"])
     select = list(spec.get("select") or [])
     extra = list(spec.get("extra") or [])          # 追加的目标（独立测试），不替换原有路径
     kept, dropped, targets = [], [], []
+    had_paths = False
+    prev = None
     for tok in toks:
-        if _looks_like_path(tok):
-            if select:
-                continue                            # 由 select 替换
-            (targets if os.path.exists(os.path.join(ws, tok.split("::")[0])) else dropped).append(tok)
+        if _looks_like_path(tok, ws, prev):
+            had_paths = True
+            if not select:
+                (targets if os.path.exists(os.path.join(ws, tok.split("::")[0])) else dropped).append(tok)
         else:
             kept.append(tok)
+        prev = tok
     for tok in select + [t for t in extra if t not in select]:
         (targets if os.path.exists(os.path.join(ws, tok.split("::")[0])) else dropped).append(tok)
     parts = []
@@ -109,7 +126,8 @@ def build_command(spec):
         parts.append("export PYTHONPATH=%s${PYTHONPATH:+:$PYTHONPATH}" % shlex.quote(ws))
     parts += [spec.get("prelude") or "true", "cd " + shlex.quote(ws)] + list(spec.get("commands") or [])
     parts.append(" ".join(shlex.quote(t) for t in kept + targets))
-    return "; ".join(parts), bool(targets), dropped
+    has_target = bool(targets) or (not select and not had_paths)
+    return "; ".join(parts), has_target, dropped
 
 
 class Terminated(Exception):
@@ -149,7 +167,8 @@ def git(git_dir, args, work_tree=None, index=None, stdin=None, check=True):
     if index:
         env["GIT_INDEX_FILE"] = index
     cmd = GIT + ["--git-dir=" + git_dir] + (["--work-tree=" + work_tree] if work_tree else []) + args
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                         cwd=work_tree or None)
     out, err = p.communicate(stdin)
     if check and p.returncode != 0:
         raise RuntimeError("git %s failed: %s" % (" ".join(args[:3]), err.decode("utf-8", "replace")[:500]))
@@ -282,22 +301,31 @@ def cmd_pytest(spec_path, out_dir):
     t0 = time.time()
     try:
         with TreeOverlay(spec, out_dir), FileOverlay(spec):
-            cmd, has_target, dropped = build_command(spec)
-            result["dropped"] = dropped
-            if not has_target:
-                result.update(status="error", error="no test files exist for this selection: %s" % dropped[:10])
-            else:
-                rc, timed_out = run_shell(cmd, log_path, int(spec.get("timeout") or 3600))
-                result["rc"] = rc
-                with open(log_path, "rb") as f:
-                    log = f.read().decode("utf-8", "replace")
-                result["tests"] = PARSERS[spec.get("parser") or "parse_log_pytest"](log)
-                result["reasons"] = failure_reasons(log)
-                if timed_out:
-                    result.update(status="timeout", error="timed out after %ss" % spec.get("timeout"))
-                elif not result["tests"]:
-                    tail = log[-1500:]
-                    result.update(status="error", error="no test results in the output; tail:\n" + tail)
+            if spec.get("test_cmd") and not spec.get("skip_tests"):
+                cmd, has_target, dropped = build_command(spec)
+                result["dropped"] = dropped
+                if not has_target:
+                    result.update(status="error", error="no test files exist for this selection: %s" % dropped[:10])
+                else:
+                    rc, timed_out = run_shell(cmd, log_path, int(spec.get("timeout") or 3600))
+                    result["rc"] = rc
+                    with open(log_path, "rb") as f:
+                        log = f.read().decode("utf-8", "replace")
+                    result["tests"] = PARSERS[spec.get("parser") or "parse_log_pytest"](log)
+                    result["reasons"] = failure_reasons(log)
+                    if timed_out:
+                        result.update(status="timeout", error="timed out after %ss" % spec.get("timeout"))
+                    elif not result["tests"]:
+                        tail = log[-1500:]
+                        result.update(status="error", error="no test results in the output; tail:\n" + tail)
+            for chk in spec.get("checks") or []:
+                clog = os.path.join(out_dir, "check-%s.log" % re.sub(r"[^A-Za-z0-9_.-]", "_", chk["id"]))
+                parts = [spec.get("prelude") or "true", "cd " + shlex.quote(spec["workspace"]), chk["command"]]
+                rc, timed_out = run_shell("; ".join(parts), clog, int(chk.get("timeout") or spec.get("timeout") or 3600))
+                result["tests"][chk["id"]] = "PASSED" if rc == 0 and not timed_out else "FAILED"
+                if rc != 0:
+                    with open(clog, "rb") as f:
+                        result["reasons"][chk["id"]] = f.read().decode("utf-8", "replace")[-400:]
     except Terminated:
         result.update(status="error", error="cancelled")
     except Exception as e:                          # 记录到结果里，不让作业悄无声息地失败
@@ -336,7 +364,7 @@ def main(argv):
     if len(argv) < 2:
         sys.exit(__doc__)
     cmd = argv[1]
-    if cmd == "pytest":
+    if cmd in ("run", "pytest"):
         cmd_pytest(argv[2], argv[3])
     elif cmd == "strip-tests":
         cmd_strip_tests(argv[2], argv[3], argv[4])

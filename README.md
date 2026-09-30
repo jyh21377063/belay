@@ -1,6 +1,6 @@
 # Belay
 
-长程编码任务的外部任务图 runtime，以及配套的评测框架。设计见 `docs/long_horizon_runtime_plan.md`，选题见 `task_selection.md`。
+长程编码任务的任务状态图 runtime，以及配套的评测框架。runtime 的实现设计见 `docs/design.md`，选题见 `task_selection.md`。
 
 ## 目录
 
@@ -79,45 +79,41 @@ python -m eval.report results/<run_id>                    # 重新生成汇总
 | `eval/agents/flat_agent.py` | B 组：自研执行器（骨架） |
 | `eval/agents/replay.py` | 评分用：在全新容器中应用补丁 |
 
-## belay 模块
+## belay 模块（v5：任务状态图 runtime）
 
-架构、目录与依赖规则见 [docs/architecture.md](docs/architecture.md)。当前完成 M0 + M1（自研 worker）与 M2–M4（证据图 runtime，按 v4 计划）：
-循环跑在宿主机进程里，所有工具经由 `environment.exec` 在任务容器中执行；容器里只需要 bash 与 coreutils，不需要联网。
-结构参考 [mini_claude](https://github.com/Windy3f3f3f3f/claude-code-from-scratch/tree/main/python/mini_claude)（MIT）。
+设计见 [docs/design.md](docs/design.md)，目录与依赖规则见 [docs/architecture.md](docs/architecture.md)。
+一条只追加的事件日志是唯一真相；任务图、执行状态、存档链三个视图由纯函数从日志推出；runtime 是唯一写者。
+循环跑在宿主机进程里，工具经由 `Env` 在任务容器中执行；容器里只需要 bash、coreutils、git 与 python3。
 
 | 路径 | 职责 |
 | --- | --- |
-| `belay/env.py` | 执行环境：`PierEnv`（评测）、`LocalEnv`（本地与测试）、`DockerEnv`（对着保留的容器调试） |
-| `belay/llm.py` | DeepSeek Anthropic 兼容接口：流式调用、重试、保留 thinking 块、用量统计、录制与回放 |
-| `belay/tools/` | 9 个工具（含只读探索子 agent `explore`）、读后被改检测、行动边界策略、输出截断、与 Orchestrator 的 `RuntimeClient` 接口 |
-| `belay/worker/` | 主循环（也用来跑探索子 agent）、上下文清理与交接重建、提示词、轨迹 |
-| `belay/config.py` | `RuntimeConfig`：每个机制一个开关（合并门、完成门 / 验收测试、申诉、隔离……）；容器内路径 |
-| `belay/graph/` | 证据图：模型、证据规则、需求账本、需求切分、不变量（纯函数）；SQLite 存储 |
-| `belay/runtime/` | Orchestrator（单写者循环 + 纯函数 `decide()`）、作业、影子仓库与集成分支、setup、Test Author / Reviewer |
-| `belay/container/runner.py` | 容器内的检查运行器（标准库、Python 3.6）：临时切换候选树跑测试、解析结果、剔除测试改动 |
-| `belay/observe/` | M6 的回放页面（空包） |
-| `belay/cli.py` | 本地调试入口，不经过 Pier |
-| `eval/agents/flat_agent.py` / `belay_agent.py` | B 组 / Belay 接入 Pier |
+| `belay/core/` | **纯函数核心**：事件（`events`）、三个视图（`model`）、推导函数（`reduce`）、状态转换规则（`rules`）、验证规则（`verify`）、不变量（`invariants`）、调度建议（`suggest`）、上下文构建（`context`）、压缩规则 L0–L2（`compact`）、规划校验（`plan`）、副作用计划（`effects`）、文字渲染（`render`）、配置（`config`） |
+| `belay/runtime/` | **命令式外壳**：事件存储（`store`）、唯一写者（`runtime`）、影子仓库与 CAS（`gitops`）、作业与验证器（`verifier`）、会话循环与 L0–L4（`session`）、工具接口（`port`）、规划器（`planner`）、运行驱动（`driver`）、重启对账（`recovery`）、提示词（`prompts`） |
+| `belay/tools/` | 通用工具（文件、bash、todo、explore）与 Belay 工具（`belay.py`：board / claim / release / add_task / note / checkpoint / ready_for_review / report_blocked / run_check / wait / rollback） |
+| `belay/worker/` | B 组的 worker（同一套工具，不用图），也用来跑只读探索子 agent |
+| `belay/env.py`、`belay/llm.py` | 执行环境（Local / Docker / Pier）；模型客户端（重试、thinking、录制与回放、ScriptedLLM） |
+| `belay/container/runner.py` | 容器内的检查运行器（标准库）：临时切换候选树跑测试与命令检查、解析结果 |
+| `belay/cli.py` | 本地调试入口：`run` / `resume` / `ledger` / `flat` |
 
 ```bash
-python -m pytest -q                                                  # 单元与集成测试，不需要容器和模型
-python -m belay.cli --workdir /path/to/repo --task-file task.md      # 本地对一个目录运行
-python -m belay.cli --docker <容器> --workdir /testbed --task-file task.md --record rec.jsonl
-python -m belay.cli --workdir /path/to/repo --task-file task.md --replay rec.jsonl   # 回放，不调用模型
-python -m eval.run --profile flat-dev --tasks <题目>                   # 通过 Pier 在调试集上运行 B 组
+python -m pytest -q                                                    # 全部测试，不需要容器和模型
+python -m belay.cli run --workdir /path/to/repo --task-file task.md --gate gate.json --run-dir runs/x
+python -m belay.cli run --docker <容器> --workdir /testbed --task-file task.md --gate gate.json --run-dir runs/x
+python -m belay.cli run ... --replay runs/x/llm_record.jsonl            # 回放录制的模型回复，不调用模型
+python -m belay.cli resume --run-dir runs/x                             # runtime 崩溃后：重放 → 对账 → 继续
+python -m belay.cli ledger --run-dir runs/x                             # 从事件库重放出账本
+python -m belay.cli flat --workdir /path/to/repo --task-file task.md    # B 组
 ```
 
-每个 trial 的日志目录下有 `transcript.jsonl`（每轮的模型输出与工具结果）和 `llm_record.jsonl`（录制的模型回复）。
-Belay 组另有 `belay/`：`graph.sqlite` 与 `events.jsonl`（证据图与事件）、`ledger.json` / `ledger.md`（需求账本）、
-`setup.json`（基线与各机制是否可用）、`worktree.diff`、`test_author-*.jsonl`、`reviews.jsonl`。
+运行目录：`events.sqlite`（事件与视图快照，唯一真相）、`events.jsonl`（同内容，便于阅读）、`sessions/S*.jsonl`
+（每个会话的完整对话，只用于审计）、`blobs/`（大工具输出、diff）、`checkpoints/<k>.diff`（每个存档的补丁镜像）、
+`deliverable.diff`（交付物 = 最近的存档）、`worktree.diff`（结束时工作区的完整改动）、`ledger.json` / `ledger.md`。
 
-```bash
-python -m eval.run --profile belay-dev --agent belay-m2 --tasks <题目>   # 分阶段验收：M2 → belay-m3 → belay
-```
+> eval 适配（`eval/agents/belay_agent.py`）仍指向 v4 的旧 runtime，接评测时按 `belay.runtime.driver.BelayRun` 重写。
 
 ## 待办
 
 - [ ] `eval/convert/promax_to_harbor.py`、`sweevo_to_harbor.py`：instruction.md 只写 problem_statement；SWE-EVO 的单提交重建写进 Dockerfile；`tests/test.sh` 写 `/logs/verifier/reward.json`（`{"resolved": 0|1, "fix_rate": x}`）
-- [x] `eval/agents/belay_agent.py`：Belay 组接入（M2–M4）
-- [ ] M5：`spawn_work`、每个 worker 一个 worktree、`merge-tree` 合并队列
+- [ ] `eval/agents/belay_agent.py`：按 v5 的 `BelayRun` 重新接入
+- [ ] 多 worker（可选）：每个 worker 一个 worktree、存档 = 三方合并再验证
 - [ ] 填写 `task_selection.md` 4.3 节的实测难度

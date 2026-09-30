@@ -1,26 +1,27 @@
-"""影子仓库与集成分支：git 写操作只由 runtime 执行（不变量 3、4）。
+"""影子仓库：存档链对应的 git 提交。只有 runtime 写它；worker 看不到（路径在 Policy.protected_prefixes 里）。
 
-影子仓库的 GIT_DIR 在 /opt/belay/git（只属于 root），work tree 按需指向各个工作区；仓库自己的 .git
-不受影响，agent 用 git diff 看到的仍是相对原始提交的改动。git 仓库与 LHTB 的非 git 目录走同一套代码。
+GIT_DIR 在工作区之外，work tree 指向工作区；仓库自己的 .git 不受影响（worker 用 git diff 看到的仍是相对原始
+提交的改动）。git 仓库与不是 git 仓库的目录走同一套代码。
 
-  init        给原始代码拍快照 → 基线提交；refs/heads/integration 指向它
-  snapshot    工作区当前内容 → 树（每个工作区一个持久的索引文件，重复快照只重新哈希改动过的文件）
-  candidate   快照 → 剔除测试路径下的改动 → 以集成分支 HEAD 为父提交的候选提交
-  advance     update-ref 比较并交换推进集成分支
-  checkout    把工作区精确切换为某个树（交付时用：工作区 = 集成分支 HEAD）
+  init        原始代码 → 基线提交；引用 refs/heads/belay 指向它
+  snapshot    工作区当前内容 → 树（持久的索引文件，重复快照只重新哈希改动过的文件）
+  strip_tests 把测试路径下的改动恢复为基线版本 → 候选树
+  commit      确定的提交（日期取事件时间，所以重做得到同一个提交）
+  cas         update-ref <新> <旧>：比较并交换推进存档链
+  checkout    把工作区精确切换为某棵树（回退、交付）
 """
 from __future__ import annotations
 
-import asyncio
-import json
+import base64
+import posixpath
 import shlex
 
-from belay.config import RuntimePaths
+from belay.core.verify import is_test_path
 from belay.env import Env
 
-REF = "refs/heads/integration"
-EXCLUDES = [".belay_checks/", "__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
-            ".hypothesis/", "*.belay-tmp"]
+REF = "refs/heads/belay"
+EXCLUDES = ["__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".hypothesis/",
+            "*.belay-tmp", ".belay_checks/"]
 LARGE_FILE_MB = 20
 
 
@@ -29,93 +30,136 @@ class GitError(RuntimeError):
 
 
 class ShadowRepo:
-    def __init__(self, env: Env, paths: RuntimePaths):
-        self.env = env                       # 以 root 运行
-        self.paths = paths
-        self._locks: dict[str, asyncio.Lock] = {}
+    def __init__(self, env: Env, git_dir: str, workspace: str):
+        self.env = env
+        self.git_dir = git_dir
+        self.workspace = workspace
 
-    def git(self, work_tree: str | None = None, index: str | None = None) -> str:
-        env = f"GIT_INDEX_FILE={shlex.quote(index)} " if index else ""
-        wt = f" --work-tree={shlex.quote(work_tree)}" if work_tree else ""
-        return (f"{env}git -c safe.directory='*' -c core.autocrlf=false -c core.quotepath=off "
-                f"-c user.name=belay -c user.email=belay@localhost --git-dir={shlex.quote(self.paths.git_dir)}{wt}")
+    def _git(self, work_tree: bool = False, index: str | None = None, date: float | None = None) -> str:
+        pre = ""
+        if index:
+            pre += f"GIT_INDEX_FILE={shlex.quote(index)} "
+        if date is not None:
+            d = f"@{int(date)} +0000"
+            pre += f"GIT_AUTHOR_DATE='{d}' GIT_COMMITTER_DATE='{d}' "
+        wt = f" --work-tree={shlex.quote(self.workspace)}" if work_tree else ""
+        return (f"{pre}git -c safe.directory='*' -c core.autocrlf=false -c core.quotepath=off "
+                f"-c user.name=belay -c user.email=belay@localhost --git-dir={shlex.quote(self.git_dir)}{wt}")
 
-    async def _run(self, cmd: str, timeout: float = 300) -> str:
-        res = await self.env.run(cmd, timeout=timeout, cwd="/")
+    def index(self, name: str) -> str:
+        return posixpath.join(self.git_dir, f"belay-index-{name}")
+
+    async def _run(self, cmd: str, timeout: float = 300, cwd: str = "/") -> str:
+        res = await self.env.run(cmd, timeout=timeout, cwd=cwd)
         if res.return_code != 0:
             raise GitError(f"rc={res.return_code}: {cmd[:300]}\n{res.output[-1500:]}")
         return res.output.strip()
 
-    def _lock(self, name: str) -> asyncio.Lock:
-        return self._locks.setdefault(name, asyncio.Lock())
-
-    async def init(self, workspace: str) -> tuple[str, str]:
-        g = self.paths.git_dir
-        excludes = "\n".join(EXCLUDES)
-        await self._run(f"mkdir -p {shlex.quote(g)} {shlex.quote(self.paths.index(''))} && "
-                        f"{self.git(workspace)} init -q && {self.git()} config core.bare false && "
-                        f"printf '%s\\n' {shlex.quote(excludes)} > {shlex.quote(g)}/info/exclude")
-        await self._refresh_large_excludes(workspace)
-        tree = await self.snapshot(workspace, "base")
-        commit = await self.commit(tree, None, "belay: original code")
-        await self._run(f"{self.git()} update-ref {REF} {commit}")
-        return commit, tree
-
-    async def _refresh_large_excludes(self, workspace: str) -> None:
-        """大文件（构建产物、数据）不进影子仓库：写入 info/exclude 的末尾一段。"""
-        g = shlex.quote(self.paths.git_dir)
-        marker = "# belay: large files"
-        cmd = (f"cd {shlex.quote(workspace)} && sed -i '/^{marker}$/,$d' {g}/info/exclude && "
-               f"echo '{marker}' >> {g}/info/exclude && "
-               f"find . -path ./.git -prune -o -type f -size +{LARGE_FILE_MB}M -print 2>/dev/null | head -2000 | "
-               f"sed 's|^\\./|/|' >> {g}/info/exclude")
-        await self._run(cmd, timeout=300)
-
-    async def snapshot(self, workspace: str, index_name: str) -> str:
-        async with self._lock(index_name):
-            git = self.git(workspace, self.paths.index(index_name))
-            return (await self._run(f"cd {shlex.quote(workspace)} && {git} add -A . && {git} write-tree",
-                                    timeout=600)).splitlines()[-1]
-
-    async def commit(self, tree: str, parent: str | None, message: str) -> str:
-        p = f" -p {parent}" if parent else ""
-        out = await self._run(f"printf '%s' {shlex.quote(message)} | {self.git()} commit-tree {tree}{p}")
-        return out.splitlines()[-1]
-
-    async def head(self) -> str:
-        return (await self._run(f"{self.git()} rev-parse {REF}")).splitlines()[-1]
-
-    async def changed(self, a: str, b: str) -> list[str]:
-        out = await self._run(f"{self.git()} diff-tree -r --no-renames --name-only {a} {b}")
-        return [line for line in out.splitlines() if line]
-
-    async def strip_tests(self, base_tree: str, tree: str) -> tuple[str, list[str]]:
-        out = await self._run(f"python3 {shlex.quote(self.paths.runner)} strip-tests "
-                              f"{shlex.quote(self.paths.git_dir)} {base_tree} {tree}")
-        data = json.loads(out.splitlines()[-1])
-        return data["tree"], data["dropped"]
-
-    async def advance(self, new: str, expected: str) -> bool:
-        res = await self.env.run(f"{self.git()} update-ref {REF} {new} {expected}", timeout=60, cwd="/")
+    # ---- 初始化
+    async def exists(self) -> bool:
+        res = await self.env.run(f"test -f {shlex.quote(self.git_dir)}/HEAD", timeout=30, cwd="/")
         return res.return_code == 0
 
-    async def checkout(self, workspace: str, index_name: str, target_tree: str) -> None:
-        """把工作区切换为 target_tree：先快照（索引 = 当前内容），再两树合并更新工作区，
-        删除 target 中没有的已跟踪文件；被忽略的文件（构建产物等）保持不动。"""
-        current = await self.snapshot(workspace, index_name)
+    async def init(self) -> tuple[str, str]:
+        g = shlex.quote(self.git_dir)
+        await self._run(f"mkdir -p {g} && {self._git()} init -q && {self._git()} config core.bare false && "
+                        f"printf '%s\\n' {shlex.quote(chr(10).join(EXCLUDES))} > {g}/info/exclude")
+        await self._run(f"cd {shlex.quote(self.workspace)} && "
+                        f"find . -path ./.git -prune -o -type f -size +{LARGE_FILE_MB}M -print 2>/dev/null | "
+                        f"head -2000 | sed 's|^\\./|/|' >> {g}/info/exclude", timeout=300)
+        tree = await self.snapshot("base")
+        commit = await self.commit(tree, None, "belay: original code", 0)
+        await self._run(f"{self._git()} update-ref {REF} {commit}")
+        return commit, tree
+
+    # ---- 观察
+    async def snapshot(self, index_name: str = "w1") -> str:
+        git = self._git(work_tree=True, index=self.index(index_name))
+        out = await self._run(f"cd {shlex.quote(self.workspace)} && {git} add -A . && {git} write-tree", timeout=600)
+        return out.splitlines()[-1].strip()
+
+    async def _diff_entries(self, a: str, b: str) -> list[tuple[str, str, str, str]]:
+        """[(status, path, old_mode, old_sha)]"""
+        out = await self._run(f"{self._git()} diff-tree -r --no-renames -z {a} {b} | base64 | tr -d '\\n'")
+        raw = base64.b64decode(out).decode("utf-8", "surrogateescape") if out else ""
+        items = raw.split("\0")
+        res, i = [], 0
+        while i < len(items) - 1:
+            meta, path = items[i], items[i + 1]
+            i += 2
+            if not meta.startswith(":"):
+                continue
+            m1, _m2, s1, _s2, st = meta[1:].split()
+            res.append((st[0], path, m1, s1))
+        return res
+
+    async def strip_tests(self, base_tree: str, tree: str) -> tuple[str, list[str]]:
+        """把 tree 中测试路径下的改动恢复为 base_tree 的版本。返回（新树，被剔除的路径）。"""
+        lines, dropped = [], []
+        for st, path, m1, s1 in await self._diff_entries(base_tree, tree):
+            if not is_test_path(path):
+                continue
+            dropped.append(path)
+            lines.append(f"0 {'0' * 40}\t{path}" if st == "A" else f"{m1} {s1}\t{path}")
+        if not dropped:
+            return tree, []
+        idx = self.index("strip")
+        data = base64.b64encode(("\n".join(lines) + "\n").encode("utf-8", "surrogateescape")).decode()
+        git = self._git(index=idx)
+        out = await self._run(f"rm -f {shlex.quote(idx)} && {git} read-tree {tree} && "
+                              f"printf %s {shlex.quote(data)} | base64 -d | {git} update-index --index-info && "
+                              f"{git} write-tree && rm -f {shlex.quote(idx)}")
+        return out.splitlines()[-1].strip(), sorted(dropped)
+
+    async def numstat(self, a: str, b: str) -> list[tuple[str, int, int]]:
+        out = await self._run(f"{self._git()} diff-tree -r --no-renames --numstat {a} {b}")
+        res = []
+        for line in out.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                add, dele, path = parts
+                res.append((path, int(add) if add.isdigit() else 0, int(dele) if dele.isdigit() else 0))
+        return sorted(res)
+
+    async def diff(self, a: str, b: str, binary: bool = False, max_bytes: int | None = None) -> str:
+        cap = f" | head -c {int(max_bytes)}" if max_bytes else ""
+        flag = "--binary --full-index" if binary else ""
+        res = await self.env.run(f"{self._git()} diff --no-color {flag} {a} {b}{cap}", timeout=300, cwd="/")
+        if res.return_code != 0:
+            raise GitError(res.output[-1000:])
+        return res.output
+
+    # ---- 提交与引用
+    async def commit(self, tree: str, parent: str | None, message: str, date: float) -> str:
+        p = f" -p {parent}" if parent else ""
+        out = await self._run(f"printf '%s' {shlex.quote(message)} | {self._git(date=date)} commit-tree {tree}{p}")
+        return out.splitlines()[-1].strip()
+
+    async def read_ref(self) -> str | None:
+        res = await self.env.run(f"{self._git()} rev-parse --verify -q {REF}", timeout=60, cwd="/")
+        return res.output.strip().splitlines()[-1] if res.return_code == 0 and res.output.strip() else None
+
+    async def cas(self, new: str, expected: str) -> bool:
+        res = await self.env.run(f"{self._git()} update-ref {REF} {new} {expected}", timeout=60, cwd="/")
+        return res.return_code == 0
+
+    async def set_ref(self, commit: str) -> None:
+        await self._run(f"{self._git()} update-ref {REF} {commit}")
+
+    async def tree_of(self, commit: str) -> str:
+        return (await self._run(f"{self._git()} rev-parse {commit}^{{tree}}")).splitlines()[-1].strip()
+
+    # ---- 工作区
+    async def checkout(self, target_tree: str, index_name: str = "w1") -> None:
+        """把工作区切换为 target_tree：已跟踪文件按 target 更新或删除；被忽略的文件（构建产物）不动。"""
+        current = await self.snapshot(index_name)
         if current == target_tree:
             return
-        async with self._lock(index_name):
-            git = self.git(workspace, self.paths.index(index_name))
-            await self._run(f"cd {shlex.quote(workspace)} && {git} read-tree -m -u {current} {target_tree}",
-                            timeout=600)
-
-    async def diff(self, a: str, b: str, max_chars: int = 60000, exclude_tests: bool = True) -> str:
-        spec = " -- . ':(exclude)*test*'" if exclude_tests else ""
-        out = await self._run(f"{self.git()} diff --no-color {a} {b}{spec} | head -c {max_chars}", timeout=120)
-        return out
+        git = self._git(work_tree=True, index=self.index(index_name))
+        await self._run(f"cd {shlex.quote(self.workspace)} && {git} read-tree -m -u {current} {target_tree}",
+                        timeout=600, cwd=self.workspace)
 
     async def show(self, tree: str, path: str, max_chars: int = 20000) -> str:
-        res = await self.env.run(f"{self.git()} show {tree}:{shlex.quote(path)} | head -c {max_chars}",
+        res = await self.env.run(f"{self._git()} show {tree}:{shlex.quote(path)} | head -c {max_chars}",
                                  timeout=60, cwd="/")
         return res.output if res.return_code == 0 else ""
