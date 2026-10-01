@@ -15,7 +15,8 @@ from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, active_guard, ch
 PAGE = 50
 STATUS_FILTERS = ("open", "verified", "submitted", "blocked", "unfinished", "done")
 REOPEN_TEXT = {"review_missing": "the reviewer found parts missing", "review_reading": "the reviewer found a "
-               "reasonable reading", "rolled_back": "its checkpoint was rolled back"}
+               "reasonable reading", "review_workaround": "the reviewer found a way to do it in this repository",
+               "rolled_back": "its checkpoint was rolled back"}
 
 
 def requirement_state(r: Requirement) -> str:
@@ -94,8 +95,7 @@ def render_board(g: Graph, worker: str, now: float, cfg: BelayConfig, status: Op
     sub = latest_submit(g, worker)
     if sub is not None:
         out.append(f"Last submit {sub.id}: {sub.status}" + (f" ({sub.reason})" if sub.reason else "")
-                   + (f"; still open: {id_ranges(sub.open)}" if sub.open else "")
-                   + (f"; held once for {len(sub.notes)} reviewer note(s)" if sub.notes and not sub.open else ""))
+                   + (f"; still open: {id_ranges(sub.open)}" if sub.open else ""))
     reqs = actionable(g)
     counts: dict[str, int] = {}
     for r in reqs:
@@ -251,15 +251,6 @@ def render_submit(g: Graph, sid: str) -> str:
         if blk:
             out.append(f"Reported blocked: {id_ranges(blk)}")
         out.append("The harness now finalizes the run; you can stop.")
-        return "\n".join(out)
-    if s.status == SUB_RETURNED and not s.open and s.notes:
-        out.append(f"Submit {sid} is held once before acceptance. Every requirement is done, but the reviewer "
-                   "noticed changes to existing behavior that the requirements do not ask for:")
-        for n in s.notes[:15]:
-            out.append(f"  - {n.get('requirement')}: {n.get('note')}")
-        out.append("This is advice, not a failure. If a change is not needed, consider keeping the original "
-                   "behavior; if it is intended (or cannot be avoided), leave it. Then call submit again; it will "
-                   "not be held for the same notes.")
         return "\n".join(out)
     if s.status == SUB_RETURNED:
         out.append(f"Submit {sid} is not accepted yet: {len(s.open)} requirement(s) are still open. Keep working on "
@@ -423,13 +414,10 @@ def ledger(g: Graph) -> dict:
         "not_delivered": [r.id for r in done_not_delivered(g, delivered)],
         "unfinished": [r.id for r in open_requirements(g)],
         "submits": [{"id": s.id, "status": s.status, "implicit": s.implicit, "checkpoint": s.checkpoint,
-                     "open": list(s.open), "reason": s.reason, "notes": [dict(n) for n in s.notes]}
-                    for s in sorted(g.submits.values(), key=lambda s: s.seq)],
+                     "open": list(s.open), "reason": s.reason} for s in sorted(g.submits.values(), key=lambda s: s.seq)],
         "reviews": [{"id": v.id, "phase": v.phase, "requirements": list(v.requirements), "status": v.status,
                      "retry_of": v.retry_of,
-                     "results": {k: x.get("implemented") for k, x in v.results.items()},
-                     "side_effects": {k: list(x.get("side_effects") or []) for k, x in v.results.items()
-                                      if x.get("side_effects")}}
+                     "results": {k: x.get("implemented") for k, x in v.results.items()}}
                     for v in sorted(g.reviews.values(), key=lambda v: v.seq)],
         "unreviewed": [r.id for r in actionable(g) if r.review == "failed"],
         "checkpoints": [{"id": c.id, "parent": c.parent, "trigger": c.trigger, "kind": c.kind, "level": c.level,
@@ -495,12 +483,6 @@ def ledger_markdown(g: Graph) -> str:
     if L["not_delivered"]:
         out += ["", f"Finished but not in the deliverable (finished after the delivered checkpoint): "
                     f"{', '.join(L['not_delivered'])}"]
-    notes = [(s["id"], n) for s in L["submits"] for n in s["notes"]]
-    if notes:
-        out += ["", "## Reviewer notes on unrequested behavior changes", "",
-                "Advice only: the submit was held once so the worker could look at them.", ""]
-        for sid, n in notes:
-            out.append(f"- {sid} {n.get('requirement')}: {n.get('note')}")
     if L["waived"]:
         out += ["", "## Waived regression checks", "",
                 "Existing tests taken out of the regression gate because the worker quoted task text asking for "

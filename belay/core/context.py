@@ -197,9 +197,7 @@ def _away_line(g: Graph, e: Event) -> Optional[str]:
         return f"{e.get('requirement')} is verified by its checks on checkpoint {e.get('checkpoint')}"
     if t == "submit_updated" and e.get("status") in ("accepted", "returned"):
         return f"submit {e.get('submit')} was {e.get('status')}" + \
-            (f"; still open: {id_ranges(e.get('open'))}" if e.get("open") else "") + \
-            (f"; held once for {len(e.get('notes'))} reviewer note(s) on unrequested behavior changes"
-             if e.get("notes") and not e.get("open") else "")
+            (f"; still open: {id_ranges(e.get('open'))}" if e.get("open") else "")
     if t == "todo_anchored":
         td = g.todos.get(e.get("todo"))
         return f"todo \"{td.title[:60] if td else e.get('todo')}\" is in checkpoint {e.get('checkpoint')}"

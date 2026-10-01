@@ -194,23 +194,6 @@ def test_reviewer_returns_what_is_missing_then_accepts(tmp_path):
                                                             "checkpoint_labeled", "compacted"}
 
 
-def test_reviewer_side_effects_hold_the_submit_once_then_an_unchanged_submit_is_accepted(tmp_path):
-    h = Harness(tmp_path, BelayConfig(labeler=False))
-    review = say("Looking at {the diff}:\n" + json.dumps({"requirements": [
-        {"id": "R3", "implemented": "yes", "side_effects": ["mul() is now defined after sub()"]}]}))
-    llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(ADD_SUB), call(SUBMIT), call(SUBMIT)])
-    run = h.make(llm, aux=ScriptedLLM([review]))
-    res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
-    held = next(o for o in results(llm) if "held once" in o)
-    assert "mul() is now defined after sub()" in held and "call submit again" in held
-    g = run.rt.graph
-    assert [(s.status, len(s.notes)) for s in g.submits.values()] == [("returned", 1), ("accepted", 0)]
-    assert g.requirements["R3"].review == "yes" and g.requirements["R3"].review_reopens == 0
-    assert "Reviewer notes on unrequested behavior changes" in (h.run_dir() / "ledger.md").read_text()
-    h.verify_log(run)
-
-
 def test_a_review_without_json_is_retried_alone_then_recorded_as_not_reviewed(tmp_path):
     h = Harness(tmp_path, BelayConfig(labeler=False))
     llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(ADD_SUB), call(SUBMIT)])

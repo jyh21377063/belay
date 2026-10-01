@@ -239,7 +239,7 @@ def _requirement_reopened(g: Graph, e: Event) -> Graph:
     _running(g)
     r = _req(g, e.get("requirement"))
     _need(r.status in (REQ_VERIFIED, REQ_SUBMITTED, REQ_BLOCKED), f"cannot reopen {r.id} in status {r.status}")
-    by_review = e.get("reason") in ("review_missing", "review_reading")
+    by_review = e.get("reason") in ("review_missing", "review_reading", "review_workaround")
     r2 = replace(r, status=REQ_OPEN, reopen_count=r.reopen_count + 1, reopen_reason=e.get("reason"),
                  last_failure=tuple(e.get("failures") or ()), checkpoint=None, status_seq=e.seq, submit=None,
                  blocked_kind=None, blocked_reason=None, blocked_quote=None,
@@ -354,7 +354,6 @@ def _submit_updated(g: Graph, e: Event) -> Graph:
     failing = {str(k): list(v)[:20] for k, v in dict(e.get("failing") or {}).items()}
     s2 = replace(s, status=st, reason=str(e.get("reason") or s.reason),
                  failing=failing or s.failing, open=tuple(e.get("open") or s.open),
-                 notes=tuple(dict(n) for n in (e.get("notes") or ())) or s.notes,
                  accepted_seq=e.seq if st == SUB_ACCEPTED else s.accepted_seq)
     g = _set_sub(g, s2)
     for rid, fails in failing.items():               # 证据失败：需求仍是 open，记下没过的检查

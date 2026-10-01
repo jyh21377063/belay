@@ -39,6 +39,7 @@ from belay.core.verify import (PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED
                                running_covers, suite_layout, test_files_of, units)
 
 BLOCK_KINDS = ("insufficient_info", "environment", "check_conflict")
+REVIEWED_BLOCK_KINDS = ("insufficient_info", "environment")     # 复查者会追问的受阻：有没有合理读法 / 能不能在仓库里做到
 TRIGGER_KIND = {"auto": KIND_AUTO, "todo": KIND_TODO, "submit": KIND_SUBMIT, "handoff": KIND_HANDOFF,
                 "session_end": KIND_HANDOFF, "deadline": KIND_FINAL, "final": KIND_FINAL}
 HANDOFF_REASONS = ("handoff", "session_end")
@@ -1023,11 +1024,11 @@ def _review_eligible(g: Graph, cfg: BelayConfig, rid: str, phase: str) -> bool:
         return False
     if phase == "done":
         return r.status == REQ_SUBMITTED
-    return r.status == REQ_BLOCKED and r.blocked_kind == "insufficient_info"
+    return r.status == REQ_BLOCKED and r.blocked_kind in REVIEWED_BLOCK_KINDS
 
 
 def _start_reviews(tx: Tx, sid: Optional[str]) -> int:
-    """还没复查过的已提交需求、以 insufficient_info 受阻的需求：分批复查（每批 review_batch 条）。"""
+    """还没复查过的已提交需求、以 insufficient_info / environment 受阻的需求：分批复查（每批 review_batch 条）。"""
     g, cfg = tx.g, tx.cfg
     s = g.submits.get(sid) if sid else None
     n = 0
@@ -1042,25 +1043,8 @@ def _start_reviews(tx: Tx, sid: Optional[str]) -> int:
     return n
 
 
-def submit_notes(g: Graph, sid: str) -> list[dict]:
-    """这次 submit 的复查里，复查者列出的"需求没要求、但改动改变了的原有行为"（llm，只作提示）。"""
-    out = []
-    for v in sorted(g.reviews.values(), key=lambda x: x.seq):
-        if v.submit != sid or v.phase != "done" or v.status != "recorded":
-            continue
-        for rid in v.requirements:
-            res = v.results.get(rid) or {}
-            r = g.requirements.get(rid)
-            if res.get("implemented") == "yes" and r is not None and r.status == REQ_SUBMITTED:
-                for x in res.get("side_effects") or ():
-                    out.append({"requirement": rid, "note": str(x)[:300]})
-    return out[:15]
-
-
 def finish_submit(tx: Tx, sid: str) -> None:
-    """复查都结束了：还有没完成的 actionable 需求 → 交还清单（returned）；没有 → 接受（运行可以收尾）。
-    复查者列出了需求没要求的原有行为改动 → 软退回一次：需求不重开，worker 看过之后自己决定改不改，原样再交就接受
-    （每条需求只复查一次，所以同一批提示不会再出现）。"""
+    """复查都结束了：还有没完成的 actionable 需求 → 交还清单（returned）；没有 → 接受（运行可以收尾）。"""
     g = tx.g
     s = g.submits.get(sid)
     if s is None or s.status != SUB_REVIEWING:
@@ -1068,14 +1052,7 @@ def finish_submit(tx: Tx, sid: str) -> None:
     if any(v.submit == sid and v.status == "running" for v in g.reviews.values()):
         return
     left = [r.id for r in open_requirements(g)]
-    if left:
-        tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned", open=left)
-        return
-    notes = submit_notes(g, sid) if tx.cfg.review_side_effects and not (g.run.reserve or g.run.finalizing) else []
-    if notes:
-        tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned", open=[], notes=notes)
-        return
-    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="accepted", open=[])
+    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned" if left else "accepted", open=left)
 
 
 def record_review(tx: Tx, vid: str, results: dict) -> None:
@@ -1093,12 +1070,9 @@ def record_review(tx: Tx, vid: str, results: dict) -> None:
             impl = r.get("implemented")
             if impl not in ("yes", "partial", "no"):
                 impl = "failed"
-        side = r.get("side_effects") if v.phase == "done" else None
         clean[rid] = {"implemented": impl, "missing": [str(x)[:300] for x in (r.get("missing") or [])][:20],
                       "evidence": [str(x)[:300] for x in (r.get("evidence") or [])][:20],
-                      "reading": str(r.get("reading") or "")[:1500] or None,
-                      "side_effects": [str(x)[:300] for x in (side if isinstance(side, list) else [])
-                                       if str(x).strip()][:3]}
+                      "reading": str(r.get("reading") or "")[:1500] or None}
     tx.emit("review_recorded", REVIEWER, LLM, review=vid, results=clean)
     if tx.g.run.reserve or tx.g.run.finalizing:
         return                                     # 截止收尾时已经没有时间再做：只进账本
@@ -1114,8 +1088,12 @@ def record_review(tx: Tx, vid: str, results: dict) -> None:
             tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_missing",
                     failures=res["missing"] or [f"review: implemented={res['implemented']}"])
         elif v.phase == "blocked" and res["implemented"] == "reading" and r.status == REQ_BLOCKED:
-            tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_reading",
-                    failures=[f"a reasonable reading: {res['reading']}"[:1500]])
+            if r.blocked_kind == "environment":
+                tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_workaround",
+                        failures=[f"a way to do it in this repository: {res['reading']}"[:1500]])
+            else:
+                tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_reading",
+                        failures=[f"a reasonable reading: {res['reading']}"[:1500]])
     if v.submit is not None:
         finish_submit(tx, v.submit)
 

@@ -33,8 +33,7 @@ and tells you what is still missing.
 
 # Doing the task
 - Read the whole task statement. The requested scope is the deliverable; do not quietly narrow it. When something \
-is ambiguous, make the reading a careful engineer would make and carry on. Where the task does not say how new \
-behavior should interact with existing behavior, keep the existing behavior.
+is ambiguous, make the reading a careful engineer would make and carry on.
 - Understand before you change: read the relevant code, its callers and its tests, and follow the existing \
 conventions, libraries and style.
 - When you have enough information to act, act. Do not keep re-reading what you already know.
@@ -128,19 +127,21 @@ coding agent says it finished them. You can only find problems: you cannot mark 
 requirement, compare its text with the changes (the parts of the diff that look related are shown first; the list \
 of all changed files is given too). Reply with a single JSON object and nothing else:
 {"requirements": [{"id": "R3", "implemented": "yes" | "partial" | "no", "missing": ["what is missing, concretely"], \
-"evidence": ["path:line ..."], "side_effects": ["existing behavior the change alters that the requirement does not \
-ask to change"]}]}
-Answer "yes" when the changes plausibly implement every part of the requirement. In "side_effects" list at most \
-three changes to behavior that existing callers or tests could observe (a different default, precedence, message, \
-type or order) which the requirement text does not ask for; leave it empty when there are none or you are unsure. \
-side_effects are advice to the agent and do not change your "implemented" answer. Answer for every requirement \
+"evidence": ["path:line ..."]}]}
+Answer "yes" when the changes plausibly implement every part of the requirement. Answer for every requirement \
 listed. Keep every string short."""
 
-REVIEW_BLOCKED_SYSTEM = """An autonomous coding agent reported that some requirements of a task cannot be done \
-because the task text does not give enough information. For each, decide whether there is a reasonable reading of \
-the task text that an engineer would act on. Reply with a single JSON object and nothing else:
-{"requirements": [{"id": "R3", "reading": "the reasonable reading, in one or two sentences, or an empty string if \
-there is none"}]}"""
+REVIEW_BLOCKED_SYSTEM = """An autonomous coding agent reported that some requirements of a task cannot be done. \
+Each comes with the agent's reason and a kind:
+- insufficient_info: the task text does not give enough information. Decide whether there is a reasonable reading \
+of the task text that an engineer would act on.
+- environment: something outside the repository (a dependency's version, a compiled extension, no network) is said \
+to prevent it. Decide whether the required behavior can still be achieved by changing this repository's own code \
+(for example by handling the case before or after calling the dependency), without installing or downloading \
+anything.
+Reply with a single JSON object and nothing else:
+{"requirements": [{"id": "R3", "reading": "insufficient_info: the reasonable reading; environment: how to achieve \
+it in this repository. One or two sentences, or an empty string if there is none or you are not confident"}]}"""
 
 LABEL_SYSTEM = """Summarise in one line (at most 25 words) what the agent did in the conversation excerpt below, as \
 a label for a saved state of the code. Output only the line."""

@@ -73,7 +73,7 @@ v7 的四条原则：
 | 需求 | `plan_proposed` / `requirement_frozen` | llm / rule | 需求清单冻结：引文、摘要、`kind`（actionable / context）、`checks` |
 | | `requirement_verified` | rule | 证据检查在链上存档里全部通过 |
 | | `requirement_submitted` / `requirement_blocked` | self_report | 提交时记下（在提交的存档上）；受阻带种类、理由、引文 |
-| | `requirement_reopened` | rule | 复查者说没做完 / 给出了合理读法 / 回退 |
+| | `requirement_reopened` | rule | 复查者说没做完 / 给出了合理读法 / 给出了在仓库里做到的办法 / 回退 |
 | todo | `todos_updated` / `todo_completed` | self_report | todo_write 的镜像（按标题匹配保持 id 稳定，条目文字里的 R 编号顺带关联）；勾掉时带锚点快照 |
 | | `todo_anchored` / `todo_invalidated` | rule | 锚点被链上同段存档包含；回退使锚点不在链上 |
 | 提交 | `submit_requested` | rule | 一次提交：快照、摘要、受阻清单、是否隐式；带存档尝试，或直接落在链头 |
@@ -117,7 +117,8 @@ v6 的 `task_*`、`steps_planned` / `step_*`、`review_requested`、`note` 都�
   已经在回归门里，证明不了任何事；这一条在验证时判断，规划器与基线谁先跑完都没关系。
 - `context` 需求（标题、日期、版本横幅、“代码在 /testbed”、“以下是发布说明”）只为覆盖原文，不进清单、不参与提交与
   DONE；`requirement_frozen` 要求至少一条 actionable。
-- 复查者对 submitted 与 blocked 只能做两件事：yes 只记录；no / partial（或受阻给出了合理读法）重开为 open。
+- 复查者对 submitted 与 blocked 只能做两件事：yes 只记录；no / partial（或受阻给出了合理读法、在仓库里做到的办法）
+  重开为 open。
 
 ### 三个基准
 
@@ -243,25 +244,23 @@ worker 的提交被拒、或提交的存档被降级时，才二分定位）。�
    证据检查全部通过 → verified；在受阻清单里 → blocked；有证据检查但没过 → 仍是 open，没过的检查记进
    `submit.failing` 与 `last_failure`；其余 → submitted（锚在这个存档上）。
 4. 复查（`_start_reviews`）：还没复查过、被复查者重开的次数没到 `review_max_reopens` 的 submitted 需求，以及以
-   insufficient_info 受阻的需求，按 `review_batch` 条一批发起 `review_started`；提交进入 `reviewing`。
-5. 所有批次都有结果后（`finish_submit`）：还有 open 的 actionable 需求 → `returned`（清单交还 worker，带原因）；
-   没有，但复查者列出了需求没要求的原有行为改动（`side_effects`，见下）→ 软退回一次：`returned`、`open=[]`、带
-   `notes`，需求不重开，worker 看过之后自己决定改不改，原样再交就接受（每条需求只复查一次，同一批提示不会再出现）；
-   都没有 → `accepted`，会话结束，运行收尾。之所以不能把提示附在“接受”里：接受之后会话就结束了，worker 看不到。
+   insufficient_info 或 environment 受阻的需求，按 `review_batch` 条一批（默认 1：多条一批在实测里容易整批拿不到
+   结论）发起 `review_started`；提交进入 `reviewing`。
+5. 所有批次都有结果后（`finish_submit`）：还有 open 的 actionable 需求 → `returned`（清单交还 worker，带原因）；没有 →
+   `accepted`，会话结束，运行收尾。
 
 复查者（`driver._eff_review` + `runtime/review.py`）：输入是需求原文 + 按每条需求原文里的名字（反引号里的代码、带下划线
 / 驼峰 / 带点的标识符、文件路径、PR 号）筛出的相关 hunk + 全部改动文件的列表 + 剩余预算内的完整 diff，再加上 worker
 的提交摘要、todo 与交接摘要（都标为自述）。它只能收紧：`no` / `partial` → `requirement_reopened(review_missing)`；受阻的
-需求给出合理读法 → `requirement_reopened(review_reading)`；`yes` 什么都不做。
-复查者还对每条需求列出至多 3 条“改动改变了、需求原文没要求改的、调用方或测试能观察到的原有行为”（`side_effects`：
-默认值、优先级、消息、类型、顺序……），只作提示，不影响 implemented 的判定（`cfg.review_side_effects` 可关）。这是为
-“需求没说清新旧行为怎么共存”这类错准备的：回归门只看得到原有的测试，看不到这种改动；worker 的系统提示里也有一句
-“任务没说新行为与原有行为怎么共存时，保持原有行为”。
+需求：insufficient_info 给出合理读法 → `requirement_reopened(review_reading)`；environment 给出“不装、不下载任何东西，
+只改这个仓库自己的代码也能做到”的办法 → `requirement_reopened(review_workaround)`（实测：worker 把几条依赖新版编译
+扩展的行为一律报成环境受阻，另一次运行在仓库里做到了）；`yes`、空读法什么都不做。两种重开都计入
+`review_max_reopens`，同一条需求最多被追问一次。check_conflict 不追问（它有引文与失败证据）。
 复查的回复按 `requirements` 键从正文里找 JSON（说明文字里有别的花括号也行，不合法的反斜杠转义宽松处理；正文里没有再
 看思考块），拿不到就把回复开头与 stop_reason 写进日志。一批里没拿到结论的条目各自单条重试一次（`retry_of`）；单条
 还失败就记为 `failed`（未复查），不阻塞：复查者只能收紧，它自己出故障不该反过来卡住 worker；未复查的需求在 submit
 结果与账本（`unreviewed`）里单独列出。
-截止收尾时复查结果只进账本（不重开、不重试、不软退回）。账本口径（`render.requirement_category`）：verified / reviewed（自报，复查通过）/
+截止收尾时复查结果只进账本（不重开、不重试）。账本口径（`render.requirement_category`）：verified / reviewed（自报，复查通过）/
 self-reported（复查没跑完或没有复查）/ done-not-delivered / blocked / open。在 SWE-EVO 这类题上，大部分需求会落在
 reviewed：图能提供硬保证的只有“不回归”和“每条需求都被过问过”，需求是不是真做对了，靠的是复查。
 
@@ -349,7 +348,8 @@ crash | stuck | runtime_crash。`next_step`：提交被接受 → 收尾；截�
 
 - 回归门豁免：允许在有引文和失败证据时豁免具体的测试，代价是门不再完全由基线决定，所以每条豁免都进账本。
 - 提交被接受后已经复查通过的需求，之后的提交不再复查（只复查新提交的、还没复查过的）。
-- 复查者的 `side_effects` 现在只是提示（软退回一次），不强制；看评测结果再决定要不要变成重开。
+- 试过让复查者列出“需求没要求的原有行为改动”并软退回一次（v7.2）：在发布说明类题上它把需求本身的效果也当成副作用，
+  worker 照着改，只添乱，已撤掉。系统提示里“保持原有行为”那句同样没有效果，也撤掉了。
 - 后台被拒的回归只在连续两次出现时才追查；改成一次就追查会把大量中间态送去定位，太吵。
 - `rollback` 不再是工具；规则保留给恢复流程（容器重建后链上的存档丢了）。worker 用 `revert_change` 撤销定位出的改动。
 - 规划器只产出需求清单（没有任务、依赖、优先级、拆分）；停滞时只给提示，不再重新规划。
@@ -362,9 +362,9 @@ crash | stuck | runtime_crash。`next_step`：提交被接受 → 收尾；截�
 | 要求 | 测试 |
 | --- | --- |
 | 事件、推导、非法转换 | `tests/unit/test_reduce.py` |
-| 规则：后台验证最新快照、新快照胜出、需求随检查项验证、提交（判定、证据失败、受阻、复查批次与上限、单条重试、软退回、截止）、todo 与锚点、提升 / 降级 / 交付一致性、二分、追查提交与后台持续回归、回归门豁免、停滞、DONE 的条件 | `tests/unit/test_rules.py` |
+| 规则：后台验证最新快照、新快照胜出、需求随检查项验证、提交（判定、证据失败、受阻、复查批次与上限、单条重试、环境受阻追问、截止）、todo 与锚点、提升 / 降级 / 交付一致性、二分、追查提交与后台持续回归、回归门豁免、停滞、DONE 的条件 | `tests/unit/test_rules.py` |
 | 重放一致性（提交、复查、todo、后台验证、定位、诊断、回退、抢占……随机驱动 40 个种子） | `tests/unit/test_replay.py` |
 | 分层开场：段顺序、前缀稳定、重开原因、300 需求 / 100 会话仍在预算内、board 过滤 | `tests/unit/test_context.py` |
 | 外壳辅助：traceback 截取、sys.path 映射、L1 保留读取、读盘重放、离开期间上限 | `tests/unit/test_runtime_helpers.py` |
-| 端到端：提交被接受、复查交还清单、复查提示软退回、复查失败单条重试、追问后隐式提交、回归被拒、交接、内存重试 / 读盘重放、截止交付 | `tests/integration/test_belay_run.py` |
+| 端到端：提交被接受、复查交还清单、复查失败单条重试、追问后隐式提交、回归被拒、交接、内存重试 / 读盘重放、截止交付 | `tests/integration/test_belay_run.py` |
 | 长程：导入隔离、降级、验证与编辑并发、抢占、被拒信息与撤销、重新接上作业、从 bundle 重建、todo 停顿点交接、中途被杀、诊断者与复查者 | `tests/integration/test_long_run.py` |

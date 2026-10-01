@@ -187,7 +187,7 @@ def test_new_snapshot_wins_between_background_and_submit(order):
 # ======================================================================== 提交：判定需求、复查收紧、接受或交还清单
 
 def test_submit_classifies_requirements_reviews_and_returns_the_list():
-    s = sim(cfg=fg())
+    s = sim(cfg=fg(review_batch=5))
     s.world.define("t1", {ADD: "PASSED"})
     sid = s.submit("t1", summary="fixed add, mul and docs")
     g = s.g
@@ -215,48 +215,6 @@ def test_submit_classifies_requirements_reviews_and_returns_the_list():
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")
     assert not llm_effects(s.log)
     s.check_log()
-
-
-def test_reviewer_side_effects_hold_the_submit_once_and_the_worker_decides():
-    s = sim(cfg=fg())
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    s.review("V1", {"R2": {"implemented": "yes", "side_effects": ["mul() now rounds results, which callers see"]},
-                    "R3": {"implemented": "yes", "side_effects": []}})
-    g = s.g
-    sub = g.submits[sid]
-    assert sub.status == "returned" and sub.open == () and len(sub.notes) == 1
-    assert reqs(s) == {"R1": REQ_VERIFIED, "R2": REQ_SUBMITTED, "R3": REQ_SUBMITTED}   # 需求不重开：只是提示
-    text = render_submit(g, sid)
-    assert "held once" in text and "mul() now rounds" in text and "call submit again" in text
-    assert "held once" in render_board(g, "w1", s.now, s.cfg)
-    assert R.next_step(g, "w1", s.now, s.cfg) == ("resume_session", "S1")      # 会话不结束：worker 自己决定
-    assert "mul() now rounds" in ledger_markdown(g)
-    sid2 = s.submit("t1")                                                # 原样再交：不再复查，接受
-    assert s.g.submits[sid2].status == "accepted" and s.running_reviews() == []
-    s.check_log()
-    # 开关关掉：复查者报了也不扣
-    s = sim(cfg=fg(review_side_effects=False))
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    s.review("V1", {"R2": {"implemented": "yes", "side_effects": ["x"]}, "R3": {"implemented": "yes"}})
-    assert s.g.submits[sid].status == "accepted"
-    # 需求没做完时照常交还清单；被重开的需求上的提示不算
-    s = sim(cfg=fg())
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    s.review("V1", {"R2": {"implemented": "no", "side_effects": ["x"]}, "R3": {"implemented": "yes"}})
-    sub = s.g.submits[sid]
-    assert sub.status == "returned" and sub.open == ("R2",) and sub.notes == ()
-    assert R.submit_notes(s.g, sid) == []
-    # 截止预留里不扣：没时间再改
-    s = sim(cfg=fg())
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    s.advance(5400)
-    s.do(R.tick)
-    s.review("V1", {"R2": {"implemented": "yes", "side_effects": ["x"]}, "R3": {"implemented": "yes"}})
-    assert s.g.submits[sid].notes == () and R.submit_notes(s.g, sid)       # 只进账本（截止时由收尾接手）
 
 
 def test_submit_regression_is_rejected_with_reasons_locate_and_diagnosis():
@@ -390,8 +348,48 @@ def test_review_batches_blocked_reading_and_reviewer_off():
     assert s.g.submits[sid].status == "accepted" and not s.g.reviews
 
 
-def test_reviewer_failure_does_not_reopen_and_deadline_only_records():
+def test_environment_blocks_are_questioned_once():
     s = sim(cfg=fg())
+    s.world.define("t1", {ADD: "PASSED"})
+    env = [{"requirement": "R3", "kind": "environment", "reason": "the docs tool is not installed"}]
+    sid = s.submit("t1", blocked=env)
+    g = s.g
+    assert [(v.phase, v.requirements) for v in g.reviews.values()] == [("done", ("R2",)), ("blocked", ("R3",))]
+    s.review("V1", {"R2": {"implemented": "yes"}})
+    s.review("V2", {"R3": {"reading": "write the docstring by hand in pkg/mod.py"}})
+    g = s.g
+    r3 = g.requirements["R3"]
+    assert r3.status == REQ_OPEN and r3.reopen_reason == "review_workaround" and r3.review_reopens == 1
+    text = render_submit(g, sid)
+    assert g.submits[sid].status == "returned" and "a way to do it in this repository" in text
+    assert "write the docstring by hand" in text
+    sid2 = s.submit("t1", blocked=env)                                   # 再次受阻：不再追问（上限 1 次）
+    assert s.g.submits[sid2].status == "accepted" and s.g.requirements["R3"].status == REQ_BLOCKED
+    s.check_log()
+    # 复查者没有把握（空读法）：受阻照常成立；check_conflict 不追问
+    s = sim(cfg=fg())
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1", blocked=env + [{"requirement": "R2", "kind": "check_conflict", "reason": "old test",
+                                         "quote": "make mul handle negative numbers correctly"}])
+    assert [v.requirements for v in s.g.reviews.values()] == [("R3",)]
+    s.review("V1", {"R3": {"reading": ""}})
+    assert s.g.submits[sid].status == "accepted" and s.g.requirements["R3"].status == REQ_BLOCKED
+
+
+def test_reviews_are_one_requirement_per_call_by_default():
+    s = sim(cfg=fg())
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    assert [s.g.reviews[v].requirements for v in s.running_reviews()] == [("R2",), ("R3",)]
+    s.review("V1", {"R2": {"implemented": "yes"}})
+    assert s.g.submits[sid].status == "reviewing"                       # 等所有批次
+    s.review("V2", {"R3": {"implemented": "yes"}})
+    assert s.g.submits[sid].status == "accepted"
+    s.check_log()
+
+
+def test_reviewer_failure_does_not_reopen_and_deadline_only_records():
+    s = sim(cfg=fg(review_batch=5))
     s.world.define("t1", {ADD: "PASSED"})
     sid = s.submit("t1")
     s.review("V1", {})                                                   # 复查者失败：什么都不重开，各自单条重试一次
@@ -731,7 +729,7 @@ def test_stall_hint_and_repeated_rejected_submits():
 
 
 def test_session_end_is_not_run_end_and_submits_decide():
-    s = sim(cfg=fg(), auto_jobs=False)
+    s = sim(cfg=fg(review_batch=5), auto_jobs=False)
     s.do(R.end_session, "w1", "done")
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("start_session", "restart")
     s.do(R.start_session, "w1", "restart", {})

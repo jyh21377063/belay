@@ -119,7 +119,6 @@ class Submit:
     reason: str = ""                         # 被拒的原因
     failing: dict = field(default_factory=dict)   # 需求 → 没过的检查（证据失败）
     open: tuple[str, ...] = ()               # rule：判定结束时仍未完成的 actionable 需求
-    notes: tuple[dict, ...] = ()             # llm：复查者看到的、需求没要求的原有行为改动（只提示，软退回一次）
     accepted_seq: Optional[int] = None
 
 
@@ -133,7 +132,7 @@ class Review:
     submit: Optional[str]
     seq: int
     status: str = "running"                  # running | recorded
-    results: dict = field(default_factory=dict)   # llm：需求 → {implemented, missing, evidence, reading, side_effects}
+    results: dict = field(default_factory=dict)   # llm：需求 → {implemented, missing, evidence, reading}
     retry_of: Optional[str] = None           # rule：失败条目单条重试时，原来那批复查的 id
 
 

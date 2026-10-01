@@ -1124,7 +1124,8 @@ class BelayRun:
             reqs = [g.requirements[r] for r in v.requirements]
             if v.phase == "blocked":
                 body = (f"<task_statement>\n{g.run.task.strip()[:8000]}\n</task_statement>\n\n" + "\n".join(
-                    f"- {r.id}: \"{r.quote}\"\n  the agent's reason: {r.blocked_reason}" for r in reqs))
+                    f"- {r.id} (kind: {r.blocked_kind}): \"{r.quote}\"\n  the agent's reason: {r.blocked_reason}"
+                    for r in reqs))
                 resp = await self.aux_llm.call(REVIEW_BLOCKED_SYSTEM, [], [{"role": "user", "content": body}])
             else:
                 cp = g.checkpoints.get(v.checkpoint) if v.checkpoint is not None else g.head_cp
