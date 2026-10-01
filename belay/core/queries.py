@@ -407,9 +407,9 @@ def latest_handoff_summary(g: Graph, worker: str) -> Optional[str]:
 
 
 def open_persistent(g: Graph, test: str) -> bool:
-    """持续性回归还没解决：之后没有任何一张同段快照上它通过。"""
+    """持续性回归还没解决：之后没有任何一张同段快照上它通过（被豁免的检查不再算）。"""
     rec = g.persistent.get(test)
-    if rec is None or rec.epoch != g.epoch:
+    if rec is None or rec.epoch != g.epoch or test in g.waived:
         return False
     index = jobs_by_tree(g)
     seen: set[str] = set()

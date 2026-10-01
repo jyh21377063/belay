@@ -30,9 +30,9 @@ from belay.core.reduce import apply
 from belay.core.suggest import suggestion_rank
 from belay.core.verify import (PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED, check_unit,
                                classify_baseline, failure_signature, finished_covers, full_verified, jobs_by_tree,
-                               guard_in_selection, guard_set, is_cmd, is_test_path, job_key, point_status,
-                               regression_ids, regressions, related_units, results_for_tree, running_covers,
-                               test_files_of, units)
+                               active_guard, guard_in_selection, guard_set, is_cmd, is_test_path, job_key,
+                               point_status, regression_ids, regressions, related_units, results_for_tree,
+                               running_covers, suite_layout, test_files_of, units)
 
 BLOCK_KINDS = ("insufficient_info", "environment", "check_conflict")
 TRIGGER_KIND = {"worker": KIND_MILESTONE, "review": KIND_REVIEW, "auto": KIND_AUTO, "step": KIND_STEP,
@@ -305,6 +305,59 @@ def report_blocked(tx: Tx, worker: str, task_id: str, kind: str, reason: str, qu
             quote=normalize_ws(quote)[:1000] if quote else None)
 
 
+def _observed_failing(g: Graph, test: str) -> bool:
+    """这个检查在 worker 的某个候选树上失败过：只看非 live 的作业（候选树已剔除测试改动，worker 改不了测试本身）。"""
+    base = g.checkpoints[0].tree if 0 in g.checkpoints else None
+    index = jobs_by_tree(g)
+    return any(tree != base and point_status(g, tree, test, index) == PT_FAIL for tree in index)
+
+
+def waive_checks(tx: Tx, worker: str, task_id: str, tests: Iterable[str], quote: str, reason: str) -> list[str]:
+    """worker 声明一些现有测试与任务原文明确要求的行为冲突：规则校验后把它们从回归门里去掉（check_waived）。
+
+    校验：worker 持有这个任务；引文逐字出现在任务原文里（至少三个词）；每个检查都在守护集合里、不是公开检查
+    （cmd:），并且确实在 worker 的某个候选树上失败过（不能预先豁免）；总数不超过 waive_max_tests。
+    豁免只改变门检查什么，不改变任务的检查项；每一条都写进账本。返回新豁免的检查。"""
+    g, cfg = tx.g, tx.cfg
+    if not cfg.waivers:
+        raise Rejected("Waivers are disabled for this run: keep the existing behaviour, or report the conflict with "
+                       "report_blocked(kind=\"check_conflict\").")
+    _held_active(g, worker, task_id)
+    if not g.baseline_ready:
+        raise Rejected("The harness is still setting up; try again shortly.")
+    if not (reason or "").strip():
+        raise Rejected("Give a reason: what the task asks for and how the test contradicts it.")
+    q = normalize_ws(quote or "")
+    if len(q.split()) < 3 or not quote_in_text(q, g.run.task):
+        raise Rejected("quote must be at least three words copied verbatim from the task text that ask for the new "
+                       "behaviour.")
+    tests = list(dict.fromkeys(str(t).strip() for t in tests if str(t).strip()))
+    if not tests:
+        raise Rejected("Name the checks to waive (tests=[...], full node ids as the gate reports them).")
+    guard = guard_set(g.baseline)
+    problems = []
+    for t in tests:
+        if is_cmd(t):
+            problems.append(f"{t}: public checks cannot be waived")
+        elif t in g.waived:
+            problems.append(f"{t}: already waived")
+        elif t not in guard:
+            problems.append(f"{t}: not in the regression gate")
+        elif not _observed_failing(g, t):
+            problems.append(f"{t}: the harness has not seen it fail on your changes; checkpoint first, or run "
+                            "run_check(as_gate=true)")
+    if problems:
+        raise Rejected("Nothing was waived:\n" + "\n".join(f"- {p}" for p in problems[:20]))
+    if len(g.waived) + len(tests) > cfg.waive_max_tests:
+        raise Rejected(f"At most {cfg.waive_max_tests} checks can be waived in a run ({len(g.waived)} already are). "
+                       "If this many existing tests contradict the task, the change is probably broader than the "
+                       "task asks for.")
+    tx.emit("check_waived", worker_actor(worker), RULE, task=task_id, tests=tests, quote=q[:1000],
+            reason=reason.strip()[:2000])
+    _cascade(tx)
+    return tests
+
+
 # ======================================================================== 步骤（模块 H）
 
 _TODO_STATUS = {"pending": STEP_PLANNED, "in_progress": STEP_ACTIVE}
@@ -529,7 +582,7 @@ def _selection(g: Graph, cfg: BelayConfig, tier: str, files: Iterable[str], extr
         sel, _why = related_units(files, test_files_of(g.baseline), g.relations)
         if sel is None:
             return "full", None
-        cmd_guard = [c for c in guard_set(g.baseline) if is_cmd(c)]      # 公开检查通常便宜：总是带上
+        cmd_guard = [c for c in active_guard(g) if is_cmd(c)]           # 公开检查通常便宜：总是带上
         return "related", tuple(sorted(set(sel) | set(units(extra_checks)) | set(cmd_guard)))
     return "full", None
 
@@ -607,7 +660,7 @@ def advance_attempt(tx: Tx, aid: str) -> None:
         if not busy:
             ensure_job(tx, a.tree, a.selection, "verify", attempt=aid)
         return
-    expected = guard_in_selection(guard_set(g.baseline), a.selection)
+    expected = guard_in_selection(active_guard(g), a.selection)
     regs_raw = regressions(expected, _raw_results(g, a.tree))
     if regs_raw and cfg.confirm_regressions:
         cu = list(units(regression_ids(regs_raw)))
@@ -746,7 +799,7 @@ def evaluate_promotion(tx: Tx, cid: int) -> None:
     cp = g.checkpoints.get(cid)
     if cp is None or cp.level != PROVISIONAL or cp.demoted or cp.abandoned or not full_verified(g, cp.tree):
         return
-    guard = guard_set(g.baseline)
+    guard = active_guard(g)
     regs_raw = regressions(sorted(guard), _raw_results(g, cp.tree))
     if regs_raw and cfg.confirm_regressions:
         cu = list(units(regression_ids(regs_raw)))
@@ -943,7 +996,7 @@ def record_located(tx: Tx, lid: str, group: int, files: Iterable, diff: Optional
             attribution=grp.get("attribution") or {})
     if loc.trigger == "demoted" and grp["exact"]:
         pairs = sorted({(f[0], check_unit(t)) for f in files for t in grp["tests"]
-                        if not is_test_path(f[0]) and not is_cmd(t)})
+                        if not is_test_path(f[0], suite_layout(tx.g)) and not is_cmd(t)})
         pairs = [p for p in pairs if p not in tx.g.relations]
         if pairs:
             tx.emit("relation_learned", RUNTIME, RULE, pairs=[list(p) for p in pairs][:100], locate=lid)

@@ -33,7 +33,8 @@ from belay.core.queries import (active_step, declared_steps, delivery_checkpoint
                                 task_files)
 from belay.core.render import ledger, ledger_markdown
 from belay.core.rules import Rejected, SnapObs
-from belay.core.verify import guard_set, is_test_path, job_priority, reasons_for_tree, test_files_of, units
+from belay.core.verify import (guard_set, is_test_path, job_priority, reasons_for_tree, suite_layout, test_files_of,
+                               units)
 from belay.env import Env
 from belay.llm import Usage
 from belay.runtime import planner as P
@@ -475,7 +476,8 @@ class BelayRun:
                            testable=last.testable, commit=last.commit, precheck=last.precheck, tool_seq=self.tool_seq)
         base, head = g.checkpoints[0].tree, g.head_cp.tree
         if self.cfg.protect_tests and guard_set(g.baseline):
-            tree, dropped = await self.repo.strip_tests(base, raw)
+            layout = suite_layout(g)
+            tree, dropped = await self.repo.strip_tests(base, raw, lambda p: is_test_path(p, layout))
         else:
             tree, dropped = raw, []
         files = await self.repo.numstat(head, tree) if tree != head else []
@@ -1055,7 +1057,8 @@ class BelayRun:
         for i, grp in enumerate(loc.groups):
             a, b = grp["good"]["tree"], grp["bad"]["tree"]
             try:
-                files = [f for f in await self.repo.numstat(a, b) if not is_test_path(f[0])]
+                layout = suite_layout(g)
+                files = [f for f in await self.repo.numstat(a, b) if not is_test_path(f[0], layout)]
                 diff = await self.repo.diff(a, b)
                 path = self.store.put_blob(diff, ".diff") if diff.strip() else None
             except Exception as e:

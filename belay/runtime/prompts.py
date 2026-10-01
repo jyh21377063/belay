@@ -35,7 +35,8 @@ work in progress is allowed to break tests. Your work becomes a checkpoint (veri
 original code fails, errors, is skipped or goes missing) when you finish a step (`step_done`, verified in the \
 background), call `checkpoint` (verified right away and labelled) or `ready_for_review`, and once more at the end. \
 So finish steps when a coherent piece of work is complete. Changes under test paths are never delivered: the \
-existing tests are the acceptance baseline.
+existing tests are the acceptance baseline. When the task text explicitly asks for behaviour that an existing test \
+contradicts, `waive_check` (quoting that task text) takes the test out of the gate; every waiver is reported.
 - A task counts as done only when the harness observes its checks passing on a checkpoint; a task without checks \
 becomes done_unverified and may be reviewed and reopened. Your own statements are recorded as notes, not as \
 evidence.

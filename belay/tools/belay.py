@@ -107,6 +107,14 @@ async def report_blocked(inp: dict, ctx: ToolContext) -> str:
                                        reason=str(inp.get("reason") or ""), quote=inp.get("quote")))
 
 
+async def waive_check(inp: dict, ctx: ToolContext) -> str:
+    tests = _list(inp.get("tests"), "tests")
+    if not tests:
+        raise ToolError("tests is required")
+    return _out(await _rt(ctx).request("waive_check", task=_task(inp), tests=tests, quote=str(inp.get("quote") or ""),
+                                       reason=str(inp.get("reason") or "")))
+
+
 async def run_check(inp: dict, ctx: ToolContext) -> str:
     return _out(await _rt(ctx).request("run_check", tests=_list(inp.get("tests"), "tests"), full=bool(inp.get("full")),
                                        as_gate=bool(inp.get("as_gate"))))
@@ -189,14 +197,27 @@ TOOLS = [
          "Report that a task cannot be finished, instead of working around it.\n"
          "- insufficient_info: the task text does not give enough information.\n"
          "- environment: the environment prevents it (missing service, permissions, network).\n"
-         "- check_conflict: an existing test that passed on the original code contradicts what the task text "
-         "explicitly asks for. Quote the task text verbatim in quote. The conflict is recorded and reported; the "
-         "regression gate does not change, so leave that behaviour intact in your checkpoints.\n"
+         "- check_conflict: the task text explicitly asks for something that existing tests contradict and you "
+         "cannot do the task at all (for specific gate tests that fail on your change, use waive_check instead "
+         "and keep working). Quote the task text verbatim in quote.\n"
          "The task is set aside and listed honestly in the final report; you can work on other tasks.",
          {"type": "object", "properties": {
              "task": _TASK, "kind": {"type": "string", "enum": ["insufficient_info", "environment", "check_conflict"]},
              "reason": {"type": "string"}, "quote": {"type": "string", "description": "Verbatim task text"}},
           "required": ["task", "kind", "reason"]}, report_blocked),
+    Tool("waive_check",
+         "Take existing tests out of the regression gate because the task text explicitly asks for behaviour they "
+         "contradict (for example the task changes a default value or an error message that an old test asserts). "
+         "Use it only after the harness has seen these tests fail on your changes (a rejected checkpoint, or "
+         "run_check with as_gate=true), and only for that reason: never to get past a failure you caused by "
+         "mistake. quote must be copied verbatim from the task text; reason says how each test contradicts it. "
+         "Every waiver is listed in the final report. Then checkpoint again.",
+         {"type": "object", "properties": {
+             "task": _TASK, "tests": {"type": "array", "items": {"type": "string"},
+                                      "description": "Full test ids as the gate reports them"},
+             "quote": {"type": "string", "description": "Verbatim task text that asks for the new behaviour"},
+             "reason": {"type": "string"}},
+          "required": ["task", "tests", "quote", "reason"]}, waive_check),
     Tool("run_check",
          "Start a check as a background job run by the harness and return at once with a job id (or the cached "
          "result if the same tree was already checked). With no arguments it runs the tests related to your "

@@ -9,6 +9,7 @@ import hashlib
 import json
 import posixpath
 import re
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from belay.core.model import JOB_FINISHED, JOB_RUNNING, LANE_FG, WHERE_LIVE, Graph, Job
@@ -27,8 +28,55 @@ _DOC_EXT = (".md", ".rst", ".txt", ".adoc")
 _GENERIC_STEMS = {"__init__", "utils", "util", "core", "base", "common", "helpers", "compat", "types", "main"}
 
 
-def is_test_path(path: str) -> bool:
-    return bool(TEST_PATH.search(path))
+# 文件名本身就表明是测试的文件：在任何目录下都算
+_TEST_FILE = re.compile(r"(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$")
+_TEST_DIR_NAMES = frozenset({"test", "tests", "testing", "__tests__"})
+
+
+@dataclass(frozen=True)
+class SuiteLayout:
+    """从基线实际收集到的测试推出的测试布局（测试 id 相对于工作区，与 runner 的 select 相同）。
+
+    files  收集到的测试文件；roots  测试目录：每个测试文件路径上最近的、名字像测试目录（test / tests / testing /
+    __tests__）的那一级。名字像测试目录、但下面没有直接属于它的测试文件的目录是源码：例如 django/test/、
+    numpy/testing/（它的测试在 numpy/testing/tests/ 里）。"""
+    files: frozenset[str]
+    roots: tuple[str, ...]
+
+    def contains(self, path: str) -> bool:
+        return bool(_TEST_FILE.search(path)) or path in self.files or \
+            any(path.startswith(r + "/") for r in self.roots)
+
+
+def suite_layout_of(test_files: Iterable[str]) -> Optional[SuiteLayout]:
+    files = frozenset(f for f in test_files if f and not is_cmd(f))
+    if not files:
+        return None
+    roots = set()
+    for f in files:
+        parts = f.split("/")[:-1]
+        for i in range(len(parts) - 1, -1, -1):
+            if parts[i] in _TEST_DIR_NAMES:
+                roots.add("/".join(parts[:i + 1]))
+                break
+    return SuiteLayout(files, tuple(sorted(roots)))
+
+
+_LAYOUT_CACHE: list = [None, None]              # [基线 dict, 布局]：基线在一次运行里只记录一次
+
+
+def suite_layout(g: Graph) -> Optional[SuiteLayout]:
+    """图上的测试布局；基线还没有结果时为 None（调用方退回按名字判断）。"""
+    if _LAYOUT_CACHE[0] is not g.baseline:
+        _LAYOUT_CACHE[:] = [g.baseline, suite_layout_of(test_files_of(g.baseline))]
+    return _LAYOUT_CACHE[1]
+
+
+def is_test_path(path: str, layout: Optional[SuiteLayout] = None) -> bool:
+    """测试路径下的改动会从候选里剔除，也不会交付。有布局时按实际收集到的测试判断，否则按名字（TEST_PATH）。"""
+    if layout is None:
+        return bool(TEST_PATH.search(path))
+    return layout.contains(path)
 
 
 def is_cmd(check: str) -> bool:
@@ -78,6 +126,12 @@ def guard_set(baseline: dict[str, str]) -> frozenset[str]:
     return frozenset(t for t, c in baseline.items() if c == B_PASS)
 
 
+def active_guard(g: Graph) -> frozenset[str]:
+    """回归门实际检查的集合：守护集合去掉被豁免的检查（check_waived）。"""
+    guard = guard_set(g.baseline)
+    return guard - frozenset(g.waived) if g.waived else guard
+
+
 def guard_in_selection(guard: Iterable[str], selection: Optional[tuple[str, ...]]) -> list[str]:
     if selection is None:
         return sorted(guard)
@@ -125,19 +179,20 @@ def related_units(changed: Iterable[str], test_files: Iterable[str],
     """按文件路径的通用规则选相关测试文件。
 
     返回 (选择, 理由)：选择为 None 表示应当跑全量。规则：
-      - 文档类文件（.md/.rst/.txt）不影响测试；测试路径下的改动会被剔除，也不参与选择；
+      - 文档类文件（.md/.rst/.txt）不影响测试；测试路径（按 test_files 推出的布局判断）下的改动会被剔除，也不参与选择；
       - 非 Python 源文件、全局配置（conftest、setup、pyproject、__init__ 等）→ 全量；
       - Python 源文件：测试文件名的词里含有源文件名 → 相关；否则同目录 / 镜像目录下的测试 → 相关；
       - 学到的相关性（relation_learned：定位出的“源文件 → 测试文件”）一律加入；
       - 任何一个源文件找不到相关测试 → 全量。
     """
     tests = sorted(set(test_files))
+    layout = suite_layout_of(tests)
     learned: dict[str, set[str]] = {}
     for src, tf in relations:
         learned.setdefault(src, set()).add(tf)
     chosen: set[str] = set()
     for path in changed:
-        if is_test_path(path) or path.endswith(_DOC_EXT):
+        if is_test_path(path, layout) or path.endswith(_DOC_EXT):
             continue
         base = posixpath.basename(path)
         extra = learned.get(path, set()) & set(tests)
@@ -207,7 +262,7 @@ def full_verified(g: Graph, tree: str) -> bool:
 
 def tree_regressions(g: Graph, tree: str) -> tuple[str, ...]:
     """全量结果上的回归（需要这棵树已有全量作业）。"""
-    return regressions(guard_set(g.baseline), results_for_tree(g, tree))
+    return regressions(active_guard(g), results_for_tree(g, tree))
 
 
 def checkpoint_full_ok(g: Graph, cid: Optional[int]) -> bool:

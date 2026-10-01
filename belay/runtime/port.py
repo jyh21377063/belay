@@ -134,6 +134,11 @@ class WorkerPort:
         return (f"{task} is recorded as blocked ({kind}). It will be listed in the final report. You can work on "
                 "other tasks.")
 
+    async def _r_waive_check(self, task: str, tests: list, quote: str, reason: str) -> str:
+        waived = await self._submit(R.waive_checks, self.w, task, tests, quote, reason)
+        return (f"Waived {len(waived)} check(s) from the regression gate: {', '.join(waived[:10])}. They are listed "
+                "in the final report. Checkpoint again (checkpoint or ready_for_review) to save your change.")
+
     async def _wait_attempt(self, aid: str) -> None:
         await self.run.rt.wait_until(lambda g: g.attempts[aid].status not in (ATT_PENDING, ATT_ADVANCING))
 

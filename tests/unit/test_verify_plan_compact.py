@@ -6,7 +6,7 @@ import copy
 from belay.core.compact import CLEARED_PREFIX, count_results, l0_shrink, l1_clear, l2_rebuild, safe_cut
 from belay.core.plan import mechanical_plan, renumber, uncovered_units, validate_plan, validate_split
 from belay.core.verify import (classify_baseline, failure_signature, guard_set, is_test_path, regressions,
-                               related_units)
+                               related_units, suite_layout_of)
 from belay.runtime.planner import extract_json
 
 # ======================================================================== verify
@@ -59,6 +59,23 @@ def _plan(**over):
                    {"id": "y", "title": "sub+dep", "links": ["B", "C"], "blocked_by": ["x"]}]}
     p.update(over)
     return p
+
+
+def test_suite_layout_keeps_source_packages_named_like_test_dirs():
+    """测试目录按基线实际收集到的测试判断：django/test/、numpy/testing/ 是源码，改动要交付。"""
+    files = ["tests/admin_views/tests.py", "tests/test_sqlite.py", "numpy/testing/tests/test_utils.py",
+             "pkg/test_core.py"]
+    layout = suite_layout_of(files)
+    assert layout.roots == ("numpy/testing/tests", "tests")
+    for p in ("django/test/utils.py", "django/test/testcases.py", "numpy/testing/_private/utils.py", "pkg/core.py"):
+        assert not is_test_path(p, layout), p
+    for p in ("tests/admin_views/models.py", "tests/data/x.json", "numpy/testing/tests/data/a.txt",
+              "pkg/conftest.py", "pkg/test_new.py", "other/helper_test.py", "pkg/test_core.py"):
+        assert is_test_path(p, layout), p
+    assert is_test_path("django/test/utils.py")                          # 没有布局（基线之前）：仍按名字
+    assert suite_layout_of([]) is None and suite_layout_of(["cmd:build"]) is None
+    assert related_units(["django/test/utils.py"], files)[0] is None     # 是源码：参与选择（找不到相关测试 → 全量）
+    assert related_units(["tests/admin_views/models.py"], files)[0] == ()
 
 
 def test_validate_plan_ok_and_renumber():

@@ -250,6 +250,19 @@ class Compaction:
 
 
 @dataclass(frozen=True)
+class Waiver:
+    """从回归门里豁免的检查（rule：worker 声明“这个现有测试与任务原文要求的行为冲突”，规则校验后接受）。
+    证据：任务原文的逐字引文 + 这个测试确实在 worker 的候选树上失败过。账本里逐条列出。"""
+    test: str
+    seq: int
+    t: float
+    task: str
+    worker: str
+    quote: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Persistent:
     """持续性回归（rule）：worker 声明的存档被降级后，失败的测试在最新快照上仍然失败。"""
     test: str
@@ -404,6 +417,7 @@ class Graph:
     locates: dict[str, Locate] = field(default_factory=dict)
     diagnoses: dict[str, Diagnosis] = field(default_factory=dict)
     relations: tuple[tuple[str, str], ...] = ()                 # rule：(源文件, 测试文件)
+    waived: dict[str, Waiver] = field(default_factory=dict)      # rule：从回归门里豁免的检查
     # C
     checkpoints: dict[int, Checkpoint] = field(default_factory=dict)
     attempts: dict[str, Attempt] = field(default_factory=dict)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import posixpath
 import shlex
+from typing import Callable
 
 from belay.core.verify import is_test_path
 from belay.env import Env
@@ -98,11 +99,13 @@ class ShadowRepo:
             res.append((st[0], path, m1, s1))
         return res
 
-    async def strip_tests(self, base_tree: str, tree: str) -> tuple[str, list[str]]:
-        """把 tree 中测试路径下的改动恢复为 base_tree 的版本。返回（新树，被剔除的路径）。"""
+    async def strip_tests(self, base_tree: str, tree: str,
+                          is_test: Callable[[str], bool] = is_test_path) -> tuple[str, list[str]]:
+        """把 tree 中测试路径下的改动恢复为 base_tree 的版本。返回（新树，被剔除的路径）。
+        is_test：测试路径的判断（runtime 传入按基线测试布局判断的版本，见 verify.suite_layout）。"""
         lines, dropped = [], []
         for st, path, m1, s1 in await self._diff_entries(base_tree, tree):
-            if not is_test_path(path):
+            if not is_test(path):
                 continue
             dropped.append(path)
             lines.append(f"0 {'0' * 40}\t{path}" if st == "A" else f"{m1} {s1}\t{path}")

@@ -50,6 +50,9 @@ class BelayConfig:
     # ---- 复查（模块 F）
     reviewer: bool = True
     review_max_reopens: int = 1
+    # ---- 回归门豁免：worker 引用任务原文声明某个现有测试与要求冲突，且它确实在候选上失败过 → 从门里去掉
+    waivers: bool = True
+    waive_max_tests: int = 20
     # ---- 截止预留 = max(下限, 全量验证实测耗时 × 系数 + 余量)，最多占预算的一定比例
     reserve_factor: float = 1.3
     reserve_extra_sec: float = 30

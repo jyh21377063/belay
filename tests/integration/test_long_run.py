@@ -197,6 +197,35 @@ def test_worker_edits_during_verification_are_not_lost(tmp_path):
 
 # ======================================================================== 模块 A：可抢占的优先级队列
 
+def test_strip_tests_keeps_source_packages_named_like_test_dirs(tmp_path):
+    """有基线测试布局时，名字像测试目录的源码包（django/test/ 这种）不被剔除；真正的测试目录照样剔除。"""
+    from belay.core.verify import is_test_path, suite_layout_of
+    from belay.runtime.gitops import ShadowRepo
+    repo = tmp_path / "repo"
+    for rel in ("pkg/test/utils.py", "pkg/core.py", "tests/test_core.py", "tests/data/case.json"):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text("old\n")
+    subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm init", shell=True,
+                   cwd=repo, check=True)
+    layout = suite_layout_of(["tests/test_core.py"])
+
+    async def main():
+        shadow = ShadowRepo(LocalEnv(str(repo)), str(tmp_path / "git"), str(repo))
+        _commit, base = await shadow.init()
+        for rel in ("pkg/test/utils.py", "pkg/core.py", "tests/test_core.py", "tests/data/case.json"):
+            (repo / rel).write_text("new\n")
+        (repo / "tests" / "test_new.py").write_text("def test_x(): pass\n")
+        raw = await shadow.snapshot("w1")
+        by_name = await shadow.strip_tests(base, raw)
+        by_layout = await shadow.strip_tests(base, raw, lambda p: is_test_path(p, layout))
+        return by_name[1], by_layout[1], await shadow.numstat(base, by_layout[0])
+
+    by_name, by_layout, kept = asyncio.run(main())
+    assert "pkg/test/utils.py" in by_name                                # 只按名字：源码包被当成测试剔除
+    assert by_layout == ["tests/data/case.json", "tests/test_core.py", "tests/test_new.py"]
+    assert sorted(f[0] for f in kept) == ["pkg/core.py", "pkg/test/utils.py"]
+
+
 def test_preemption_lets_the_waiting_checkpoint_go_first(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

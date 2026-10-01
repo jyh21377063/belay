@@ -10,7 +10,7 @@ from belay.core.queries import (chain, done_not_delivered, holder, id_ranges, is
                                 requirement_status, status_reasons, steps_of, suspect, task_files, unfinished_deps,
                                 workable)
 from belay.core.suggest import suggest
-from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, checkpoint_full_ok, full_verified, guard_set,
+from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, active_guard, checkpoint_full_ok, full_verified,
                                reasons_for_tree, regression_ids, tree_regressions)
 
 PAGE = 50
@@ -320,8 +320,9 @@ def render_diagnosis(g: Graph, did: str) -> str:
                    f"{s.get('reason', '')}")
     inten = r.get("intentional") or {}
     if inten.get("likely"):
-        out.append(f"- the change looks intentional for the task text \"{inten.get('quote')}\": undo it, or report "
-                   "the conflict with report_blocked(kind=\"check_conflict\"); the gate still applies.")
+        out.append(f"- the change looks intentional for the task text \"{inten.get('quote')}\": if the task really "
+                   "asks for it, waive_check(tests=[...], quote=...) takes these tests out of the gate (listed in the "
+                   "final report); otherwise undo the change.")
     if r.get("suggestion"):
         out.append(f"- suggestion: {r['suggestion']}")
     if r.get("flaky_suspect"):
@@ -409,7 +410,9 @@ def ledger(g: Graph) -> dict:
         "isolation": dict(g.isolation),
         "head_full_verified": bool(cp and full_verified(g, cp.tree)),
         "head_regressions": list(tree_regressions(g, cp.tree)) if cp and full_verified(g, cp.tree) else [],
-        "guard_checks": len(guard_set(g.baseline)),
+        "guard_checks": len(active_guard(g)),
+        "waived": [{"test": w.test, "task": w.task, "quote": w.quote, "reason": w.reason}
+                   for w in sorted(g.waived.values(), key=lambda w: (w.seq, w.test))],
         "categories": {c: len(v) for c, v in cats.items()},
         "category_tasks": cats,
         "requirements": reqs,
@@ -455,9 +458,10 @@ def ledger_markdown(g: Graph) -> str:
            f"- deliver_unconfirmed={L['deliver_unconfirmed']}; chain head {L['head']}, latest confirmed "
            f"{L['confirmed']}"
            + (" — delivery falls behind the head" if L["delivered_checkpoint"] not in (None, L["head"]) else ""),
-           f"- regression gate: {L['guard_checks']} checks" + (" (degraded mode: verification switched the working "
-                                                               "tree; no background verification)"
-                                                               if L["degraded"] else ""),
+           f"- regression gate: {L['guard_checks']} checks"
+           + (f", {len(L['waived'])} waived (see below)" if L["waived"] else "")
+           + (" (degraded mode: verification switched the working tree; no background verification)"
+              if L["degraded"] else ""),
            "- tasks: " + ", ".join(f"{k} {v}" for k, v in c.items()), "", "## Requirements", ""]
     for r in L["requirements"]:
         out.append(f"- {r['id']} [{r['status']}] {r['summary'] or r['quote'][:120]} (tasks: {', '.join(r['tasks'])})")
@@ -472,4 +476,10 @@ def ledger_markdown(g: Graph) -> str:
                     f"{', '.join(L['not_delivered'])}"]
     if L["unfinished"]:
         out += ["", f"Unfinished: {', '.join(L['unfinished'])}"]
+    if L["waived"]:
+        out += ["", "## Waived regression checks", "",
+                "Existing tests taken out of the regression gate because the worker quoted task text asking for "
+                "behaviour they contradict (the tests had failed on its changes):", ""]
+        for w in L["waived"]:
+            out.append(f"- {w['test']} ({w['task']}): \"{w['quote'][:200]}\" — {w['reason'][:300]}")
     return "\n".join(out) + "\n"

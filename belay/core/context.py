@@ -21,7 +21,7 @@ from belay.core.queries import (chain, focus_task, held_tasks, id_ranges, latest
                                 num, open_persistent, requirement_status, resume_point, steps_of, task_files)
 from belay.core.render import checkpoint_line, render_diagnosis, render_located
 from belay.core.suggest import suggest
-from belay.core.verify import (B_FAIL, B_FLAKY, check_unit, guard_set, reasons_for_tree, related_units,
+from belay.core.verify import (B_FAIL, B_FLAKY, active_guard, check_unit, reasons_for_tree, related_units,
                                regression_ids, results_for_tree, test_files_of)
 
 LABEL = {"original": "task statement, verbatim", "rule": "derived by the harness from its task graph",
@@ -400,8 +400,11 @@ def _gate(g: Graph, worker: str) -> str:
         return "No test results are available for this task, so checkpoints are not verified by tests."
     fails = sorted(t for t, c in g.baseline.items() if c == B_FAIL)
     flaky = sorted(t for t, c in g.baseline.items() if c == B_FLAKY)
-    lines = [f"{len(guard_set(g.baseline))} checks passed twice on the original code: these form the regression "
+    lines = [f"{len(active_guard(g))} checks passed twice on the original code: these form the regression "
              "gate. A checkpoint is accepted only if none of them fails, errors, is skipped or goes missing."]
+    if g.waived:
+        lines.append(f"{len(g.waived)} waived (the task asks for behaviour they contradict): "
+                     + ", ".join(sorted(g.waived)[:10]) + (" ..." if len(g.waived) > 10 else ""))
     if g.degraded:
         lines.append("(The tests cannot run outside the working tree here, so checks run only when you "
                      "checkpoint, finish a task or a session ends.)")

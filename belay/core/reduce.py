@@ -16,7 +16,7 @@ from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, A
                               RUN_DONE, RUN_INCOMPLETE, RUN_RUNNING, SPLIT, STEP_ACTIVE, STEP_ANCHORED, STEP_DECLARED,
                               STEP_PLANNED, WHERE_LIVE, WHERE_SLOT, Attempt, Checkpoint, Compaction, Diagnosis, Graph,
                               Job, Lease, Locate, Note, Persistent, Requirement, Run, Session, Snapshot, Stall, Step,
-                              Task, Wip, WorkerState)
+                              Task, Waiver, Wip, WorkerState)
 from belay.core.queries import has_cycle, is_ancestor, last_session, latest_confirmed_ancestor
 from belay.core.verify import PASSED, results_for_tree
 
@@ -774,6 +774,17 @@ def _checkpoint_labeled(g: Graph, e: Event) -> Graph:
     return _set_cp(g, replace(g.checkpoints[cid], label=str(e.get("label"))[:300]))
 
 
+def _check_waived(g: Graph, e: Event) -> Graph:
+    _running(g)
+    worker = actor_worker(e.actor)
+    _need(worker is not None, "a waiver comes from a worker's request")
+    out = dict(g.waived)
+    for test in e.get("tests"):
+        _need(g.baseline.get(test) == "pass", f"{test} is not in the regression gate")
+        out[test] = Waiver(test, e.seq, e.t, e.get("task"), worker, str(e.get("quote")), str(e.get("reason")))
+    return replace(g, waived=out)
+
+
 HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
     "run_started": _run_started, "runtime_recovered": _runtime_recovered, "clock_started": _clock_started,
     "run_suspended": _run_suspended,
@@ -797,6 +808,7 @@ HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
     "relation_learned": _relation_learned, "diagnosis_requested": _diagnosis_requested,
     "diagnosis_recorded": _diagnosis_recorded, "review_started": _review_started,
     "review_recorded": _review_recorded, "checkpoint_labeled": _checkpoint_labeled,
+    "check_waived": _check_waived,
 }
 
 

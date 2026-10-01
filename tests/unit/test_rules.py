@@ -603,6 +603,55 @@ def test_rollback_defaults_to_the_latest_milestone():
     assert any(e.kind == "restore_workspace" and e.args["reset_ref"] for e in s.effects)
 
 
+# ======================================================================== 回归门豁免
+
+MUL_QUOTE = "make mul handle negative numbers correctly"
+
+
+def test_waiver_takes_a_contradicted_test_out_of_the_gate():
+    s = sim(cfg=manual(locate=False))
+    s.do(R.claim, "w1", "T2")
+    with pytest.raises(Rejected, match="not seen it fail"):              # 不能预先豁免
+        s.do(R.waive_checks, "w1", "T2", [MUL], MUL_QUOTE, "the old test asserts the old sign")
+    s.world.define("neg", {MUL: "FAILED"})
+    aid = s.checkpoint("neg")
+    assert s.g.attempts[aid].status == "rejected" and s.g.head == 0
+    with pytest.raises(Rejected, match="verbatim"):
+        s.do(R.waive_checks, "w1", "T2", [MUL], "mul must change", "the old test asserts the old sign")
+    with pytest.raises(Rejected, match="not in the regression gate"):    # 原始代码上就失败的不在门里
+        s.do(R.waive_checks, "w1", "T2", [ADD], MUL_QUOTE, "x")
+    with pytest.raises(Rejected, match="hold"):
+        s.do(R.waive_checks, "w1", "T1", [MUL], MUL_QUOTE, "x")
+    assert s.do(R.waive_checks, "w1", "T2", [MUL], MUL_QUOTE, "the old test asserts the old sign") == [MUL]
+    w = s.g.waived[MUL]
+    assert w.task == "T2" and w.worker == "w1" and w.quote == MUL_QUOTE
+    aid = s.checkpoint("neg")                                            # 同一棵树再存：复用结果，门里已没有 MUL
+    assert s.g.attempts[aid].status == "created" and s.g.head == 1
+    L = ledger(s.g)
+    assert L["guard_checks"] == 1 and [x["test"] for x in L["waived"]] == [MUL]
+    assert "Waived regression checks" in ledger_markdown(s.g)
+    assert "1 waived" in build_context(s.g, "w1", 24_000, s.now, s.cfg, mode="resume").text
+    with pytest.raises(Rejected, match="already waived"):
+        s.do(R.waive_checks, "w1", "T2", [MUL], MUL_QUOTE, "again")
+    s.check_log()
+
+
+def test_waivers_can_be_disabled_and_are_capped():
+    s = sim(cfg=manual(locate=False, waivers=False))
+    s.do(R.claim, "w1", "T2")
+    s.world.define("neg", {MUL: "FAILED"})
+    s.checkpoint("neg")
+    with pytest.raises(Rejected, match="disabled"):
+        s.do(R.waive_checks, "w1", "T2", [MUL], MUL_QUOTE, "x")
+    s = sim(cfg=manual(locate=False, waive_max_tests=0))
+    s.do(R.claim, "w1", "T2")
+    s.world.define("neg", {MUL: "FAILED"})
+    s.checkpoint("neg")
+    with pytest.raises(Rejected, match="At most 0"):
+        s.do(R.waive_checks, "w1", "T2", [MUL], MUL_QUOTE, "x")
+    assert not s.g.waived
+
+
 # ======================================================================== 模块 H：步骤与恢复点
 
 def _step(s: Sim, tree: str, summary: str = "") -> str:

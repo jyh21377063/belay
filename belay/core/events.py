@@ -100,6 +100,7 @@ EVENT_SPECS: dict[str, Spec] = {
     "review_started": Spec(("task", "phase"), (RULE,)),
     "review_recorded": Spec(("task", "phase", "implemented"), (LLM,)),
     "checkpoint_labeled": Spec(("checkpoint", "label"), (LLM,)),
+    "check_waived": Spec(("task", "tests", "quote", "reason"), (RULE,)),
 }
 EVENT_TYPES = tuple(EVENT_SPECS)
 # llm 来源的事件：只能记录、重开、新增，永远不能引起完成、存档、提升（不变量检查）

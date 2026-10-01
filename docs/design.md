@@ -54,6 +54,7 @@
 | | `checkpoint_advancing` / `checkpoint_created` / `checkpoint_rejected` | rule / observed | 父节点在推进时确定；新存档为暂存（related）或确认（full） |
 | | `checkpoint_confirmed` / `checkpoint_demoted` | observed / rule | 全量通过 → 确认点前移；确认过的回归 → 降级 |
 | | `checkpoint_marked` | rule | worker 声明的单元落在已有的自动 / 交接存档上：升级为里程碑 |
+| | `check_waived` | rule | 守护检查被豁免：worker 引用任务原文声明它与要求冲突，且它确实在候选上失败过（§3.3） |
 | | `rollback` | rule | 段号 +1；确认点退回链上最近的确认祖先 |
 | 定位 | `persistent_regression` / `locate_started` / `locate_concluded` / `regression_located` / `relation_learned` | rule / rule / rule / observed / rule | 见 §3.4 |
 | LLM | `diagnosis_requested` / `diagnosis_recorded` | rule / llm | 诊断者（只解释） |
@@ -114,6 +115,12 @@
   剔除测试、预检与提交），不记新快照。快照只用于恢复、回退与事后二分，本身不触发验证。
 - 每张快照是一个确定的提交（树 = `{raw: 原样树, cand: 候选树}`，父提交是上一张快照），ref 为 `refs/belay/snap/<n>`：
   防 gc，也让 git bundle 能增量导出。
+- 候选树 = 原样树剔除测试路径下的改动（恢复为基线版本），交付也只交付候选树。测试路径按基线实际收集到的测试判断
+  （`verify.suite_layout`）：文件名像测试（`test_*.py`、`*_test.py`、`conftest.py`）、本身是收集到的测试文件、或位于
+  测试目录之下；测试目录 = 每个收集到的测试文件路径上最近的、名字像测试目录（test / tests / testing / `__tests__`）
+  的那一级。所以 `django/test/`、`numpy/testing/`（它的测试在 `numpy/testing/tests/`）这类源码包不会被当成测试剔除。
+  基线之前（规划时列测试文件）与容器里的 runner 仍按名字（`TEST_PATH`）判断。测试 id 相对于工作区（与 runner 的
+  `select` 相同）。
 - 预检：改动的 `.py` 文件用 `compile()` 检查语法（不写 `.pyc`）；可配 `precheck_cmd`。失败的快照标为不可测：不进验证
   队列，但留在时间线上。
 - 后台线（`rules.schedule_background`）：同一时刻每个 worker 最多一个后台尝试，只验证语义节点：还没被包含的步骤锚点
@@ -142,6 +149,13 @@
   不再交付，不追查、不通知。
 - 收尾（`driver._finalize`）：`finalize_started` 取消后台尝试 → 对当前 WIP 做一次 full 前台尝试 → 链头仍是暂存点且还有
   时间就提升它 → 取消剩下的作业 → 交付最新的确认点（`delivered` 带 `level`、`lag`、`not_delivered`）。
+- 豁免（`rules.waive_checks`，工具 `waive_check`）：任务原文明确要求的行为与某个现有测试冲突时（例如改默认值、改报错
+  文字），worker 可以把这个测试从回归门里去掉。规则校验：持有这个任务；引文逐字出现在任务原文里（至少三个词）；
+  每个检查都在守护集合里、不是公开检查，并且确实在 worker 的某个候选树上失败过（只看非 live 作业，候选树已剔除测试
+  改动；不能预先豁免）；一次运行最多 `waive_max_tests` 个（`waivers=False` 关掉）。之后回归判定用
+  `verify.active_guard`（守护集合 − 豁免）；已经被拒或降级的存档不变，worker 再存一次。豁免不改变任务的检查项，
+  也不影响 DONE 的判定；账本逐条列出（测试、任务、引文、理由），开场的回归门一段也会列出。被豁免的测试不再算
+  “仍未解决的持续回归”。`report_blocked(kind="check_conflict")` 保留给整个任务做不了的情况。
 - 交付一致性：`done_checkpoint` 不在交付点祖先链上的任务记为“完成但未交付”。
 - DONE 的条件（`queries.status_reasons`，空列表 = DONE，否则逐条写进 `delivered.status_reasons` 与账本）：
   1. 没有未解决的任务（open / active / review）；
@@ -256,6 +270,8 @@
 ## 8. 与计划的差异和补充决定（需要时可以改回）
 
 - 手动 `checkpoint(summary)` 的 summary 直接作为里程碑标签；标签模型只给没有标签、没有步骤的存档补一行。
+- 回归门豁免（§3.3）：计划里冲突只记录（`check_conflict` 让任务受阻、门不变），结果是任务要求的行为改动永远进不了
+  存档。现在允许在有引文和失败证据时豁免具体的测试，代价是门不再完全由基线决定，所以每条豁免都进账本。
 - todo 列表里新标为 completed 的条目等同于 `step_done`（计划只写了 `step_done` 工具）；两者都保留。
 - 按计划只在里程碑上导出 bundle；非里程碑存档靠“快照已导出 + 提交确定”保证可重做，另加了合并（见 §6）。
 - DONE 的条件在 F2 的基础上加了“每条需求都被满足”和“复查者没有认定没做完”（§3.3），修正了 0-4 指出的“全部受阻 +
@@ -275,7 +291,7 @@
 | 要求 | 测试 |
 | --- | --- |
 | 事件、推导、非法转换 | `tests/unit/test_reduce.py` |
-| 规则：两条线、新快照胜出、提升 / 降级 / 交付一致性、二分（精确、跳过、非单调、跨回退、上限）、只追查声明完成的存档、诊断与复查、步骤与恢复点、DONE 的条件 | `tests/unit/test_rules.py` |
+| 规则：两条线、新快照胜出、提升 / 降级 / 交付一致性、二分（精确、跳过、非单调、跨回退、上限）、只追查声明完成的存档、诊断与复查、步骤与恢复点、DONE 的条件、回归门豁免 | `tests/unit/test_rules.py` |
 | 重放一致性（快照、后台线、步骤、定位、诊断、复查、抢占……随机驱动 40 个种子） | `tests/unit/test_replay.py` |
 | 分层开场：段顺序、前缀稳定、跨会话笔记、300 需求 / 1000 任务 / 100 会话仍在预算内、board 过滤 | `tests/unit/test_context_suggest.py` |
 | 外壳辅助：traceback 截取、sys.path 映射、L1 保留读取、读盘重放、离开期间上限 | `tests/unit/test_runtime_helpers.py` |
