@@ -109,8 +109,12 @@ def count_results(messages: list[dict]) -> int:
     return n
 
 
-def l1_clear(messages: list[dict], keep_recent: int, meta: Optional[Mapping[str, dict]] = None) -> tuple[list[dict], int]:
-    """返回（新消息列表，清理的条数）。不修改输入；只改写 tool_result 的内容，不删消息，配对始终有效。"""
+def l1_clear(messages: list[dict], keep_recent: int, meta: Optional[Mapping[str, dict]] = None,
+             keep_reads: bool = False) -> tuple[list[dict], int]:
+    """返回（新消息列表，清理的条数）。不修改输入；只改写 tool_result 的内容，不删消息，配对始终有效。
+
+    keep_reads=True 时先只清命令、测试之类的输出，保留 read_file 的结果（它们通常是编辑所依据的内容）。
+    """
     meta = meta or {}
     uses = _tool_uses(messages)
     positions = []
@@ -120,6 +124,9 @@ def l1_clear(messages: list[dict], keep_recent: int, meta: Optional[Mapping[str,
                 if b.get("type") == "tool_result" and not _result_text(b).startswith(CLEARED_PREFIX):
                     positions.append((mi, bi))
     stale = positions[:max(0, len(positions) - keep_recent)]
+    if keep_reads:
+        stale = [(mi, bi) for mi, bi in stale
+                 if uses.get(messages[mi]["content"][bi].get("tool_use_id"), {}).get("name") != "read_file"]
     if not stale:
         return messages, 0
     out = list(messages)

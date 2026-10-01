@@ -2,19 +2,25 @@
 
 纯函数：不修改输入的图（只复制被修改的表），不读时钟，不做 IO。
 reduce 是机械的，但它同时是状态机的最后一道防线：不合法的转换（例如 open → done、给冻结的需求加字段、
-链头不对的存档）会抛 IllegalEvent。规则只产生合法的事件；一条被接受过的日志重放时永远不会抛出。
+父节点不对的存档）会抛 IllegalEvent。规则只产生合法的事件；一条被接受过的日志重放时永远不会抛出。
 """
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional
 
 from belay.core.events import Event, actor_worker, validate
-from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, ATT_REJECTED, BLOCKED, DONE,
-                              DONE_UNVERIFIED, FINISHED, JOB_FINISHED, JOB_RUNNING, OPEN, REVIEW, RUN_DONE,
-                              RUN_INCOMPLETE, RUN_RUNNING, SPLIT, Attempt, Checkpoint, Compaction, Graph, Job, Lease,
-                              Note, Requirement, Run, Session, Stall, Task, Wip, WorkerState)
-from belay.core.queries import has_cycle, last_session
+from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, ATT_REJECTED, ATT_SUPERSEDED, BLOCKED,
+                              CONFIRMED, DONE, DONE_UNVERIFIED, FINISHED, JOB_FINISHED, JOB_RUNNING, KIND_MILESTONE,
+                              KIND_REVIEW, KIND_STEP, LANE_BG, LANE_FG, OPEN, PROVISIONAL, REVIEW, RUN_DONE,
+                              RUN_INCOMPLETE, RUN_RUNNING, SPLIT, STEP_ACTIVE, STEP_ANCHORED, STEP_DECLARED,
+                              STEP_PLANNED, WHERE_LIVE, WHERE_SLOT, Attempt, Checkpoint, Compaction, Diagnosis, Graph,
+                              Job, Lease, Locate, Note, Persistent, Requirement, Run, Session, Snapshot, Stall, Step,
+                              Task, Wip, WorkerState)
+from belay.core.queries import has_cycle, is_ancestor, last_session, latest_confirmed_ancestor
+from belay.core.verify import PASSED, results_for_tree
+
+PROGRESS_KINDS = (KIND_MILESTONE, KIND_STEP, KIND_REVIEW)     # 自动存档与交接存档不算进展
 
 
 class IllegalEvent(ValueError):
@@ -43,18 +49,43 @@ def _task(g: Graph, tid: str) -> Task:
     return g.tasks[tid]
 
 
-def _set_task(g: Graph, t: Task) -> Graph:
+def _set_task(g: Graph, t: Task, e: Optional[Event] = None, reason: str = "") -> Graph:
+    old = g.tasks.get(t.id)
+    if e is not None and (old is None or old.status != t.status):
+        t = replace(t, history=(t.history + ((e.seq, t.status, reason or e.type),))[-30:])
     return replace(g, tasks=_put(g.tasks, t.id, t))
 
 
-def _progress(g: Graph, e: Event, worker: str | None) -> Graph:
-    """新证据：记到这个 worker 最近的会话上（包括刚结束的：会话结束时 runtime 替它做的存档也算）。"""
+def _set_cp(g: Graph, cp: Checkpoint) -> Graph:
+    return replace(g, checkpoints=_put(g.checkpoints, cp.id, cp))
+
+
+def _progress(g: Graph, e: Event, worker: Optional[str]) -> Graph:
+    """进展：记到这个 worker 最近的会话上（包括刚结束的：会话结束后 runtime 替它做的存档也算）。"""
     g = replace(g, last_progress_t=e.t, last_progress_seq=e.seq)
+    if worker is None and len(g.workers) == 1:
+        worker = next(iter(g.workers))
     if worker:
         s = last_session(g, worker)
         if s is not None and not s.progress:
             g = replace(g, sessions=_put(g.sessions, s.id, replace(s, progress=True)))
     return g
+
+
+def _check_passes(g: Graph, e: Event, tree: str) -> Graph:
+    """某个任务的检查项第一次在存档上通过：算进展。"""
+    if not any(cp.tree == tree and not cp.abandoned for cp in g.checkpoints.values()):
+        return g
+    res = results_for_tree(g, tree)
+    progressed = False
+    for t in list(g.tasks.values()):
+        if not t.checks or t.status == SPLIT:
+            continue
+        new = [c for c in t.checks if res.get(c) == PASSED and c not in t.passed_checks]
+        if new:
+            g = _set_task(g, replace(t, passed_checks=t.passed_checks + tuple(new)))
+            progressed = True
+    return _progress(g, e, None) if progressed else g
 
 
 def _running(g: Graph) -> None:
@@ -75,9 +106,26 @@ def _run_started(g: Graph, e: Event) -> Graph:
 
 def _runtime_recovered(g: Graph, e: Event) -> Graph:
     _need(g.run is not None, "recovered before start")
-    run = replace(g.run, recoveries=g.run.recoveries + 1,
+    rebuilt = bool(e.get("rebuilt"))
+    run = replace(g.run, recoveries=g.run.recoveries + 1, rebuilds=g.run.rebuilds + (1 if rebuilt else 0),
                   downtime_sec=g.run.downtime_sec + float(e.get("downtime_sec")))
-    return replace(g, run=run)
+    g = replace(g, run=run)
+    lost = [int(n) for n in (e.get("lost_snapshots") or ())]
+    if lost:
+        snaps = dict(g.snapshots)
+        for n in lost:
+            if n in snaps:
+                snaps[n] = replace(snaps[n], lost=True)
+        g = replace(g, snapshots=snaps)
+    iso = e.get("isolation")
+    if iso:
+        g = replace(g, isolation={**g.isolation, **dict(iso)})
+    return g
+
+
+def _run_suspended(g: Graph, e: Event) -> Graph:
+    _running(g)
+    return replace(g, run=replace(g.run, suspended=g.run.suspended + 1))
 
 
 def _deadline_reserve(g: Graph, e: Event) -> Graph:
@@ -86,12 +134,21 @@ def _deadline_reserve(g: Graph, e: Event) -> Graph:
     return replace(g, run=replace(g.run, reserve=True, reserve_sec=float(e.get("reserve_sec"))))
 
 
+def _finalize_started(g: Graph, e: Event) -> Graph:
+    _running(g)
+    _need(not g.run.finalizing, "finalize_started twice")
+    return replace(g, run=replace(g.run, finalizing=True, finalize_reason=e.get("reason")))
+
+
 def _delivered(g: Graph, e: Event) -> Graph:
     _running(g)
-    _need(e.get("checkpoint") == g.head, "delivered checkpoint must be the chain head")
+    cid = e.get("checkpoint")
+    _need(cid in g.checkpoints and is_ancestor(g, cid, g.head), f"delivered checkpoint {cid} is not on the chain")
     status = e.get("status")
     _need(status in ("DONE", "INCOMPLETE"), f"bad delivered status {status}")
-    run = replace(g.run, status=RUN_DONE if status == "DONE" else RUN_INCOMPLETE, delivered=g.head)
+    cp = g.checkpoints[cid]
+    run = replace(g.run, status=RUN_DONE if status == "DONE" else RUN_INCOMPLETE, delivered=cid,
+                  delivered_level=cp.level, deliver_unconfirmed=e.get("unconfirmed_policy"))
     return replace(g, run=run)
 
 
@@ -127,7 +184,7 @@ def _new_task(g: Graph, spec: dict, seq: int, origin: str, parent: str | None = 
     return Task(id=tid, title=spec.get("title", ""), description=spec.get("description", ""), links=links,
                 blocked_by=blocked_by, parent=parent, discovered_from=spec.get("discovered_from"),
                 priority=int(spec.get("priority") or 0), checks=tuple(spec.get("checks") or ()), origin=origin,
-                created_seq=seq)
+                created_seq=seq, history=((seq, OPEN, "created"),))
 
 
 def _task_added(g: Graph, e: Event) -> Graph:
@@ -136,7 +193,9 @@ def _task_added(g: Graph, e: Event) -> Graph:
     t = _new_task(g, e.payload, e.seq, e.source)
     if t.discovered_from is not None:
         _need(t.discovered_from in g.tasks, f"discovered_from unknown task {t.discovered_from}")
-    return _set_task(g, t)
+    g = _set_task(g, t)
+    _need(has_cycle({x.id: x.blocked_by for x in g.tasks.values()}) is None, "task_added creates a cycle")
+    return g
 
 
 def _task_split(g: Graph, e: Event) -> Graph:
@@ -156,7 +215,7 @@ def _task_split(g: Graph, e: Event) -> Graph:
     edges = {t.id: t.blocked_by for t in g.tasks.values()}
     _need(has_cycle(edges) is None, "split creates a dependency cycle")
     g = replace(g, leases=_drop(g.leases, parent.id))
-    return _set_task(g, replace(parent, status=SPLIT, children=tuple(children)))
+    return _set_task(g, replace(parent, status=SPLIT, children=tuple(children)), e)
 
 
 def _task_claimed(g: Graph, e: Event) -> Graph:
@@ -165,11 +224,10 @@ def _task_claimed(g: Graph, e: Event) -> Graph:
     w = e.get("worker")
     _need(w in g.workers, f"unknown worker {w}")
     _need(t.status == OPEN, f"cannot claim {t.id} in status {t.status}")
-    _need(t.id not in g.leases, f"{t.id} is already leased")
-    _need(all(g.tasks[d].status in FINISHED for d in t.blocked_by), f"{t.id} has unfinished blockers")
-    lease = Lease(t.id, w, e.t, float(e.get("expires_t")))
-    g = replace(g, leases=_put(g.leases, t.id, lease))
-    return _set_task(g, replace(t, status=ACTIVE))
+    _need(t.id not in g.leases, f"{t.id} is already held")
+    head = e.get("head")
+    g = replace(g, leases=_put(g.leases, t.id, Lease(t.id, w, e.t, head, e.seq)))
+    return _set_task(g, replace(t, status=ACTIVE, claimed_head=head), e)
 
 
 def _task_released(g: Graph, e: Event) -> Graph:
@@ -179,7 +237,7 @@ def _task_released(g: Graph, e: Event) -> Graph:
     _need(t.status == ACTIVE and lease is not None and lease.worker == e.get("worker"),
           f"{e.get('worker')} does not hold active task {t.id}")
     g = replace(g, leases=_drop(g.leases, t.id))
-    return _set_task(g, replace(t, status=OPEN))
+    return _set_task(g, replace(t, status=OPEN), e)
 
 
 def _review_requested(g: Graph, e: Event) -> Graph:
@@ -191,7 +249,7 @@ def _review_requested(g: Graph, e: Event) -> Graph:
     cp = e.get("checkpoint")
     if cp is not None:
         _need(cp == g.head, "review on a checkpoint that is not the head")
-    return _set_task(g, replace(t, status=REVIEW, review_seq=e.seq, review_attempt=None, review_checkpoint=cp))
+    return _set_task(g, replace(t, status=REVIEW, review_seq=e.seq, review_attempt=None, review_checkpoint=cp), e)
 
 
 def _task_done(g: Graph, e: Event) -> Graph:
@@ -206,8 +264,8 @@ def _task_done(g: Graph, e: Event) -> Graph:
     _need(verified == bool(t.checks), f"{t.id}: verified must be {bool(t.checks)}")
     worker = g.leases[t.id].worker if t.id in g.leases else None
     g = replace(g, leases=_drop(g.leases, t.id))
-    g = _set_task(g, replace(t, status=DONE if verified else DONE_UNVERIFIED, done_checkpoint=cp, verified=verified,
-                             last_failure=()))
+    g = _set_task(g, replace(t, status=DONE if verified else DONE_UNVERIFIED, done_checkpoint=cp, done_seq=e.seq,
+                             verified=verified, last_failure=(), review=None, review_missing=()), e)
     return _progress(g, e, worker)
 
 
@@ -218,7 +276,8 @@ def _task_blocked(g: Graph, e: Event) -> Graph:
     worker = actor_worker(e.actor)
     g = replace(g, leases=_drop(g.leases, t.id))
     g = _set_task(g, replace(t, status=BLOCKED, blocked_kind=e.get("kind"), blocked_reason=e.get("reason"),
-                             blocked_quote=e.get("quote"), review_attempt=None, review_checkpoint=None))
+                             blocked_quote=e.get("quote"), review_attempt=None, review_checkpoint=None,
+                             review=None), e, e.get("kind"))
     return _progress(g, e, worker)
 
 
@@ -229,11 +288,85 @@ def _task_reopened(g: Graph, e: Event) -> Graph:
     status = ACTIVE if (t.status == REVIEW and t.id in g.leases) else OPEN
     if status == OPEN:
         g = replace(g, leases=_drop(g.leases, t.id))
+    by_review = e.get("reason") in ("review_missing", "review_reading")
     t2 = replace(t, status=status, reopen_count=t.reopen_count + 1, reopen_reason=e.get("reason"),
                  last_failure=tuple(e.get("failures") or ()), review_attempt=None, review_checkpoint=None,
-                 review_seq=None, done_checkpoint=None, verified=False, blocked_kind=None, blocked_reason=None,
-                 blocked_quote=None)
-    return _set_task(g, t2)
+                 review_seq=None, done_checkpoint=None, done_seq=None, verified=False, blocked_kind=None,
+                 blocked_reason=None, blocked_quote=None,
+                 review_reopens=t.review_reopens + (1 if by_review else 0))
+    return _set_task(g, t2, e, e.get("reason"))
+
+
+# ======================================================================== 步骤
+
+def _steps_planned(g: Graph, e: Event) -> Graph:
+    _running(g)
+    tid = e.get("task")
+    _task(g, tid)
+    keep = {s.id for s in g.steps.values() if s.task == tid and s.status in (STEP_DECLARED, STEP_ANCHORED)}
+    listed = set()
+    steps = dict(g.steps)
+    for spec in e.get("steps"):
+        sid = spec["id"]
+        listed.add(sid)
+        cur = steps.get(sid)
+        status = spec.get("status", STEP_PLANNED)
+        if cur is None:
+            _need(status in (STEP_PLANNED, STEP_ACTIVE), f"new step {sid} must be planned or active")
+            steps[sid] = Step(sid, tid, int(spec["n"]), spec["title"], status, order=int(spec.get("order", 0)))
+        else:
+            _need(cur.task == tid, f"step {sid} belongs to {cur.task}")
+            if cur.status in (STEP_DECLARED, STEP_ANCHORED):
+                status = cur.status
+            steps[sid] = replace(cur, title=spec["title"], status=status, order=int(spec.get("order", 0)))
+    for sid in [s.id for s in steps.values() if s.task == tid]:
+        if sid not in listed and sid not in keep:
+            del steps[sid]
+    return replace(g, steps=steps)
+
+
+def _step(g: Graph, sid: str) -> Step:
+    _need(sid in g.steps, f"unknown step {sid}")
+    return g.steps[sid]
+
+
+def _step_started(g: Graph, e: Event) -> Graph:
+    s = _step(g, e.get("step"))
+    _need(s.status in (STEP_PLANNED, STEP_ACTIVE), f"cannot start step {s.id} in status {s.status}")
+    return replace(g, steps=_put(g.steps, s.id, replace(s, status=STEP_ACTIVE)))
+
+
+def _step_done(g: Graph, e: Event) -> Graph:
+    s = _step(g, e.get("step"))
+    _need(s.status in (STEP_PLANNED, STEP_ACTIVE), f"cannot finish step {s.id} in status {s.status}")
+    n = int(e.get("snapshot"))
+    _need(n == 0 or n in g.snapshots, f"unknown anchor snapshot {n}")
+    epoch = g.snapshots[n].epoch if n in g.snapshots else 0
+    if e.get("anchor_epoch") is not None:
+        epoch = int(e.get("anchor_epoch"))
+    s2 = replace(s, status=STEP_DECLARED, anchor_snapshot=n, anchor_epoch=epoch, summary=e.get("summary", ""),
+                 files=tuple(tuple(f) for f in (e.get("files") or ())), declared_seq=e.seq)
+    return replace(g, steps=_put(g.steps, s.id, s2))
+
+
+def _step_anchored(g: Graph, e: Event) -> Graph:
+    s = _step(g, e.get("step"))
+    _need(s.status == STEP_DECLARED, f"step {s.id} is {s.status}, not declared")
+    cid = int(e.get("checkpoint"))
+    cp = g.checkpoints.get(cid)
+    _need(cp is not None and not cp.abandoned, f"anchor checkpoint {cid} is not on the chain")
+    _need(cp.epoch == s.anchor_epoch and cp.snapshot >= (s.anchor_snapshot or 0),
+          f"checkpoint {cid} does not contain the anchor of {s.id}")
+    g = replace(g, steps=_put(g.steps, s.id, replace(s, status=STEP_ANCHORED, checkpoint=cid)))
+    h = g.leases.get(s.task)
+    return _progress(g, e, h.worker if h else None)
+
+
+def _step_invalidated(g: Graph, e: Event) -> Graph:
+    s = _step(g, e.get("step"))
+    _need(s.status in (STEP_DECLARED, STEP_ANCHORED), f"step {s.id} is {s.status}")
+    s2 = replace(s, status=STEP_ACTIVE, anchor_snapshot=None, anchor_epoch=None, checkpoint=None)
+    return replace(g, steps=_put(g.steps, s.id, s2))
 
 
 # ======================================================================== 执行状态
@@ -253,13 +386,20 @@ def _session_started(g: Graph, e: Event) -> Graph:
     return replace(g, workers=_put(g.workers, w, replace(ws, status="running", session=sid, last_heartbeat=e.t)))
 
 
+def _session_resumed(g: Graph, e: Event) -> Graph:
+    sid = e.get("session")
+    _need(sid in g.sessions and g.sessions[sid].ended_t is None, f"cannot resume session {sid}")
+    s = g.sessions[sid]
+    return replace(g, sessions=_put(g.sessions, sid, replace(s, resumes=s.resumes + (e.get("mode"),))))
+
+
 def _session_ended(g: Graph, e: Event) -> Graph:
     sid = e.get("session")
     _need(sid in g.sessions, f"unknown session {sid}")
     s = g.sessions[sid]
     _need(s.ended_t is None, f"session {sid} already ended")
-    s2 = replace(s, ended_t=e.t, end_reason=e.get("reason"), peak_context=int(e.get("peak_context") or 0),
-                 turns=int(e.get("turns") or 0), error=e.get("error"))
+    s2 = replace(s, ended_t=e.t, ended_seq=e.seq, end_reason=e.get("reason"),
+                 peak_context=int(e.get("peak_context") or 0), turns=int(e.get("turns") or 0), error=e.get("error"))
     g = replace(g, sessions=_put(g.sessions, sid, s2))
     ws = g.workers[s.worker]
     if ws.session == sid:
@@ -278,37 +418,29 @@ def _compacted(g: Graph, e: Event) -> Graph:
     return replace(g, compactions=g.compactions + (c,))
 
 
-def _lease_renewed(g: Graph, e: Event) -> Graph:
-    lease = g.leases.get(e.get("task"))
-    _need(lease is not None and lease.worker == e.get("worker"), f"no lease on {e.get('task')} for {e.get('worker')}")
-    return replace(g, leases=_put(g.leases, lease.task, replace(lease, expires_t=float(e.get("expires_t")))))
-
-
-def _lease_expired(g: Graph, e: Event) -> Graph:
-    tid = e.get("task")
-    lease = g.leases.get(tid)
-    _need(lease is not None and lease.worker == e.get("worker"), f"no lease on {tid} for {e.get('worker')}")
-    g = replace(g, leases=_drop(g.leases, tid))
-    t = g.tasks[tid]
-    if t.status == ACTIVE:
-        g = _set_task(g, replace(t, status=OPEN))
-    return g
-
-
 def _note(g: Graph, e: Event) -> Graph:
     w = e.get("worker")
     session = g.workers[w].session if w in g.workers else None
     session = e.get("session", session)
-    return replace(g, notes=g.notes + (Note(e.seq, e.t, w, session, e.get("kind"), e.get("text")),))
+    note = Note(e.seq, e.t, w, session, e.get("kind"), e.get("text"), e.get("task"))
+    return replace(g, notes=g.notes + (note,))
 
 
-def _wip_recorded(g: Graph, e: Event) -> Graph:
+def _snapshot_taken(g: Graph, e: Event) -> Graph:
+    _running(g)
+    n = int(e.get("snapshot"))
+    _need(n == g.last_snapshot + 1, f"snapshot numbers are sequential (got {n})")
     w = e.get("worker")
+    base = int(e.get("base", g.head if g.head is not None else 0))
+    snap = Snapshot(n=n, seq=e.seq, t=e.t, worker=w, tree=e.get("tree"), raw_tree=e.get("raw_tree"), epoch=g.epoch,
+                    reason=e.get("reason"), testable=bool(e.get("testable")), commit=e.get("commit", ""), base=base,
+                    files=tuple(tuple(f) for f in (e.get("files") or ())), dropped=tuple(e.get("dropped") or ()),
+                    held=tuple(e.get("held") or ()), step=e.get("step"), session=e.get("session"),
+                    tool_seq=int(e.get("tool_seq") or 0), precheck=e.get("precheck", ""))
     prev = g.wips.get(w)
-    wip = Wip(worker=w, base=int(e.get("base")), tree=e.get("tree"), raw_tree=e.get("raw_tree", ""),
-              files=tuple(tuple(f) for f in e.get("files")), dropped=tuple(e.get("dropped") or ()),
-              diff=e.get("diff"), seq=e.seq, last_rejection=prev.last_rejection if prev else None)
-    return replace(g, wips=_put(g.wips, w, wip))
+    wip = Wip(worker=w, base=base, tree=snap.tree, raw_tree=snap.raw_tree, files=snap.files, dropped=snap.dropped,
+              snapshot=n, seq=e.seq, last_rejection=prev.last_rejection if prev else None)
+    return replace(g, snapshots=_put(g.snapshots, n, snap), wips=_put(g.wips, w, wip))
 
 
 def _stall_detected(g: Graph, e: Event) -> Graph:
@@ -323,9 +455,12 @@ def _job_started(g: Graph, e: Event) -> Graph:
     _need(jid not in g.jobs, f"job {jid} exists")
     _need(key not in g.job_keys, f"job key {key} already has job {g.job_keys.get(key)}")
     sel = e.get("selection")
+    live = bool(e.get("live"))
     job = Job(id=jid, key=key, tree=e.get("tree"), selection=None if sel is None else tuple(sel),
-              purpose=e.get("purpose"), requested_by=e.actor, attempt=e.get("attempt"), live=bool(e.get("live")),
-              tag=e.get("tag", ""), started_t=e.t, replaces=e.get("replaces"))
+              purpose=e.get("purpose"), requested_by=e.actor, attempt=e.get("attempt"), live=live,
+              where=e.get("where") or (WHERE_LIVE if live else WHERE_SLOT), tag=e.get("tag", ""),
+              locate=e.get("locate"), checkpoint=e.get("checkpoint"), started_t=e.t, started_seq=e.seq,
+              replaces=e.get("replaces"))
     g = replace(g, jobs=_put(g.jobs, jid, job), job_keys=_put(g.job_keys, key, jid))
     aid = e.get("attempt")
     if aid is not None:
@@ -337,6 +472,13 @@ def _job_started(g: Graph, e: Event) -> Graph:
     return g
 
 
+def _job_preempted(g: Graph, e: Event) -> Graph:
+    jid = e.get("job")
+    _need(jid in g.jobs and g.jobs[jid].state == JOB_RUNNING, f"job {jid} is not running")
+    j = g.jobs[jid]
+    return replace(g, jobs=_put(g.jobs, jid, replace(j, preemptions=j.preemptions + 1)))
+
+
 def _job_finished(g: Graph, e: Event) -> Graph:
     jid = e.get("job")
     _need(jid in g.jobs, f"unknown job {jid}")
@@ -344,16 +486,19 @@ def _job_finished(g: Graph, e: Event) -> Graph:
     _need(job.state == JOB_RUNNING, f"job {jid} already {job.state}")
     state = e.get("state")
     _need(state in ("finished", "unknown", "cancelled"), f"bad job state {state}")
-    job2 = replace(job, state=state, results=dict(e.get("results") or {}), error=e.get("error", ""),
-                   sec=float(e.get("sec") or 0.0), finished_t=e.t)
+    job2 = replace(job, state=state, results=dict(e.get("results") or {}), reasons=dict(e.get("reasons") or {}),
+                   error=e.get("error", ""), sec=float(e.get("sec") or 0.0), finished_t=e.t)
     keys = g.job_keys if state == JOB_FINISHED else _drop(g.job_keys, job.key)
-    return replace(g, jobs=_put(g.jobs, jid, job2), job_keys=keys)
+    g = replace(g, jobs=_put(g.jobs, jid, job2), job_keys=keys)
+    if state == JOB_FINISHED and not job.live and g.run is not None and g.run.status == RUN_RUNNING:
+        g = _check_passes(g, e, job.tree)
+    return g
 
 
 def _baseline_recorded(g: Graph, e: Event) -> Graph:
     _need(not g.baseline_ready, "baseline recorded twice")
     return replace(g, baseline=dict(e.get("classes")), baseline_ready=True,
-                   baseline_sec=float(e.get("full_sec") or 0.0))
+                   baseline_sec=float(e.get("full_sec") or 0.0), isolation=dict(e.get("isolation") or {}))
 
 
 def _checkpoint_attempted(g: Graph, e: Event) -> Graph:
@@ -361,11 +506,17 @@ def _checkpoint_attempted(g: Graph, e: Event) -> Graph:
     aid = e.get("attempt")
     _need(aid not in g.attempts, f"attempt {aid} exists")
     _need(g.baseline_ready, "checkpoint attempted before the baseline")
-    _need(e.get("base") == g.head, "attempt base must be the chain head")
+    _need(e.get("base") == g.head, "attempt base must be the chain head when it is made")
     _need(e.get("tree") != g.head_cp.tree, "attempt on the head tree (nothing to checkpoint)")
+    lane = e.get("lane")
+    _need(lane in (LANE_FG, LANE_BG), f"bad lane {lane}")
     for a in g.attempts.values():
-        _need(not (a.worker == e.get("worker") and a.status in (ATT_PENDING, ATT_ADVANCING)),
-              f"{e.get('worker')} already has attempt {a.id} in progress")
+        _need(not (a.worker == e.get("worker") and a.lane == lane and a.status in (ATT_PENDING, ATT_ADVANCING)),
+              f"{e.get('worker')} already has a {lane} attempt {a.id} in progress")
+    n = int(e.get("snapshot"))
+    _need(n in g.snapshots, f"attempt on unknown snapshot {n}")
+    snap = g.snapshots[n]
+    _need(snap.tree == e.get("tree"), "attempt tree differs from its snapshot")
     tasks = tuple(e.get("tasks") or ())
     for tid in tasks:
         t = _task(g, tid)
@@ -375,8 +526,24 @@ def _checkpoint_attempted(g: Graph, e: Event) -> Graph:
     sel = e.get("selection")
     a = Attempt(id=aid, worker=e.get("worker"), trigger=e.get("trigger"), tree=e.get("tree"), base=e.get("base"),
                 tier=e.get("tier"), selection=None if sel is None else tuple(sel), tasks=tasks,
-                summary=e.get("summary", ""), raw_tree=e.get("raw_tree", ""), created_seq=e.seq)
+                summary=e.get("summary", ""), raw_tree=e.get("raw_tree", ""), created_seq=e.seq, snapshot=n,
+                epoch=snap.epoch, lane=lane, kind=e.get("kind") or KIND_MILESTONE)
     return replace(g, attempts=_put(g.attempts, aid, a))
+
+
+def _attempt_superseded(g: Graph, e: Event) -> Graph:
+    aid = e.get("attempt")
+    _need(aid in g.attempts, f"unknown attempt {aid}")
+    a = g.attempts[aid]
+    _need(a.status == ATT_PENDING, f"attempt {aid} is {a.status}, only pending attempts can be superseded")
+    g = replace(g, attempts=_put(g.attempts, aid, replace(a, status=ATT_SUPERSEDED, reason=e.get("reason"))))
+    cp = e.get("review_checkpoint")
+    for tid in a.tasks:
+        t = g.tasks[tid]
+        if t.status == REVIEW and t.review_attempt == aid:
+            _need(cp is not None and cp == g.head, f"superseded review attempt {aid} must hand {tid} to the head")
+            g = _set_task(g, replace(t, review_checkpoint=cp))
+    return g
 
 
 def _checkpoint_advancing(g: Graph, e: Event) -> Graph:
@@ -384,9 +551,11 @@ def _checkpoint_advancing(g: Graph, e: Event) -> Graph:
     _need(aid in g.attempts, f"unknown attempt {aid}")
     a = g.attempts[aid]
     _need(a.status == ATT_PENDING, f"attempt {aid} is {a.status}")
-    _need(a.base == g.head, f"attempt {aid} is based on {a.base}, head is {g.head}")
     _need(e.get("parent_commit") == g.head_cp.commit, "parent commit must be the head commit")
     _need(not any(x.status == ATT_ADVANCING for x in g.attempts.values()), "another attempt is advancing")
+    hs = g.head_cp
+    _need(not (hs.epoch == a.epoch and hs.snapshot >= a.snapshot and hs.id != 0),
+          f"attempt {aid} is older than the head (it should be superseded)")
     a2 = replace(a, status=ATT_ADVANCING, parent_commit=e.get("parent_commit"), date=float(e.get("date")),
                  flaky=tuple(e.get("flaky") or ()))
     return replace(g, attempts=_put(g.attempts, aid, a2))
@@ -398,29 +567,35 @@ def _checkpoint_created(g: Graph, e: Event) -> Graph:
     files = tuple(tuple(f) for f in (e.get("files") or ()))
     if cid == 0:
         _need(not g.checkpoints, "checkpoint 0 is the first checkpoint")
-        cp = Checkpoint(0, e.get("commit"), e.get("tree"), None, e.seq, e.t)
-        return replace(g, checkpoints={0: cp}, head=0)
+        cp = Checkpoint(0, e.get("commit"), e.get("tree"), None, e.seq, e.t, confirmed_seq=e.seq)
+        return replace(g, checkpoints={0: cp}, head=0, confirmed=0)
     _running(g)
     aid = e.get("attempt")
     _need(aid in g.attempts, f"checkpoint {cid} from unknown attempt {aid}")
     a = g.attempts[aid]
     _need(a.status == ATT_ADVANCING, f"attempt {aid} is {a.status}, not advancing")
-    _need(a.base == g.head, "CAS: attempt base is no longer the head")
+    _need(a.parent_commit == g.head_cp.commit, "CAS: the parent commit is no longer the head")
     _need(e.get("tree") == a.tree, "checkpoint tree differs from the verified tree")
     _need(cid == max(g.checkpoints) + 1, f"checkpoint ids are sequential (got {cid})")
     held = tuple(sorted({l.task for l in g.leases.values() if l.worker == a.worker} | set(a.tasks)))
+    level = CONFIRMED if a.tier == "full" else PROVISIONAL
     cp = Checkpoint(cid, e.get("commit"), a.tree, g.head, e.seq, e.t, attempt=aid, tier=a.tier, trigger=a.trigger,
-                    files=files, tasks=held)
+                    files=files, tasks=held, snapshot=a.snapshot, epoch=a.epoch, kind=a.kind, level=level,
+                    confirmed_seq=e.seq if level == CONFIRMED else None,
+                    label=(a.summary or "").strip().split("\n")[0][:300])      # 手动存档的 summary 就是里程碑标签
     g = replace(g, checkpoints=_put(g.checkpoints, cid, cp), head=cid,
                 attempts=_put(g.attempts, aid, replace(a, status=ATT_CREATED, checkpoint=cid)))
+    g = replace(g, confirmed=latest_confirmed_ancestor(g, cid))
     for tid in a.tasks:
         t = g.tasks[tid]
         if t.status == REVIEW and t.review_attempt == aid:
             g = _set_task(g, replace(t, review_checkpoint=cid))
     wip = g.wips.get(a.worker)
     if wip is not None and wip.tree == a.tree:      # 存进去的正是当前的 WIP：它相对新存档没有未验证的改动了
-        g = replace(g, wips=_put(g.wips, a.worker, replace(wip, base=cid, files=(), diff=None, last_rejection=None)))
-    return _progress(g, e, a.worker)
+        g = replace(g, wips=_put(g.wips, a.worker, replace(wip, base=cid, files=(), last_rejection=None)))
+    if a.kind in PROGRESS_KINDS or level == CONFIRMED:
+        g = _progress(g, e, a.worker)
+    return _check_passes(g, e, a.tree)
 
 
 def _checkpoint_rejected(g: Graph, e: Event) -> Graph:
@@ -432,11 +607,33 @@ def _checkpoint_rejected(g: Graph, e: Event) -> Graph:
     a2 = replace(a, status=ATT_REJECTED, regressions=regs, flaky=tuple(e.get("flaky") or ()), reason=e.get("reason"))
     g = replace(g, attempts=_put(g.attempts, aid, a2))
     wip = g.wips.get(a.worker)
-    if wip is not None:
+    if wip is not None and (a.lane == LANE_FG or a.kind in (KIND_STEP, "handoff")):
         rej = {"attempt": aid, "seq": e.seq, "reason": e.get("reason"), "regressions": list(regs[:50]),
-               "n_regressions": len(regs), "flaky": list(a2.flaky[:20]), "detail": e.get("detail", "")}
+               "n_regressions": len(regs), "flaky": list(a2.flaky[:20]), "detail": e.get("detail", ""),
+               "snapshot": a.snapshot, "kind": a.kind}
         g = replace(g, wips=_put(g.wips, a.worker, replace(wip, last_rejection=rej)))
     return g
+
+
+def _checkpoint_confirmed(g: Graph, e: Event) -> Graph:
+    _running(g)
+    cid = int(e.get("checkpoint"))
+    cp = g.checkpoints.get(cid)
+    _need(cp is not None and not cp.abandoned, f"checkpoint {cid} is not on the chain")
+    _need(cp.level != CONFIRMED and not cp.demoted, f"checkpoint {cid} is already {cp.level}")
+    g = _set_cp(g, replace(cp, level=CONFIRMED, confirmed_seq=e.seq))
+    g = replace(g, confirmed=latest_confirmed_ancestor(g, g.head))
+    return _progress(g, e, None)
+
+
+def _checkpoint_demoted(g: Graph, e: Event) -> Graph:
+    _running(g)
+    cid = int(e.get("checkpoint"))
+    cp = g.checkpoints.get(cid)
+    _need(cp is not None and cp.id != 0, f"cannot demote checkpoint {cid}")
+    _need(cp.level == PROVISIONAL and not cp.demoted, f"checkpoint {cid} cannot be demoted")
+    g = _set_cp(g, replace(cp, demoted=True, demote_regressions=tuple(e.get("regressions") or ())))
+    return replace(g, confirmed=latest_confirmed_ancestor(g, g.head))
 
 
 def _rollback(g: Graph, e: Event) -> Graph:
@@ -460,22 +657,128 @@ def _rollback(g: Graph, e: Event) -> Graph:
               f"task {t.id} is done on abandoned checkpoint {t.done_checkpoint}; reopen it first")
         _need(not (t.status == REVIEW and t.review_checkpoint in chain_ids),
               f"task {t.id} is reviewed on abandoned checkpoint {t.review_checkpoint}; reopen it first")
-    return replace(g, checkpoints=cps, head=to)
+    for s in g.steps.values():
+        _need(not (s.status == STEP_ANCHORED and s.checkpoint in chain_ids),
+              f"step {s.id} is anchored on abandoned checkpoint {s.checkpoint}; invalidate it first")
+    epoch = g.epoch + 1
+    g = replace(g, checkpoints=cps, head=to, epoch=epoch, epoch_base=_put(g.epoch_base, epoch, to))
+    return replace(g, confirmed=latest_confirmed_ancestor(g, to))
+
+
+# ======================================================================== 定位、诊断、复查
+
+def _persistent_regression(g: Graph, e: Event) -> Graph:
+    _running(g)
+    out = dict(g.persistent)
+    for test in e.get("tests"):
+        out[test] = Persistent(test, e.seq, e.t, int(e.get("since") or 0), int(e.get("epoch", g.epoch)),
+                               e.get("trigger"), e.get("checkpoint"))
+    return replace(g, persistent=out)
+
+
+def _locate_started(g: Graph, e: Event) -> Graph:
+    _running(g)
+    lid = e.get("locate")
+    _need(lid not in g.locates, f"locate {lid} exists")
+    bad = e.get("bad")
+    loc = Locate(id=lid, tests=tuple(e.get("tests")), bad_tree=bad["tree"], bad_snapshot=bad.get("snapshot"),
+                 bad_checkpoint=bad.get("checkpoint"), epoch=int(e.get("epoch")), lower=int(e.get("lower", 0)),
+                 trigger=e.get("trigger"), started_seq=e.seq, started_t=e.t, ref=e.get("ref"))
+    return replace(g, locates=_put(g.locates, lid, loc))
+
+
+def _locate_concluded(g: Graph, e: Event) -> Graph:
+    lid = e.get("locate")
+    _need(lid in g.locates and g.locates[lid].status == "running", f"locate {lid} is not running")
+    loc = g.locates[lid]
+    return replace(g, locates=_put(g.locates, lid, replace(loc, status="concluded",
+                                                         groups=tuple(dict(x) for x in e.get("groups")))))
+
+
+def _regression_located(g: Graph, e: Event) -> Graph:
+    lid = e.get("locate")
+    _need(lid in g.locates and g.locates[lid].status == "concluded", f"locate {lid} is not concluded")
+    loc = g.locates[lid]
+    rec = {k: e.get(k) for k in ("tests", "good", "bad", "exact", "files", "diff", "attribution", "group")}
+    rec["seq"] = e.seq
+    return replace(g, locates=_put(g.locates, lid, replace(loc, results=loc.results + (rec,))))
+
+
+def _relation_learned(g: Graph, e: Event) -> Graph:
+    rel = list(g.relations)
+    for src, tf in e.get("pairs"):
+        if (src, tf) not in rel:
+            rel.append((src, tf))
+    return replace(g, relations=tuple(rel))
+
+
+def _diagnosis_requested(g: Graph, e: Event) -> Graph:
+    did = e.get("diagnosis")
+    _need(did not in g.diagnoses, f"diagnosis {did} exists")
+    d = Diagnosis(id=did, trigger=e.get("trigger"), tests=tuple(e.get("tests")), key=e.get("key", ""), seq=e.seq,
+                  locate=e.get("locate"), previous=e.get("previous"))
+    return replace(g, diagnoses=_put(g.diagnoses, did, d))
+
+
+def _diagnosis_recorded(g: Graph, e: Event) -> Graph:
+    did = e.get("diagnosis")
+    _need(did in g.diagnoses and g.diagnoses[did].status == "requested", f"diagnosis {did} is not requested")
+    d = g.diagnoses[did]
+    status = "failed" if e.get("failed") else "recorded"
+    return replace(g, diagnoses=_put(g.diagnoses, did, replace(d, status=status,
+                                                            result=dict(e.get("result") or {}))))
+
+
+def _review_started(g: Graph, e: Event) -> Graph:
+    _running(g)
+    t = _task(g, e.get("task"))
+    _need(t.status in (DONE_UNVERIFIED, BLOCKED), f"cannot review {t.id} in status {t.status}")
+    _need(t.review != "running", f"{t.id} is already under review")
+    return _set_task(g, replace(t, review="running", review_missing=()))
+
+
+def _review_recorded(g: Graph, e: Event) -> Graph:
+    t = _task(g, e.get("task"))
+    _need(t.review == "running", f"{t.id} has no review in progress")
+    impl = e.get("implemented")
+    _need(impl in ("yes", "partial", "no", "reading", "none", "failed"), f"bad review result {impl}")
+    return _set_task(g, replace(t, review=impl, review_missing=tuple(e.get("missing") or ())[:30]))
+
+
+def _checkpoint_labeled(g: Graph, e: Event) -> Graph:
+    cid = int(e.get("checkpoint"))
+    _need(cid in g.checkpoints, f"unknown checkpoint {cid}")
+    return _set_cp(g, replace(g.checkpoints[cid], label=str(e.get("label"))[:300]))
+
+
+def _progress_summary(g: Graph, e: Event) -> Graph:
+    rec = {"seq": e.seq, "worker": e.get("worker"), "text": str(e.get("text"))[:4000], "after": e.get("after")}
+    return replace(g, summaries=(g.summaries + (rec,))[-20:])
 
 
 HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
-    "run_started": _run_started, "runtime_recovered": _runtime_recovered, "deadline_reserve": _deadline_reserve,
-    "delivered": _delivered,
+    "run_started": _run_started, "runtime_recovered": _runtime_recovered, "run_suspended": _run_suspended,
+    "deadline_reserve": _deadline_reserve, "finalize_started": _finalize_started, "delivered": _delivered,
     "plan_proposed": _plan_proposed, "requirement_frozen": _requirement_frozen, "task_added": _task_added,
     "task_split": _task_split, "task_claimed": _task_claimed, "task_released": _task_released,
     "review_requested": _review_requested, "task_done": _task_done, "task_blocked": _task_blocked,
     "task_reopened": _task_reopened,
-    "session_started": _session_started, "session_ended": _session_ended, "compacted": _compacted,
-    "lease_renewed": _lease_renewed, "lease_expired": _lease_expired, "note": _note, "wip_recorded": _wip_recorded,
-    "stall_detected": _stall_detected,
-    "job_started": _job_started, "job_finished": _job_finished, "baseline_recorded": _baseline_recorded,
-    "checkpoint_attempted": _checkpoint_attempted, "checkpoint_advancing": _checkpoint_advancing,
-    "checkpoint_created": _checkpoint_created, "checkpoint_rejected": _checkpoint_rejected, "rollback": _rollback,
+    "steps_planned": _steps_planned, "step_started": _step_started, "step_done": _step_done,
+    "step_anchored": _step_anchored, "step_invalidated": _step_invalidated,
+    "session_started": _session_started, "session_resumed": _session_resumed, "session_ended": _session_ended,
+    "compacted": _compacted, "note": _note, "snapshot_taken": _snapshot_taken, "stall_detected": _stall_detected,
+    "job_started": _job_started, "job_preempted": _job_preempted, "job_finished": _job_finished,
+    "baseline_recorded": _baseline_recorded,
+    "checkpoint_attempted": _checkpoint_attempted, "attempt_superseded": _attempt_superseded,
+    "checkpoint_advancing": _checkpoint_advancing, "checkpoint_created": _checkpoint_created,
+    "checkpoint_rejected": _checkpoint_rejected, "checkpoint_confirmed": _checkpoint_confirmed,
+    "checkpoint_demoted": _checkpoint_demoted, "rollback": _rollback,
+    "persistent_regression": _persistent_regression, "locate_started": _locate_started,
+    "locate_concluded": _locate_concluded, "regression_located": _regression_located,
+    "relation_learned": _relation_learned, "diagnosis_requested": _diagnosis_requested,
+    "diagnosis_recorded": _diagnosis_recorded, "review_started": _review_started,
+    "review_recorded": _review_recorded, "checkpoint_labeled": _checkpoint_labeled,
+    "progress_summary": _progress_summary,
 }
 
 

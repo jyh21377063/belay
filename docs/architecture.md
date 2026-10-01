@@ -9,13 +9,14 @@
 belay/
 ├── core/            纯函数核心：不做 IO、不调模型、不读时钟（now 作为参数传入）
 │   ├── events.py    事件类型、必需字段、允许的来源
-│   ├── model.py     三个视图（任务图 / 执行状态 / 存档链）的不可变数据模型；快照序列化
+│   ├── model.py     三个视图（任务图 + 步骤 / 执行状态 + 快照时间线 / 两级存档链）的不可变数据模型；快照序列化
 │   ├── reduce.py    apply(graph, event) / replay(events)：视图的推导函数，也是状态机的最后一道防线
-│   ├── rules.py     状态转换规则：输入（worker 请求 / 观察 / 时钟）→ 事件；next_step（会话结束 ≠ 运行结束）
-│   ├── verify.py    基线归类、守护集合、相关测试选择、回归判定、按树合并作业结果
-│   ├── queries.py   只读查询（可做的任务、需求状态、存档链……）
-│   ├── suggest.py   调度建议
-│   ├── context.py   build_context：9 段开场上下文，超预算从下往上裁
+│   ├── rules.py     状态转换规则：输入（worker 请求 / 快照 / 观察 / 时钟 / LLM 结果）→ 事件：前台与后台存档线、提升与
+│   │                降级、快照二分定位、持续性回归、诊断与复查、步骤；next_step（会话结束 ≠ 运行结束）
+│   ├── verify.py    基线归类、守护集合、相关测试选择（含学到的相关性）、回归判定、按树合并作业结果、定位点状态、优先级
+│   ├── queries.py   只读查询（需求状态、存档链、交付点、快照时间线、步骤、恢复点……）
+│   ├── suggest.py   调度建议（依赖只是排序提示）
+│   ├── context.py   build_context：分层开场上下文（受保护段 + 各段上限 + 折叠与查询入口）；resume_reminder
 │   ├── compact.py   L0 落盘 / L1 清理 / L2 用图重建（消息列表的纯变换）
 │   ├── plan.py      规划提议的校验（逐字引文、覆盖、无环）与机械切分
 │   ├── invariants.py 不变量
@@ -24,17 +25,17 @@ belay/
 ├── runtime/         命令式外壳
 │   ├── store.py     SQLite 事件表 + 视图快照 + 附件
 │   ├── runtime.py   Runtime.submit：锁内“规则 → 追加事件 → 更新视图 → 检查不变量”，之后执行副作用
-│   ├── gitops.py    影子仓库：快照、剔除测试改动、确定的提交、CAS、检出
-│   ├── verifier.py  作业：setsid 进程组、完成标记、读写锁（验证独占工作区）
-│   ├── session.py   会话循环：工具执行、L0–L4
-│   ├── port.py      WorkerPort：Belay 工具与 runtime 之间的接口，通知
+│   ├── gitops.py    影子仓库：快照与快照提交、剔除测试改动、确定的提交、CAS、检出、增量 bundle、只撤销一段改动
+│   ├── verifier.py  作业：验证槽位池 + 可抢占的优先级队列、setsid 进程组、完成标记、重新接上、导入隔离探针
+│   ├── session.py   会话循环：工具执行与快照钩子、L0–L4（步骤边界交接）、消息轨迹（读盘重放）、ModelCallFailed
+│   ├── port.py      WorkerPort：Belay 工具与 runtime 之间的接口，通知（只推能据此行动的）
 │   ├── planner.py   规划器（LLM 提议 + 校验 + 重试 + 机械兜底）；停滞时的拆分提议
-│   ├── driver.py    BelayRun：准备、会话、收尾、交付、副作用执行
-│   ├── recovery.py  重启对账
+│   ├── driver.py    BelayRun：准备（基线双跑）、快照、会话（内存重试 / 读盘重放）、收尾与交付、镜像、挂起、副作用
+│   ├── recovery.py  重启对账：CAS、重新接上作业、会话接续、容器重建
 │   └── prompts.py   系统提示、L3 / 规划器提示词
 ├── tools/           模型能调用的工具（通用工具 + belay.py）
 ├── worker/          B 组的 worker 循环（也跑只读探索子 agent）
-├── container/       上传到容器里执行的脚本（只用标准库）
+├── container/       上传到容器里执行的脚本（只用标准库）：runner.py（槽位导出、种子、sys.path、隔离探针、检查运行）
 ├── env.py  llm.py  cli.py
 tests/
 ├── sim.py           纯核心的模拟器（假的作业与 git），单元测试与重放一致性测试共用
@@ -55,3 +56,7 @@ tests/
 整个 Belay 跑在一个 asyncio 事件循环里。`Runtime.submit` 是唯一的写入口，在一把锁里完成决定与写日志，
 所以不需要别的并发控制；会话循环、作业、时钟、副作用都是这个循环里的协程，只通过 submit 改变状态、通过
 `wait_until(谓词)` 等待图的变化。这就是“函数式核心、命令式外壳”：难调试的并发问题集中在很薄的外壳里。
+
+一次运行内部的并发来自 worker 与 runtime 自己的后台活动（快照验证、提升、定位、长作业、会话交替、崩溃重启），
+不来自多个 agent：前台与后台存档尝试各至多一个，父节点在推进时确定（CAS），新快照胜出；验证在验证槽位里跑，
+不碰 worker 的工作区（隔离无效时降级为切换工作区，并关闭后台验证）。

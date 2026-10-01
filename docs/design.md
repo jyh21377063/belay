@@ -1,12 +1,13 @@
-# Belay v5 实现设计
+# Belay 实现设计（v6：长程单 worker 的可靠性底座）
 
-本文是 `Belay v5：用任务状态图管理长程 agent 的 runtime` 方案落到代码时的设计说明：方案里没写死、但实现必须
-定下来的东西，以及为什么这样定。方案本身讲“为什么要有这张图”，这里讲“这张图具体长什么样、怎么动”。
+本文是《Belay 改进计划 v2（修订稿）》落到代码时的设计说明：计划里没写死、但实现必须定下来的东西，以及为什么这样定。
+计划讲“要解决什么、机制要做对什么”，这里讲“这张图具体长什么样、怎么动”。目标场景：一个任务连续运行十几小时到一天，
+中间经历几十次会话交接，runtime 进程与容器都可能丢失。
 
 ## 0. 一句话结构
 
 ```
-          worker 工具请求 / 验证器结果 / git 结果 / 时钟
+          worker 工具请求 / 快照 / 验证器结果 / git 结果 / LLM 结果 / 时钟
                            │  (输入)
                            ▼
    rules.*(graph, 输入, now, cfg) ──► [事件草稿]      纯函数：决定
@@ -17,246 +18,240 @@
                            │
            effects_for(事件, graph') ──► [副作用]      纯函数：计划副作用
                            │
-      执行副作用（跑作业、git CAS、还原工作区……）      命令式外壳，结果再作为输入回来
+      执行副作用（作业、git CAS、bundle、定位 diff、诊断、复查……）   命令式外壳，结果再作为输入回来
 ```
 
-- `belay/core/` 全是纯函数：不做 IO、不调模型、不读时钟（`now` 作为参数传入）。决定、推导、调度建议、上下文构建、
-  压缩的规则部分、不变量都在这里，全部可以用普通单元测试覆盖。
-- `belay/runtime/` 是薄的命令式外壳：事件存储、git、作业、会话循环、LLM 调用、恢复对账。
+一次运行内部有两条并行的线：worker 在前台写代码；runtime 在后台拍快照、验证、推进存档、提升、定位。两者只通过事件
+日志与通知交汇，后台从不碰 worker 的工作区（验证在验证槽位里跑；隔离无效时降级，见 §3.1）。
+
+- `belay/core/` 全是纯函数：不做 IO、不调模型、不读时钟（`now` 作为参数传入）。
+- `belay/runtime/` 是薄的命令式外壳：事件存储、git、验证槽位、会话循环、LLM 调用、镜像与恢复。
 - **唯一写者**：`Runtime.submit()` 在一把锁里执行“规则 → 追加事件 → 更新视图”，所以不需要其他并发控制。
 
 ## 1. 事件
 
 每条事件：`seq`（从 1 开始连续递增，同时是图的版本号）、`t`（墙钟秒）、`type`、`actor`、`source`、`payload`。
 
-- `actor`：`runtime` / `worker:<id>` / `verifier` / `planner` / `compactor`
-- `source`：`observed`（观察）/ `rule`（规则）/ `llm`（LLM 提议，已被规则校验）/ `self_report`（自述）
+**来源纪律**（`invariants.check_log` / `llm_effects`）：`task_done`、`checkpoint_created`、`checkpoint_advancing`、
+`checkpoint_confirmed`、`step_anchored`、`delivered` 只能来自 `rule` / `observed`；`llm` 的事件只能记录、重开、新增
+（`diagnosis_recorded`、`review_recorded`、`checkpoint_labeled`、`progress_summary`），永远不引起完成、存档、提升。
+由观察推断出的结论（学到的相关性、持续性回归）记为 `rule`。
 
-**来源纪律**（由不变量检查）：`task_done`、`checkpoint_created` 的来源只能是 `rule` 或 `observed`；
-`self_report` 与 `llm` 的事件永远不能让任务进入完成、不能推进存档链。worker 发起的认领、放弃、声明做完、
-报告受阻是被允许的转换（方案原文），它们由规则接受后写成 `source=rule, actor=worker:w1`，
-其中的文字（笔记、原因）作为自述字段保留。
-
-### 事件表
-
-与方案一致，只增加了一种：`checkpoint_advancing`（三步推进存档的第一步，恢复对账必须有它）。
-
-| 类别 | 事件 | 谁写 | 视图变化 |
+| 类别 | 事件 | 来源 | 视图变化 |
 | --- | --- | --- | --- |
-| 运行 | `run_started` | runtime | 任务原文、预算、截止时间、验证器能力 |
-| | `runtime_recovered` | runtime | 恢复次数、停机时长 |
-| | `deadline_reserve` | rule | 进入截止预留：停下 worker，由 runtime 做全量存档并交付 |
-| | `delivered` | rule | 运行结束（DONE / INCOMPLETE），交付的存档 |
-| 任务 | `plan_proposed` | planner(llm) | 只记录提议与校验报告，不改变图 |
-| | `requirement_frozen` | rule | 一次性写入全部需求并冻结 |
-| | `task_added` | llm / self_report | 新任务 |
-| | `task_split` | llm / self_report | 父任务 → `split`，子任务继承链接 |
-| | `task_claimed` / `task_released` | rule | 租约与任务状态 |
-| | `review_requested` | rule | `active → review` |
-| | `task_done` | rule | `review → done / done_unverified` |
-| | `task_blocked` | self_report | `→ blocked`，原因与引文 |
-| | `task_reopened` | rule | `→ active`（租约还在）或 `open` |
-| 执行 | `session_started` / `session_ended` | runtime | 会话、开场上下文摘要、结束原因 |
-| | `compacted` | compactor | 压缩层级、前后 token、L3 摘要 |
-| | `lease_renewed` / `lease_expired` | rule | 租约 |
-| | `note` | self_report | 笔记 / 待办 |
-| | `wip_recorded` | observed | 未验证进度：基于哪个存档、改了哪些文件、diff 附件 |
-| | `stall_detected` | rule | 停滞类型与处理（提示 / 重新规划） |
-| 验证 | `job_started` / `job_finished` | rule / observed | 作业；同一 (树, 检查集合) 只跑一次 |
-| | `baseline_recorded` | observed | 原始代码上两次运行的归类：pass / fail / flaky / skip |
-| | `checkpoint_attempted` | rule | 一次存档尝试：候选树、档位、要跑的检查 |
-| | `checkpoint_advancing` | rule | 验证通过，准备 CAS（先记意图） |
-| | `checkpoint_created` | observed | CAS 成功，存档链前进 |
-| | `checkpoint_rejected` | rule | 回归列表；链不动；原因写入 WIP |
-| | `rollback` | rule | 还原工作区；必要时把链头退回，之后的存档作废 |
+| 运行 | `run_started` / `runtime_recovered` / `run_suspended` | rule / observed / rule | 预算、恢复与重建次数、丢失的快照、隔离状态 |
+| | `deadline_reserve` / `finalize_started` / `delivered` | rule | 截止预留；收尾开始（不再开后台验证）；交付点、级别、落后多少 |
+| 任务 | `plan_proposed` `requirement_frozen` `task_added` `task_split` | llm / rule / self | 同 v5 |
+| | `task_claimed`（带 `head`）/ `task_released` / `review_requested` / `task_done` / `task_blocked` / `task_reopened` | rule / self | 当前焦点（没有时效）；认领时的链头作为恢复点的基底 |
+| 步骤 | `steps_planned` / `step_started` / `step_done` | self_report | todo 列表即焦点任务的步骤计划；`step_done` 带锚点快照 |
+| | `step_anchored` / `step_invalidated` | rule | 锚点被链上同段存档包含；回退使锚点不在链上 |
+| 执行 | `session_started` / `session_resumed` / `session_ended` / `compacted` / `note` | rule / observed / … | `session_resumed.mode` = memory（内存重试）/ replay（读盘重放） |
+| | `snapshot_taken` | observed | 快照时间线（序号、段号、原因、可测、持有的任务与步骤、快照提交）；同时更新 WIP |
+| | `stall_detected` | rule | 同 v5 |
+| 验证 | `job_started`（带 `where`：slot / workspace / live）/ `job_preempted` / `job_finished`（带 `reasons`） | rule / observed | 作业与失败原因 |
+| | `baseline_recorded`（带 `isolation`） | observed | 守护集合、导入隔离是否有效 |
+| 存档 | `checkpoint_attempted`（带 `snapshot`、`lane`、`kind`）/ `attempt_superseded` | rule | 前台 / 后台尝试；更旧的尝试被新存档取代 |
+| | `checkpoint_advancing` / `checkpoint_created` / `checkpoint_rejected` | rule / observed | 父节点在推进时确定；新存档为暂存（related）或确认（full） |
+| | `checkpoint_confirmed` / `checkpoint_demoted` | observed / rule | 全量通过 → 确认点前移；确认过的回归 → 降级 |
+| | `rollback` | rule | 段号 +1；确认点退回链上最近的确认祖先 |
+| 定位 | `persistent_regression` / `locate_started` / `locate_concluded` / `regression_located` / `relation_learned` | rule / rule / rule / observed / rule | 见 §3.4 |
+| LLM | `diagnosis_requested` / `diagnosis_recorded` | rule / llm | 诊断者（只解释） |
+| | `review_started` / `review_recorded` | rule / llm | 复查者（只收紧：只能重开） |
+| | `checkpoint_labeled` / `progress_summary` | llm | 没有步骤时的兜底 |
+
+去掉的事件：`lease_renewed`、`lease_expired`（单 worker 下持有没有时效）、`wip_recorded`（并入 `snapshot_taken`）。
 
 ## 2. 三个视图
 
 全部定义在 `belay/core/model.py`，是不可变 dataclass；`reduce` 返回新图（结构共享，不修改旧图）。
 
-### A 任务图
+- 任务图：`Requirement`、`Task`（新增 `claimed_head`、`passed_checks`、`review*`、`history`）、`Step`。
+- 执行状态：`Session`（`ended_seq`、`resumes`）、`Lease`（当前焦点，没有 TTL）、`Wip`、`Snapshot`、`Job`、`Persistent`、
+  `Locate`、`Diagnosis`；`graph.epoch` / `graph.epoch_base`（段号 → 段起点存档）；`graph.isolation`。
+- 存档链：`Attempt`（`snapshot`、`epoch`、`lane`、`kind`、状态新增 `superseded`）、`Checkpoint`（`snapshot`、`epoch`、
+  `kind` ∈ auto/step/milestone/review/handoff/final/baseline、`level` ∈ provisional/confirmed、`demoted`、`label`）；
+  `graph.head` 与 `graph.confirmed`（最新确认点，永远是链头的祖先或就是链头）。
 
-- `Requirement(id, quote, summary, origin)`：`requirement_frozen` 之后不可改（reducer 拒绝任何修改）。
-- `Task(id, title, description, links, blocked_by, parent, discovered_from, priority, checks, status, origin, ...)`
-- 检查（Check）不单独建表：检查 id 就是测试 node id（`tests/test_x.py::test_y`）或公开检查 `cmd:<name>`；
-  基线归类在 `graph.baseline`，公开检查列表在 `run.public_checks`。任务的 `checks` 就是 `verified_by` 边。
-  worker 自己写的测试（基线里不存在）只是开发信号，不能作为 `verified_by`。
+### 三个基准
 
-任务状态机：
-
-```
-            claim                ready_for_review          证据（规则）
-  open ──────────────► active ─────────────────► review ─────────────► done / done_unverified
-   ▲  ◄────────────── │  ▲                          │
-   │     release      │  └──── reopened ────────────┘  （存档被拒 / 证据失败；租约还在）
-   │                  │
-   └─── reopened ─────┴──► blocked （report_blocked，任意未完成状态可进入；再次 claim 会先 reopen）
-  open/active/blocked ──split──► split（子任务继承链接）
-  done* ──reopened（rollback 使其存档作废）──► open
-```
-
-“可做”（ready）是推导的：`open` 且 `blocked_by` 全部完成（done 或 done_unverified）。
-
-### B 执行状态
-
-- `Worker(id, status, session, last_heartbeat)`
-- `Session(id, worker, n, started_t, ended_t, end_reason, opening, peak_context, compactions, transcript, progress)`
-  —— `progress` 记录这个会话里（包括它结束后 runtime 替它做的存档）有没有新证据，用于“连续两个会话没有进展”。
-- `Lease(task, worker, acquired_t, expires_t)`
-- `Wip(worker, base, tree, files, dropped, diff, last_rejection)`；worker 的笔记与待办在 `notes`（自述，单独标注）。
-- `Job(id, key, tree, selection, purpose, state, results, sec, error)`；`purpose` ∈ baseline / verify / confirm / evidence / dev。
-
-### C 存档链
-
-- `Checkpoint(id, commit, tree, parent, attempt, tier, trigger, created_seq, files, tasks, abandoned)`；0 号是基线。
-- `Attempt(id, worker, trigger, tree, base, tier, selection, tasks, jobs, phase, status, regressions, flaky, ...)`
-- `graph.head`：链头。**存档 = (事件序号, git 提交)** 的一致切面。
-
-一个树上的检查结果 = 所有在这棵树上完成的作业结果的合并（`results_for_tree`）。任务的“证据”就是它的检查在
-存档那棵树上的结果，所以不需要单独存证据：作业按树哈希去重，证据按树哈希连接到存档。
+| 用途 | 基准 | 实现 |
+| --- | --- | --- |
+| 交付 | 最新的确认点 | `queries.delivery_checkpoint`；除基线外没有确认点时按 `deliver_unconfirmed` |
+| `rollback` 的默认目标 | 最近的里程碑（暂存或确认） | `queries.latest_milestone`（kind ∈ step/milestone/review/handoff/final/baseline） |
+| 容器重建 | 整条链、全部快照与最新快照 | `recovery.rebuild_container` |
 
 ## 3. 关键规则
 
-### 3.1 存档：验证后比较并交换
+### 3.1 独立目录验证（模块 A）
 
-1. 请求（worker 的 `checkpoint` / `ready_for_review`，或 runtime 在会话结束、交接、截止、收尾时发起）先由外壳
-   观察工作区：快照成树 → **剔除测试路径下的改动**（测试文件恢复为原始版本）→ 候选树。
-2. 规则写 `wip_recorded` 和 `checkpoint_attempted`：
-   - 档位：平时 `related`（按文件路径规则挑选相关测试文件，宁多勿少；改了非 Python 文件、配置、conftest，
-     或者一个相关测试都找不到，就升级为 `full`）；截止与收尾时 `full`。
-   - 要跑的检查 = 相关守护测试所在的文件 ∪ 待验证任务的检查。
-   - 同一 (树, 检查集合) 已有作业就复用，不再跑。
-3. 作业结束后判定：守护集合（基线上两次都通过）中被选中的测试，候选上**失败、出错、被跳过、漏跑**都算回归。
-   有回归时先对这些测试重跑一次确认（`confirm`），重跑通过的记为 `flaky`，不算回归（这仍是观察到的事实）。
-4. 没有回归 → `checkpoint_advancing`（意图入日志）→ 外壳 `commit-tree`（提交日期取事件时间，所以重做得到同一个
-   提交）+ `update-ref <新> <旧>` → `checkpoint_created`。有回归 → `checkpoint_rejected`，存档链不动，工作区
-   原样保留，回归写入 WIP 的 `last_rejection`。
-5. 候选树与链头相同：不产生尝试（没有东西可存）。`ready_for_review` 此时直接在链头上判定证据；收尾时链头的全量验证
-   由 `verify_head` 在链头那棵树上起作业完成（有回归同样先确认），全量结果里出现的回归如实写进账本
-   （`head_regressions`）—— 这就是分档验证可能漏掉的回归。
-6. 收尾时被取消的验证作业不再重跑，依赖它的尝试直接拒绝；正在 CAS 的尝试不能中止，交付前等它做完。
+- 非 live 的作业默认 `where=slot`：runner 先把候选树导出到验证槽位（`read-tree --reset -u` 按槽位索引只改动不同的
+  文件；`git clean -fd` 清掉未被忽略的未跟踪文件，被忽略的构建产物留作缓存），第一次导出后从工作区复制被忽略的文件与
+  项目自己的 `.git` 作为构建缓存种子（`cp -a --reflink=auto`）。
+- `sys.path` 映射：基线阶段在工作区跑 `runner.py probe`，把位于工作区之下的条目按原顺序映射到槽位（再补根目录与
+  `src/`），作为 `PYTHONPATH` 放在最前（`RunnerVerifier.map_sys_path`）。
+- 基线双跑：一次 `where=workspace`（此时还没有 worker），一次 `where=slot`；工作区通过而槽位没通过的测试先在槽位里确认
+  重跑，剩下的数量超过 `isolation_max_diff` 就判定隔离无效。守护集合只取两边都通过的测试。
+- 破坏探针（`runner.py isolation-probe`）：在槽位里找一个被测试导入的源文件，先确认 `import` 解析到槽位，再在文件开头插
+  `raise ImportError` 跑那个测试，必须失败。命令里写死了工作区绝对路径（`VerifierSpec.mentions`）同样判为无效。
+- 降级模式（`graph.degraded`）：作业回到 `where=workspace`（`TreeOverlay` 切换工作区），与 worker 的写类工具在
+  `workspace_lock` 上互斥；不做任何后台验证（不自动存档、不提升、不定位、不做持续性检测），只在 worker 本来就在等待时
+  验证（手动存档、ready_for_review、会话结束与交接——这时驱动等验证结束再开新会话、收尾）。基线用工作区上的两次。
+- 调度：`RunnerVerifier` 的槽位池 + 优先级队列（`verify.job_priority`：1 收尾与基线 / 2 worker 在等的 / 3 提升 /
+  4 自动存档）。第 1、2 档到达而槽位被第 3、4 档占着时取消低档作业（TERM）并重新排队，写 `job_preempted`，不算丢失。
+  第 3、4 档以 `nice` 运行，可选限制并发（`background_cpu_limit`）。
+- 作业进程：`setsid` 起会话，`timeout --foreground` 保证取消信号能到达 runner；外层 shell 用 trap 挡住 TERM，保证写完成
+  标记；进程组 id 由作业自己写。启动命令先把自己的输出换成 `/dev/null`，launch 立即返回（v5 里 launch 实际会等作业跑完）。
 
-### 3.2 任务完成
+### 3.2 自动快照与后台存档（模块 B）
 
-- `ready_for_review` → `review_requested` + 一次存档尝试（带上该任务的检查）。
-- 尝试的结果决定任务：被拒 → `task_reopened(checkpoint_rejected)`；通过（新存档或未变）→ 在链头那棵树上看任务的
-  检查：全部 PASSED → `task_done(verified)`；有失败 → `task_reopened(evidence_failed)`；缺结果 → 起 `evidence` 作业。
-- 没有检查的任务在**进入存档后**成为 `done_unverified`。与方案的差别：方案写“声明做完即进入完成（未验证）”，这里
-  要求它的工作已经在某个存档里。否则账本说“做完了”，交付物里却没有这部分改动。
+- 快照时机（`driver.take_snapshot`）：写类工具之后按限流（`snapshot_min_interval_sec` 或 `snapshot_min_writes`）；模型跑
+  测试 / 构建的 bash 命令执行前一定拍（`model_test`）；会话结束、交接、截止、`step_done`、手动存档、review、按门自查、
+  回退与撤销之后、恢复开始时跳过限流。树与上一张相同就不记。
+- 每张快照是一个确定的提交（树 = `{raw: 原样树, cand: 候选树}`，父提交是上一张快照），ref 为 `refs/belay/snap/<n>`：
+  防 gc，也让 git bundle 能增量导出。
+- 预检：改动的 `.py` 文件用 `compile()` 检查语法（不写 `.pyc`）；可配 `precheck_cmd`。失败的快照标为不可测：不进验证
+  队列，但留在时间线上。
+- 后台线（`rules.schedule_background`）：同一时刻最多一个后台尝试。优先验证还没被包含的步骤锚点与比链头新的交接快照
+  （最早的先，到来时取代正在等结果的自动尝试）；否则取最新的可测快照（原因 ∈ `AUTO_REASONS`，为前台意图拍的快照由
+  发起者自己验证）。
+- 新快照胜出：前台、后台尝试各至多一个；链头的快照序号不小于尝试的快照序号（同段）时，尝试被 `attempt_superseded`
+  取代（它带着的 review 任务转到链头上判定）；父节点在 `checkpoint_advancing` 时才确定，CAS 用它校验。同一批级联里两个
+  尝试同时完成时，第二个等第一个落地后再推进（多半随即被取代）。
+- 进展（`reduce._progress`）只来自：任务完成、确认点前移、某个任务的检查项第一次在存档上通过、步骤锚定、手动 / 步骤 /
+  review 存档。自动存档与交接存档不算。
 
-### 3.3 租约
+### 3.3 两级存档链（模块 C）
 
-一个任务最多一个租约；worker 的任何工具调用都是心跳，租约剩余不到一半时写 `lease_renewed`（不是每次调用都写，
-避免日志膨胀）。时钟 tick 时过期的租约写 `lease_expired`，`active` 任务回到 `open`（`review` 的任务保持 review）。
-worker 交接给自己的新会话时，`session_started` 顺带续期它的所有租约。
+- related 档位通过 → 暂存点；full 档位通过（例如 related 升级为 full、收尾）→ 直接是确认点。
+- 提升（`schedule_promotion`）：验证队列有空闲时，只看最新确认点与最近一次降级之后的暂存点，取最新的跑全量（更老的
+  跳过），同一时刻只提升一个。全量通过（回归先确认重跑）→ `checkpoint_confirmed`；确认过的回归 → `checkpoint_demoted`，
+  它之后的暂存点是 suspect，直到它们自己跑完全量。
+- 降级后对最新的可测快照只跑这几个失败的测试（`recheck`）：仍失败 → `persistent_regression(trigger=demoted)` → 通知
+  worker + 定位 + 诊断；已通过 → 只记录。
+- 收尾（`driver._finalize`）：`finalize_started` 取消后台尝试 → 对当前 WIP 做一次 full 前台尝试 → 链头仍是暂存点且还有
+  时间就提升它 → 取消剩下的作业 → 交付最新的确认点（`delivered` 带 `level`、`lag`、`not_delivered`）。
+- 交付一致性：`done_checkpoint` 不在交付点祖先链上的任务记为“完成但未交付”，DONE 要求没有这类任务、没有未解决的任务，
+  并且交付的是确认点（`rules.final_status`）。
 
-### 3.4 运行的结束
+### 3.4 被拒信息与规则定位（模块 D）
 
-`next_step(graph, worker, now)` 是纯函数：
+- D1：runner 的 `reasons` 经 `JobOutcome` → `job_finished.reasons` → 拒绝消息（每个回归下一行原因）；`failure_log(test)`
+  从最近一次包含它的作业日志里截出 traceback 段落（`verifier.extract_failure`）。
+- D2：回归所在的测试文件在快照的 `dropped` 里时提示“以原始版本运行”；`run_check(as_gate=true)` 对当前工作区拍快照、
+  剔除测试改动，在槽位里以第 2 档运行。
+- D3：`locate_started` 记下测试、坏端（快照）、段号与段起点。区间内的点 = 段起点存档 + 同段内坏端之前的可测快照（连续
+  相同的树只取一张）+ 坏端；每个点上某个测试的状态由作业结果推出（`verify.point_status`：pass / fail / unknown /
+  running / untested），所以二分的中间状态不单独记事件。每个测试取“最后一次已知通过”为好端（自然处理了非单调的一过性
+  失败），与之后第一次失败之间取中点跑那个测试单元；跑不出结果的点记为 unknown 跳过；达到 `locate_max_steps` /
+  `locate_max_sec` 就给出已缩小的区间。多个测试共享作业，按（好端, 坏端）分组写 `locate_concluded`；外壳算出组内
+  “好 → 坏”的改动与 diff 后写 `regression_located`（带当时持有的任务、步骤与会话）。
+  触发：前台 / 步骤 / 交接尝试因回归被拒、降级后问题仍在、持续性回归。
+- D4：`revert_change(located)` 逐文件三方合并（ours = 工作区，base = 坏端，theirs = 好端），全部干净才写回，有冲突就什么
+  都不改（`gitops.revert_files`）。降级与持续性回归的通知把它列为首选、`rollback` 为备选。
+- 学到的相关性：降级触发、且定位精确时，把“改动的源文件 → 失败测试所在文件”记为 `relation_learned`；`related_units`
+  之后把它们加入选择。
 
-1. 已交付 → 停止。
-2. 剩余时间低于截止预留（全量验证实测耗时 × 系数，有上下限）→ `deadline_reserve` → 停 worker → 全量存档尝试 → 交付。
-3. 没有可做的工作（没有 ready / active / review 的任务），且每条需求都至少有一个已完成或受阻的任务 → 收尾：
-   全量存档尝试 → `delivered(DONE)`（要求链头那棵树有全量结果且无回归）否则 `INCOMPLETE`。
-4. 没有可做的工作但需求没覆盖（例如只剩被受阻任务卡住的任务）→ `INCOMPLETE`。
-5. 连续 2 个会话没有新证据 → `stall_detected(sessions_no_progress)` → `INCOMPLETE`。
-6. 否则 → 用 `build_context` 开新会话。**会话结束不等于运行结束。**
+### 3.5 持续性回归、诊断者（模块 E）
 
-交付物永远是链头的存档：`delivered` 的副作用把链头导出为补丁（测试路径的改动在进入存档前就剔除了），并可选地把
-工作区检出为链头。
+- 持续性回归（`rules.detect_persistent`）：同一守护测试在当前段最近 `persist_k` 个可测快照上都失败；或 worker 自己的
+  `run_check` 也看到它失败而最新快照上它也失败。一过性失败不触发。之后没有任何同段快照上它通过就算“仍未解决”。
+- 诊断：规则写 `diagnosis_requested`（同一（回归签名, 定位区间）只一次；同一签名第二次被拒时带上前一次的结论再诊断），
+  外壳从图里组装输入（失败原因、测试源码、定位 diff、当时的任务 / 步骤 / 需求原文 / 笔记 / 压缩摘要，限
+  `diagnose_input_tokens`），用 `aux_llm` 调用，结果经 `record_diagnosis` 校验：`intentional=true` 的引文不在任务原文里就
+  丢弃这一项。诊断不改变门的判定。
 
-### 3.5 停滞
+### 3.6 复查者（模块 F）
 
-满足任一条件写 `stall_detected`（同一种停滞在出现新进展之前只记一次）：超过阈值时间没有新存档也没有任务完成；同一个
-回归签名连续被拒 3 次；连续 2 个会话没有进展。处理按成本递增：第一次只记录（同一回归连续被拒时在上下文里如实说明被拒的原因；
-按时长判定的停滞不告诉模型，避免变相按时间催促），再次发生时调规划器提议拆分，规则校验子任务仍覆盖原来的需求链接。
+- 任务进入 `done_unverified` 时异步复查一次；收尾前 `next_step` 返回 `review`，对还没复查过的 `done_unverified` 与以
+  `insufficient_info` 受阻的任务发起复查，进行中时返回 `wait: review in progress`。
+- `no` / `partial` → `task_reopened(review_missing)`；受阻任务给出合理读法 → `task_reopened(review_reading)`；`yes` 什么都
+  不做。每个任务最多被复查者重开 `review_max_reopens` 次，之后不再复查。截止收尾时只进账本。
+- 账本口径（`render.task_category`）：verified / reviewed / self-reported / done-not-delivered / blocked / open。
 
-时间只在 runtime 内部使用（何时进入截止预留、何时收尾、停滞与存档提醒的触发）。给模型的任何文字——系统提示、开场上下文、
-board、通知——都不包含剩余时间、已用时间或截止预留。
+### 3.7 步骤与恢复点（模块 H）
 
-## 4. 调度建议与上下文构建
+- 认领后 todo 列表即步骤计划：每次 `todo_write` 立即写 `steps_planned`（按标题匹配保持步骤 id 稳定）；未持有任务时写成
+  普通笔记。新标为 completed 的条目按 `step_done` 处理（先强制拍锚点快照）。
+- `step_done`：锚点快照以第 2 档在后台验证（被拒要通知并定位）；锚点被链上同段、快照序号不小于它的存档包含时写
+  `step_anchored`；回退使锚点不再在链上时写 `step_invalidated` 并清空锚点（否则新段的存档会把它重新判成 anchored）。
+- `queries.resume_point`：基底 = 当前步骤之前最后一个锚定步骤所在的存档，没有就是认领时的链头；部分快照 = 最新一张。
+  部分改动默认保留在工作区，开场上下文展示基底 → 最新快照的 diff，并预读涉及的文件。
+- 交接时机（`session._manage_context`）：到软阈值（`handoff_soft_tokens`，默认等于 `l2_tokens`）且有进行中的步骤时暂缓
+  L2，下一次 `step_done` 后交接；没有步骤时照旧 L2/L3；硬阈值（`l4_tokens`）照旧强制交接。
+- 没有步骤时的兜底：里程碑存档（以及每 `label_every` 个自动存档）用 `aux_llm` 生成一行标签（手动存档的 summary 直接作
+  标签）；长时间中断或重建后对对话尾部生成进度摘要。
 
-两者都只读图（`belay/core/suggest.py`、`belay/core/context.py`）。
+## 4. 调度建议与分层开场上下文（模块 I）
 
-- `suggest(graph, worker, now)`：候选 = 可做的任务 + 自己持有的任务；排序键依次为
-  被重开的优先 → 解锁的下游越多越靠前 → 所链接需求还没有任何进展的靠前 → 规划器优先级 → id。
-  截止预留期间不给建议：此时 worker 已被停下，由 runtime 收尾。`claim` 记录该任务在建议里的名次，用于评估采纳率。
-- `build_context(graph, worker, budget, blobs)`：按方案的 9 段顺序生成，超预算时从下往上裁，前三段永远不裁。
-  每段带来源标签；第 7 段（笔记）标为自述，第 8 段（压缩摘要）标为 LLM。`blobs` 是调用方按附件路径读出的内容
-  （例如 WIP diff），函数本身仍是纯的。
+- `suggest`：依赖改为排序提示（依赖未完成的排后，但仍可认领）；一次建议只建一次反向依赖索引。
+- `build_context`：九段，按顺序：任务原文、需求索引（id + 一行摘要，不带状态，冻结后逐字不变）、当前焦点（恢复点：
+  任务、需求引文、检查结果、步骤、部分改动 diff、本任务全部会话的笔记、交接摘要、崩溃时中断前最后几个工具调用）、
+  待处理的问题（仍未解决的持续回归与降级、定位结果、诊断、最近一次被拒）、离开期间（上个会话结束后的事件按重要性取前
+  `away_top` 条，其余计数；工作区变化的文件）、工作区、进度总览（需求按状态计数，未完成与受阻的展开，已完成的压成
+  id 区间，太多时只展开与当前任务相关的）、下一步、回归门。前四段受保护，每段各有上限（`opening_caps`），被折叠的段都
+  留下查询入口（`board(status=…)`、`task(id=…)`、`history`、`failure_log`）。
+- `resume_reminder`：原样接上对话时，把当前焦点、待处理的问题与离开期间作为 system-reminder 追加。
 
-## 5. 会话与压缩
+## 5. 会话、压缩与交接
 
-| 层 | 触发 | 做什么 | 实现 |
-| --- | --- | --- | --- |
-| L0 | 单个工具结果超过阈值 | 全文存附件，上下文保留开头、报错行、结尾和路径 | `core/compact.py: l0_shrink` |
-| L1 | 工具结果数或估算 token 达到阈值 | 最近 N 个结果保留，更早的换成一行占位（工具、参数、退出码、全文路径） | `l1_clear` |
-| L2 | 上下文达到压缩阈值 | 旧对话 → `build_context` + 最近一段原文（在安全边界切，tool_use/tool_result 不拆开）+ 重读最近改过的文件 | `l2_rebuild` |
-| L3 | L2 之后仍超过目标 | 模型只写图里没有的东西：关键判断及理由、放弃的做法、当前思路；摘要作为 `compacted` 事件入图，所以下一次 `build_context` 第 8 段就包含它 | `runtime/session.py` |
-| L4 | 需要再次压缩但本会话压缩次数已达上限，或上下文超过重开阈值 | 可选地让模型写一份 L3 格式的交接摘要（记为 `compacted(level=4)`）；结束会话；runtime 尝试存档、记录 WIP，用 `build_context` 开新会话，租约保留 | `session` + `driver` |
+| 层 | 触发 | 做什么 |
+| --- | --- | --- |
+| L0 | 单个工具结果超过 `l0_chars` | 全文存附件，上下文保留开头、报错行、结尾和路径 |
+| L1 | 上下文超过 `l1_trigger_tokens`（默认 50 万；按数量触发默认关闭） | 先只清命令 / 测试输出，保留 `read_file`；仍超过再一起清 |
+| L2 | 上下文超过 `l2_tokens`（默认 70 万），且没有进行中的步骤 | 旧对话 → `build_context(mode=compaction)` + 最近一段原文 + 重读最近改过的文件 |
+| L3 | L2 之后仍超过目标 | 模型只写图里没有的东西，摘要入图 |
+| L4 | 软阈值后的下一次 `step_done`，或超过 `l4_tokens`（默认 76 万），或压缩次数达到上限 | 可选交接摘要；结束会话；新会话从恢复点开始 |
 
-每次压缩写 `compacted(level, before, after)`。开场与 L2 的前缀永远是任务原文 + 需求列表，让前缀缓存尽量命中。
-worker 崩溃（模型接口多次重试仍失败、工具实现异常逃逸）→ `session_ended(crash)` → 新会话，租约保留；连续崩溃
-`max_crash_restarts` 次则收尾。worker 卡死（超过 `idle_timeout_sec` 没有模型回复也没有工具调用；进行中的工具调用
-不算）→ 取消会话，`session_ended(stuck)` → 新会话。
+每条追加进对话的消息都写进轨迹（`message` 记录），整体替换（开场、L1–L3、提醒）时写 `messages_checkpoint`（blob）：读盘
+重放 = 最后一个 checkpoint + 之后的 message 记录，没有结果的 `tool_use` 补一条“中断，效果未知”。
 
-## 6. 恢复
+## 6. 恢复（模块 G）
 
-启动时 `Runtime.open(store)`：加载最近的视图快照，重放之后的事件（`replay(快照, 尾部) == replay(全部)` 由测试保证）。
-然后对账：
+| 中断 | 做法 |
+| --- | --- |
+| 会话崩溃（模型接口多次重试仍失败），runtime 仍在 | 内存重试：`ModelCallFailed` → 退避 → 原样再调用，附上离开期间的变化（`session_resumed(memory)`）；上下文本身的问题（400 / 413 / “too long”）或连续失败达到 `resume_max_failures` 改开新会话 |
+| runtime 进程崩溃，容器仍在 | `reconcile`：CAS 对账；有完成标记的作业补收结果，进程组还活着的重新接上（G5），其余记 unknown 重跑；停机不超过 `resume_max_downtime_sec` 且轨迹读得出来就读盘重放（`session_resumed(replay)`），否则开新会话 |
+| 容器 / 工作区 / 影子仓库丢失 | `resume(rebuild=True)`：从原始代码重建 0 号存档（树与提交必须一致）→ 按顺序 unbundle → 最后一次导出之后的快照记为 lost；丢了提交的存档按确定的提交重做，连树都没有就截链 → 恢复引用 → 工作区检出为最新一张已导出快照的原样树 → 重跑破坏探针 → `runtime_recovered(rebuilt=true)` |
 
-1. `advancing` 状态的尝试：查 git 引用。已经指向新提交 → 补记 `checkpoint_created`；还指向旧提交 → 重做 CAS
-   （提交是确定的，重做安全）；都不是 → `checkpoint_rejected(cas_conflict)`。
-2. `running` 的作业：有完成标记就补收结果；否则记为 `unknown`，由规则按同样的 (树, 检查集合) 重跑。
-3. 未结束的会话 → `session_ended(runtime_crash)`；单 worker 下租约属于持久的 worker 身份，照常续期。
-4. `runtime_recovered(downtime)`，截止时间按墙钟计算，然后回到 `next_step`。
-
-三条不变量：先写事件再做副作用；副作用幂等（作业按键去重、存档用 CAS、提交确定）；状态只在宿主机（事件库、快照、
-每个存档的补丁镜像都在运行目录里）。
+- 镜像（G3）：每张快照、每个存档都有 ref；`driver.mirror` 按节奏（每 `mirror_every` 张快照、每个存档、会话结束、交付、
+  挂起）导出增量 bundle（`git bundle create <新 ref> ^<上次已导出的提交>`，第一份以 0 号基线提交为前提），经 base64 分段
+  传回宿主机 `run_dir/git/<m>.bundle`；已导出的 ref 记在事件库的 meta 里。
+- 恢复的第一步是补拍一张 `recover` 快照（G7）；离开期间的变化（G1）进入开场。
+- 外层调度：`BelayRun.suspend()` = 强制快照 → 导出 bundle → 会话以 suspended 结束 → `run_suspended`。
 
 ## 7. 不变量（`core/invariants.py`）
 
-在事务边界上成立（一个请求由规则产生的一批事件整体提交，例如冻结需求后逐个加入初始任务）；测试里每个事务之后都检查，
-运行时由 `check_invariants` 开关控制（违反即抛出，不写日志）。
+1. 事件序号连续；快照序号从 1 连续。
+2. active / review 的任务有且只有一个持有者；active 的任务一定有持有者。
+3. 需求冻结后每条需求至少被一个未拆分的任务链接；`blocked_by` 无环（排序需要）。
+4. 存档链从链头沿 parent 能走回 0 号；链上存档的快照序号严格递增；每个非基线存档来自一个没有回归的尝试；
+   `confirmed` 等于链头最近的确认祖先；没有既确认又降级的存档。
+5. `done` 的检查在存档那棵树上全部 PASSED；`done_unverified` 没有检查且有存档。
+6. anchored 的步骤，其锚点快照被链上某个同段存档包含。
+7. 同一时刻最多一个尝试处于 advancing；每个 worker 前台、后台尝试各至多一个；同一个作业键最多一个非 unknown 作业。
+8. 拆分出的子任务合起来覆盖父任务的链接。
+9. 来源纪律（§1）；交付后封口。
 
-1. 事件序号连续，图的版本号等于最后一条事件的序号。
-2. 每个任务最多一个租约；有租约的任务状态是 active 或 review；active 的任务一定有租约。
-3. 需求冻结后每条需求至少被一个未拆分的任务链接；任务链接的需求都存在；`blocked_by` 无环。
-4. 存档链从链头沿 parent 能走回 0 号；每个非基线存档都来自一个经过 advancing 的尝试，且该尝试没有回归。
-5. `done` 的任务：存档在链上（未作废），它的每个检查在那棵树上都是 PASSED；`done_unverified` 没有检查且有存档。
-6. 同一时刻最多一个尝试处于 advancing；同一个作业键最多一个非 unknown 作业。
-7. 拆分出的子任务合起来覆盖父任务的链接。
-8. 来源纪律：`task_done` / `checkpoint_created` 不来自自述或 LLM。
-9. 交付后不再有任务、存档类事件。
+## 8. 与计划的差异和补充决定（需要时可以改回）
 
-## 8. 机制开关（`core/config.py: BelayConfig`）
+- 手动 `checkpoint(summary)` 的 summary 直接作为里程碑标签；标签模型只给没有标签、没有步骤的存档补一行。
+- todo 列表里新标为 completed 的条目等同于 `step_done`（计划只写了 `step_done` 工具）；两者都保留。
+- 每个存档创建时都会导出 bundle（计划写的是“每个里程碑”）：链上存档的提交丢失会导致链断，bundle 很小，所以不区分。
+- DONE 的条件按计划 F2：没有 open、没有 done-not-delivered、交付的是确认点；全部任务受阻时仍可能是 DONE（账本会写明
+  blocked 的数量；以 insufficient_info 受阻的任务会先被复查）。
+- 降级模式下也不做规则定位与持续性检测（二分作业会切换工作区）；诊断仍会以“相对最新确认点的 diff”为输入进行。
+- 构建缓存种子额外复制了项目自己的 `.git`（有些测试会调用 git，例如 setuptools_scm）。
+- 分片轮转的全量、竞争式分支、运行级 supervisor 都没有做（计划里是扩展点）。
+- `eval/` 本轮没有改：`eval/agents/belay_agent.py` 仍需按 `BelayRun` 重写（0-1）。
 
-`suggest`、`graph_context`（关掉即“Belay − 图上下文”：开场与 L2 不用 `build_context`，改用模型写的完整摘要）、
-`confirm_regressions`、`protect_tests`、`stall`、`checkpoint_tier`（related / full）以及各层压缩的阈值。
-
-## 9. 与 B 组的关系
-
-B 组（`belay/worker/` + `eval/agents/flat_agent.py`）保持不变：它是“同一个 worker、同样的工具、不用图”的对照。
-Belay 的会话循环（`belay/runtime/session.py`）复用同一套工具实现（`belay/tools/`）、同一个模型客户端与相同的
-系统提示主体，只多出 Belay 工具、分层压缩和 runtime 管理的会话生命周期。
-
-## 10. 测试（`python -m pytest -q`，不需要容器和模型）
+## 9. 测试（`python -m pytest -q`，不需要容器和模型）
 
 | 要求 | 测试 |
 | --- | --- |
-| 事件类型、三个视图的推导函数 | `tests/unit/test_reduce.py`：事件格式与来源、`apply` 不修改输入、快照往返、十类不合法转换被拒、交付后封口 |
-| 状态转换与不变量 | `tests/unit/test_rules.py`：认领 / 租约续期与过期、验证后完成、回归拒绝与重开、漏跑与跳过算回归、不稳定确认、证据失败、链头判定、作业去重与丢失重跑、追加与拆分、受阻与引文、回退、截止预留、停滞升级、会话结束 ≠ 运行结束、DONE 的条件、崩溃上限、来源纪律 |
-| 纯函数重放一致性 | `tests/unit/test_replay.py`：40 个随机种子，作业乱序完成 / 丢失 / 取消、CAS 失败、回退、拆分、会话起止；每个事务后检查不变量；`replay(日志) == 实时的图`、任意前缀一致、快照 + 尾部 == 全部、事件经 JSON 往返后重放不变；另有覆盖率断言 |
-| Belay 工具、规划器、首次开场上下文 | `test_planner.py`（校验反馈重试、机械兜底）、`test_context_suggest.py`（9 段顺序、从下往上裁、前三段不裁、来源标注）、集成测试里的开场断言 |
-| 验证后 CAS 推进存档、交付物取自最近的存档 | 集成：`test_happy_path_done`、`test_regression_rejected_and_test_changes_are_not_delivered`、`test_deadline_delivers_the_latest_checkpoint`、`test_run_check_wait_and_rollback` |
-| L0–L4 压缩与交接、每次开新会话都用 build_context、会话结束 ≠ 运行结束 | 单元：`test_verify_plan_compact.py`（L0/L1/L2 的配对与纯度）；集成：`test_l2_compaction_…`、`test_l3_summary_…`、`test_l4_handoff_…`、`test_session_end_is_not_run_end`、`test_repeated_idle_sessions_…`、`test_worker_crash_…`、`test_stuck_worker_…` |
-| 恢复 | 集成：`test_runtime_crash_around_cas_is_reconciled`（CAS 前 / CAS 后崩溃，只创建一次存档，引用正确）、`test_runtime_crash_with_a_lost_job`（丢失的作业按同一个键重跑）、`test_stall_escalates_to_replan_and_split` |
-| 分层规则 | `tests/unit/test_layering.py`：core 不做 IO、不读时钟；tools / worker 不认识 runtime；容器脚本只用标准库；两处测试路径规则一致 |
-
-## 11. 没有做的
-
-- 多 worker（数据模型按多 worker 设计，但只实现单 worker 的调度与工作区）。
-- 容器整个丢失后的自动重建：机制（每个存档的补丁镜像 + `restore_workspace`）已实现并有测试，重建容器需要评测
-  框架配合，留到接 eval 时做。
-- 可插拔的检查作者（为无检查的任务补测试）：接口位置在 `task_added.checks`，暂未实现。
-- eval 适配：`eval/agents/belay_agent.py` 依赖旧 runtime，需要按新接口（`belay.runtime.driver.BelayRun`）重写。
+| 事件、推导、非法转换 | `tests/unit/test_reduce.py` |
+| 规则：两条线、新快照胜出、提升 / 降级 / 交付一致性、二分（精确、跳过、非单调、跨回退、上限）、持续性回归、诊断与复查、步骤与恢复点、DONE 的条件 | `tests/unit/test_rules.py` |
+| 重放一致性（快照、后台线、步骤、定位、诊断、复查、抢占……随机驱动 40 个种子） | `tests/unit/test_replay.py` |
+| 分层开场：段顺序、前缀稳定、跨会话笔记、300 需求 / 1000 任务 / 100 会话仍在预算内、board 过滤 | `tests/unit/test_context_suggest.py` |
+| 外壳辅助：traceback 截取、sys.path 映射、L1 保留读取、读盘重放、离开期间上限 | `tests/unit/test_runtime_helpers.py` |
+| 端到端（v5 场景 + 内存重试 / 读盘重放） | `tests/integration/test_belay_run.py` |
+| 长程：导入隔离三种夹具、降级、验证与编辑并发、抢占、D1–D4、重新接上作业、从 bundle 重建、步骤边界交接、步骤中间被杀、诊断者与复查者 | `tests/integration/test_long_run.py` |

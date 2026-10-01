@@ -16,9 +16,9 @@ import pytest
 from belay.core import rules as R
 from belay.core.config import BelayConfig
 from belay.core.events import Event
-from belay.core.invariants import check, check_log
+from belay.core.invariants import check, check_log, llm_effects
 from belay.core.model import ACTIVE, graph_from_json, to_json
-from belay.core.queries import chain, held_tasks, open_attempt
+from belay.core.queries import chain, held_tasks
 from belay.core.reduce import replay
 from belay.core.rules import Rejected
 from tests.sim import Sim
@@ -43,12 +43,13 @@ FILES = [[("pkg/mod.py", 3, 1)], [("pkg/other.py", 2, 2)], [("setup.py", 1, 0)],
          [("pkg/mod.py", 1, 1), ("pkg/other.py", 1, 1)]]
 
 
-def drive(seed: int, steps: int = 160):
+def drive(seed: int, steps: int = 200):
     rnd = random.Random(seed)
-    cfg = BelayConfig(lease_ttl_sec=300, stall_no_progress_sec=900, reserve_min_sec=60,
-                      confirm_regressions=rnd.random() < 0.7)
-    s = Sim(BASE, cfg=cfg, auto_jobs=False)
-    s.setup(TASK, PLAN, budget=rnd.choice([2500, 20000]))
+    cfg = BelayConfig(stall_no_progress_sec=900, reserve_min_sec=60, confirm_regressions=rnd.random() < 0.7,
+                      auto_checkpoint=rnd.random() < 0.8, persist_k=rnd.choice([2, 3]),
+                      locate_max_steps=rnd.choice([3, 8]))
+    s = Sim(BASE, cfg=cfg, auto_jobs=False, auto_located=rnd.random() < 0.8)
+    s.setup(TASK, PLAN, budget=rnd.choice([1500, 20000]))
     s.do(R.start_session, "w1", "first", {})
     snapshots = [(s.g.seq, s.g)]
     n_tree = [0]
@@ -57,8 +58,7 @@ def drive(seed: int, steps: int = 160):
         n_tree[0] += 1
         tree = f"tree{seed}_{n_tree[0]}"
         over = {}
-        r = rnd.random()
-        if r < 0.5:
+        if rnd.random() < 0.5:
             over[ADD] = "PASSED"
         if rnd.random() < 0.25:
             over[rnd.choice([MUL, Z, W])] = rnd.choice(["FAILED", "ERROR", "SKIPPED"])
@@ -71,8 +71,9 @@ def drive(seed: int, steps: int = 160):
         return rnd.choice(sorted(s.g.tasks)) if s.g.tasks else "T1"
 
     ops = ["claim", "claim", "release", "review", "review", "checkpoint", "add_task", "note", "blocked", "job",
-           "job", "job", "job", "tick", "heartbeat", "session", "rollback", "run_check", "split", "cas_fail",
-           "verify_head"]
+           "job", "job", "job", "job", "tick", "session", "rollback", "run_check", "split", "cas_fail", "snap",
+           "snap", "snap", "steps", "step_done", "gate", "diagnosis", "review_result", "locate_diff", "promote",
+           "finalize_review"]
     for _ in range(steps):
         op = rnd.choice(ops)
         held = [t.id for t in held_tasks(s.g, "w1") if t.status == ACTIVE]
@@ -82,10 +83,20 @@ def drive(seed: int, steps: int = 160):
             elif op == "release" and held:
                 s.do(R.release, "w1", rnd.choice(held), "later")
             elif op == "review" and held:
-                s.do(R.request_review, "w1", rnd.choice(held), s.obs(new_tree(), files=rnd.choice(FILES)))
+                s.review(rnd.choice(held), new_tree(), files=rnd.choice(FILES))
             elif op == "checkpoint":
                 tree = new_tree() if rnd.random() < 0.8 else s.g.head_cp.tree
-                s.do(R.request_checkpoint, "w1", s.obs(tree, files=rnd.choice(FILES)), "worker")
+                s.checkpoint(tree, files=rnd.choice(FILES))
+            elif op == "snap":
+                tree = new_tree() if rnd.random() < 0.85 else s.g.head_cp.tree
+                s.snap(tree, files=rnd.choice(FILES), testable=rnd.random() < 0.9,
+                       reason=rnd.choice(["writes", "writes", "model_test", "interval", "handoff"]))
+            elif op == "steps":
+                s.do(R.plan_steps, "w1", [{"content": f"step {i}", "status": rnd.choice(
+                    ["pending", "in_progress", "completed"])} for i in range(rnd.randint(1, 4))],
+                     s.snap(new_tree(), reason="step_done"))
+            elif op == "step_done" and held:
+                s.do(R.step_done, "w1", s.snap(new_tree(), reason="step_done"), "did a step")
             elif op == "add_task":
                 s.do(R.add_task, "w1", f"extra {rnd.randint(0, 99)}", [rnd.choice(sorted(s.g.requirements))],
                      blocked_by=[some_task()] if rnd.random() < 0.3 else [])
@@ -96,26 +107,27 @@ def drive(seed: int, steps: int = 160):
                      quote="Also make mul handle negative numbers correctly.")
             elif op == "job" and s.pending_jobs:
                 jid = rnd.choice(list(s.pending_jobs))
+                if rnd.random() < 0.1:
+                    s.do(R.job_preempted, jid)
                 r = rnd.random()
-                state = "unknown" if r < 0.1 else "cancelled" if r < 0.14 else "finished"
+                state = "unknown" if r < 0.08 else "cancelled" if r < 0.12 else "finished"
                 s.finish_job(jid, state=state)
             elif op == "tick":
                 s.advance(rnd.uniform(0, 400))
                 s.do(R.tick)
-            elif op == "heartbeat":
-                s.advance(rnd.uniform(0, 300))
-                s.do(R.heartbeat, "w1")
             elif op == "session":
                 if s.g.workers["w1"].session:
                     s.do(R.end_session, "w1", rnd.choice(["done", "handoff", "crash"]),
                          todos=[{"content": "x", "status": "pending"}])
                 else:
                     s.do(R.start_session, "w1", R.session_reason(s.g, "w1"), {})
-            elif op == "rollback" and open_attempt(s.g) is None:
-                s.do(R.rollback, "w1", rnd.choice([c.id for c in chain(s.g)]))
+            elif op == "rollback":
+                s.do(R.rollback, "w1", rnd.choice([c.id for c in chain(s.g)]) if rnd.random() < 0.5 else None)
             elif op == "run_check":
                 s.do(R.run_check, "w1", new_tree(), tests=[MUL] if rnd.random() < 0.5 else [], full=rnd.random() < 0.2,
                      changed=["pkg/mod.py"])
+            elif op == "gate" and s.g.snapshots:
+                s.do(R.gate_check, "w1", max(s.g.snapshots), tests=[Z])
             elif op == "split":
                 t = s.g.tasks.get(some_task())
                 if t is not None:
@@ -123,17 +135,34 @@ def drive(seed: int, steps: int = 160):
                                               {"title": "part 2", "links": list(t.links)}])
             elif op == "cas_fail":
                 s.ref_ok = False
-            elif op == "verify_head":
-                s.do(R.verify_head)
+            elif op == "diagnosis":
+                for d in [d for d in s.g.diagnoses.values() if d.status == "requested"][:1]:
+                    s.do(R.record_diagnosis, d.id, {"suspects": [{"file": "pkg/mod.py"}],
+                                                    "intentional": {"likely": rnd.random() < 0.5,
+                                                                    "quote": rnd.choice(["nope", TASK[:30]])}})
+            elif op == "review_result":
+                for t in [t for t in s.g.tasks.values() if t.review == "running"][:1]:
+                    s.do(R.record_review, t.id, "blocked" if t.status == "blocked" else "done",
+                         {"implemented": rnd.choice(["yes", "no", "partial"]), "missing": ["m"],
+                          "reading": rnd.choice(["", "a reading"])})
+            elif op == "locate_diff":
+                for loc in [l for l in s.g.locates.values() if l.status == "concluded"][:1]:
+                    for i in range(len(loc.groups)):
+                        s.do(R.record_located, loc.id, i, [("pkg/mod.py", 1, 1)], None)
+            elif op == "promote":
+                s.do(R.schedule_promotion)
+            elif op == "finalize_review":
+                s.do(R.request_final_reviews)
         except Rejected:
             pass
         s.ref_ok = True if rnd.random() < 0.7 else s.ref_ok
         snapshots.append((s.g.seq, s.g))
-    # 收尾：跑完剩下的作业，然后交付
-    while s.pending_jobs:
-        s.finish_job(s.pending_jobs[0])
+    # 收尾：进入收尾，跑完剩下的作业，然后交付
     if s.g.workers["w1"].session:
         s.do(R.end_session, "w1", "done")
+    s.do(R.begin_finalize, "test")
+    while s.pending_jobs:
+        s.finish_job(s.pending_jobs[0])
     s.do(R.deliver, "test")
     snapshots.append((s.g.seq, s.g))
     return s, snapshots
@@ -144,7 +173,7 @@ def test_replay_consistency(seed):
     s, snaps = drive(seed)
     log, g = s.log, s.g
     # 1
-    assert not check(g) and not check_log(log)
+    assert not check(g) and not check_log(log) and not llm_effects(log)
     # 2
     assert replay(log) == g
     # 3
@@ -170,8 +199,12 @@ def test_fuzz_actually_exercises_the_rules():
         reasons |= {e.get("reason") for e in s.log if e.type in ("task_reopened", "checkpoint_rejected")}
     must = {"task_claimed", "task_released", "review_requested", "task_done", "task_blocked", "task_reopened",
             "task_split", "task_added", "checkpoint_attempted", "checkpoint_advancing", "checkpoint_created",
-            "checkpoint_rejected", "rollback", "lease_renewed", "lease_expired", "stall_detected", "job_started",
-            "job_finished", "session_started", "session_ended", "note", "wip_recorded", "deadline_reserve",
-            "delivered"}
+            "checkpoint_rejected", "rollback", "stall_detected", "job_started", "job_finished", "session_started",
+            "session_ended", "note", "snapshot_taken", "deadline_reserve", "delivered", "attempt_superseded",
+            "checkpoint_confirmed", "checkpoint_demoted", "steps_planned", "step_done", "step_anchored",
+            "step_invalidated", "locate_started", "locate_concluded", "regression_located", "diagnosis_requested",
+            "diagnosis_recorded", "review_started", "review_recorded", "persistent_regression", "finalize_started",
+            "job_preempted"}
     assert must <= types, must - types
-    assert {"checkpoint_rejected", "evidence_failed", "rolled_back", "regression", "cas_conflict"} <= reasons
+    assert {"checkpoint_rejected", "evidence_failed", "rolled_back", "regression", "cas_conflict",
+            "review_missing"} <= reasons

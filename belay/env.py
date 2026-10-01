@@ -108,7 +108,26 @@ class Env:
 
     async def write_text(self, path: str, text: str) -> str:
         """写文件：先写到临时文件再 cat 覆盖目标，保留目标文件原有的权限与属主。返回写入内容的 sha256。"""
-        raw = text.encode("utf-8", errors="surrogateescape")
+        return await self.write_bytes(path, text.encode("utf-8", errors="surrogateescape"))
+
+    async def read_bytes(self, path: str, chunk: int = 4 * 1024 * 1024) -> bytes:
+        """读二进制文件（例如 git bundle）：分段 base64 传回，不受单条命令输出大小的限制。"""
+        q = shlex.quote(path)
+        res = await self.run(f"test -f {q} || exit 3; wc -c < {q}", timeout=60)
+        if res.return_code == 3:
+            raise FileMissing(path)
+        if res.return_code != 0:
+            raise OSError(f"read failed rc={res.return_code}: {res.output[-500:]}")
+        size = int(res.output.strip().splitlines()[-1] or 0)
+        out = bytearray()
+        for off in range(0, size, chunk):
+            res = await self.run(f"tail -c +{off + 1} {q} | head -c {chunk} | base64 | tr -d '\\n'", timeout=600)
+            if res.return_code != 0:
+                raise OSError(f"read failed rc={res.return_code}: {res.output[-500:]}")
+            out += base64.b64decode(res.output.strip())
+        return bytes(out)
+
+    async def write_bytes(self, path: str, raw: bytes) -> str:
         data = base64.b64encode(raw).decode()
         q = shlex.quote(path)
         tmp = shlex.quote(f"{path}.belay-tmp")

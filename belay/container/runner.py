@@ -4,7 +4,9 @@
                                                （pytest 是 run 的别名）
   python3 runner.py strip-tests GIT_DIR BASE_TREE TREE   把 TREE 中测试路径下的改动恢复为 BASE_TREE 的版本，
                                                          输出 {"tree": 新树, "dropped": [路径]}
-  python3 runner.py probe SPEC                 在工作区的测试环境里打印 sys.path（检查 import 到的是哪份代码）
+  python3 runner.py probe SPEC                 在测试环境里打印 sys.path（基线阶段用来把工作区路径映射到验证槽位）
+  python3 runner.py isolation-probe SPEC OUT   在验证槽位里检查导入隔离：import 解析到槽位；破坏一个被测试导入的源文件，
+                                               那个测试必须失败。输出 {"ok": ..., "reason": ..., "inconclusive": ...}
 
 SPEC（JSON）：
   workspace    运行测试的目录
@@ -15,8 +17,14 @@ SPEC（JSON）：
   select       测试文件或 node id 列表；空 = 用 test_cmd 原有的路径（全量）
   extra        追加的测试目标（不替换原有路径），例如放进工作区的独立测试
   overlay      {工作区相对路径: 源文件}：运行期间临时放入工作区（独立测试），结束后删除
-  tree         可选：运行期间把工作区临时切换为这个树（只改动不同的文件），结束后恢复
+  tree         可选：运行期间把工作区临时切换为这个树（只改动不同的文件），结束后恢复（降级模式、基线的工作区那一次）
   git_dir / index   tree 需要的影子仓库与临时索引文件
+  slot         可选：在验证槽位里运行（模块 A）。先把 tree 增量导出到槽位（read-tree --reset -u 只改动不同的文件，
+               被忽略的构建产物留作缓存，未被忽略的未跟踪文件清掉）；第一次导出后从工作区复制被忽略的文件作为
+               构建缓存种子（cp -a --reflink=auto）。workspace 此时就是槽位目录。
+  slot_index / seed_from / seed_index / seed_marker   槽位的索引文件、种子来源、列出工作区被忽略文件用的索引、种子标记
+  pythonpath_entries   按原顺序放在 PYTHONPATH 最前的路径（工作区 sys.path 映射到槽位后的结果）
+  nice / env   后台作业的 nice 值与额外环境变量（限制并发）
   pythonpath   是否把工作区放到 PYTHONPATH 最前面（在原始代码副本上验证测试时用）
   timeout      秒
   chown        结束后把工作区改回给这个用户（runtime 以 root 运行门禁时用）
@@ -121,9 +129,7 @@ def build_command(spec):
         prev = tok
     for tok in select + [t for t in extra if t not in select]:
         (targets if os.path.exists(os.path.join(ws, tok.split("::")[0])) else dropped).append(tok)
-    parts = []
-    if spec.get("pythonpath"):
-        parts.append("export PYTHONPATH=%s${PYTHONPATH:+:$PYTHONPATH}" % shlex.quote(ws))
+    parts = env_prefix(spec)
     parts += [spec.get("prelude") or "true", "cd " + shlex.quote(ws)] + list(spec.get("commands") or [])
     parts.append(" ".join(shlex.quote(t) for t in kept + targets))
     has_target = bool(targets) or (not select and not had_paths)
@@ -265,6 +271,60 @@ class TreeOverlay(object):
         return False
 
 
+def export_slot(spec):
+    """把 tree 增量导出到验证槽位：只改动与槽位索引不同的文件；被忽略的文件（构建缓存）保留。"""
+    gd, slot, idx, tree = spec["git_dir"], spec["slot"], spec["slot_index"], spec["tree"]
+    if not os.path.isdir(slot):
+        os.makedirs(slot)
+    git(gd, ["read-tree", "--reset", "-u", tree], work_tree=slot, index=idx)
+    git(gd, ["clean", "-f", "-d", "-q"], work_tree=slot, index=idx)
+    marker = spec.get("seed_marker")
+    if spec.get("seed_from") and marker and not os.path.exists(marker):
+        seed_slot(spec)
+        with open(marker, "w") as f:
+            f.write(tree)
+
+
+def seed_slot(spec):
+    """构建缓存种子：工作区里被忽略的文件与目录（target/、build/、node_modules/、大文件……）以及项目自己的 .git。"""
+    ws, slot, gd = spec["seed_from"], spec["slot"], spec["git_dir"]
+    idx = spec.get("seed_index")
+    tmp_idx = None
+    if not idx or not os.path.exists(idx):
+        tmp_idx = os.path.join(os.path.dirname(spec["slot_index"]), "seed-index-%d" % os.getpid())
+        git(gd, ["read-tree", spec["tree"]], index=tmp_idx)
+        idx = tmp_idx
+    out = git(gd, ["ls-files", "-z", "-o", "-i", "--exclude-standard", "--directory"], work_tree=ws, index=idx,
+              check=False)
+    if tmp_idx and os.path.exists(tmp_idx):
+        os.remove(tmp_idx)
+    paths = [p.decode("utf-8", "surrogateescape").rstrip("/") for p in out.split(b"\0") if p]
+    if os.path.isdir(os.path.join(ws, ".git")):
+        paths.append(".git")
+    for i in range(0, len(paths), 200):
+        chunk = [p for p in paths[i:i + 200] if p and not p.startswith("../")]
+        if chunk:
+            subprocess.call(["cp", "-a", "--reflink=auto", "--parents"] + chunk + [slot + "/"], cwd=ws,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def env_prefix(spec):
+    parts = []
+    entries = [e for e in (spec.get("pythonpath_entries") or []) if e]
+    if entries:
+        parts.append("export PYTHONPATH=%s${PYTHONPATH:+:$PYTHONPATH}" % shlex.quote(":".join(entries)))
+    if spec.get("pythonpath"):
+        parts.append("export PYTHONPATH=%s${PYTHONPATH:+:$PYTHONPATH}" % shlex.quote(spec["workspace"]))
+    for k, v in sorted((spec.get("env") or {}).items()):
+        parts.append("export %s=%s" % (k, shlex.quote(str(v))))
+    return parts
+
+
+def niced(cmd, spec):
+    n = int(spec.get("nice") or 0)
+    return "nice -n %d bash -c %s" % (n, shlex.quote(cmd)) if n > 0 else cmd
+
+
 class FileOverlay(object):
     def __init__(self, spec):
         self.ws = spec["workspace"]
@@ -300,6 +360,9 @@ def cmd_pytest(spec_path, out_dir):
     result = {"status": "ok", "tests": {}, "reasons": {}, "rc": None, "sec": 0, "dropped": [], "error": ""}
     t0 = time.time()
     try:
+        if spec.get("slot"):
+            export_slot(spec)
+            spec = dict(spec, workspace=spec["slot"], tree=None)
         with TreeOverlay(spec, out_dir), FileOverlay(spec):
             if spec.get("test_cmd") and not spec.get("skip_tests"):
                 cmd, has_target, dropped = build_command(spec)
@@ -307,7 +370,7 @@ def cmd_pytest(spec_path, out_dir):
                 if not has_target:
                     result.update(status="error", error="no test files exist for this selection: %s" % dropped[:10])
                 else:
-                    rc, timed_out = run_shell(cmd, log_path, int(spec.get("timeout") or 3600))
+                    rc, timed_out = run_shell(niced(cmd, spec), log_path, int(spec.get("timeout") or 3600))
                     result["rc"] = rc
                     with open(log_path, "rb") as f:
                         log = f.read().decode("utf-8", "replace")
@@ -320,8 +383,10 @@ def cmd_pytest(spec_path, out_dir):
                         result.update(status="error", error="no test results in the output; tail:\n" + tail)
             for chk in spec.get("checks") or []:
                 clog = os.path.join(out_dir, "check-%s.log" % re.sub(r"[^A-Za-z0-9_.-]", "_", chk["id"]))
-                parts = [spec.get("prelude") or "true", "cd " + shlex.quote(spec["workspace"]), chk["command"]]
-                rc, timed_out = run_shell("; ".join(parts), clog, int(chk.get("timeout") or spec.get("timeout") or 3600))
+                parts = env_prefix(spec) + [spec.get("prelude") or "true", "cd " + shlex.quote(spec["workspace"]),
+                                            chk["command"]]
+                rc, timed_out = run_shell(niced("; ".join(parts), spec), clog,
+                                          int(chk.get("timeout") or spec.get("timeout") or 3600))
                 result["tests"][chk["id"]] = "PASSED" if rc == 0 and not timed_out else "FAILED"
                 if rc != 0:
                     with open(clog, "rb") as f:
@@ -346,18 +411,122 @@ def cmd_strip_tests(git_dir, base, tree):
     print(json.dumps({"tree": new, "dropped": dropped}))
 
 
+def _sys_path(spec, module=None):
+    parts = env_prefix(spec) + [spec.get("prelude") or "true", "cd " + shlex.quote(spec["workspace"])]
+    parts += list(spec.get("commands") or [])
+    code = "import json, sys; print('SYS_PATH=' + json.dumps(sys.path))"
+    if module:
+        code = ("import importlib, json, sys; m = importlib.import_module(%r); "
+                "print('MODULE_FILE=' + json.dumps(getattr(m, '__file__', None) or ''))" % module)
+    parts.append("python -c %s" % shlex.quote(code))
+    out = subprocess.Popen(["bash", "-c", "; ".join(parts)], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT).communicate()[0].decode("utf-8", "replace")
+    return out
+
+
 def cmd_probe(spec_path):
     with open(spec_path) as f:
         spec = json.load(f)
-    parts = []
-    if spec.get("pythonpath"):
-        parts.append("export PYTHONPATH=%s${PYTHONPATH:+:$PYTHONPATH}" % shlex.quote(spec["workspace"]))
-    parts += [spec.get("prelude") or "true", "cd " + shlex.quote(spec["workspace"])] + list(spec.get("commands") or [])
-    parts.append("python -c 'import json, sys; print(\"SYS_PATH=\" + json.dumps(sys.path))'")
-    out = subprocess.Popen(["bash", "-c", "; ".join(parts)], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT).communicate()[0].decode("utf-8", "replace")
+    out = _sys_path(spec)
     m = re.search(r"^SYS_PATH=(.*)$", out, re.M)
     print(json.dumps({"sys_path": json.loads(m.group(1)) if m else None, "output": out[-1000:]}))
+
+
+def _imported_modules(path):
+    import ast
+    try:
+        with open(path, "rb") as f:
+            tree = ast.parse(f.read())
+    except Exception:
+        return []
+    mods = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            mods += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            mods.append(node.module)
+            mods += ["%s.%s" % (node.module, a.name) for a in node.names]
+    return mods
+
+
+def _module_file(roots, mod, slot=None):
+    """模块对应的源文件：先在映射的路径里找，再在槽位里按路径后缀找（发现没被映射的源码目录）。"""
+    rel = mod.replace(".", "/")
+    for root in roots:
+        for cand in (rel + ".py", rel + "/__init__.py"):
+            full = os.path.join(root, cand)
+            if os.path.isfile(full):
+                return full
+    if slot:
+        skip = {".git", "node_modules", "__pycache__", ".tox", ".venv", "venv", "build", "dist"}
+        for dirpath, dirnames, filenames in os.walk(slot):
+            depth = dirpath[len(slot):].count(os.sep)
+            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")] if depth < 4 else []
+            for cand in (rel + ".py", rel + "/__init__.py"):
+                full = os.path.join(dirpath, cand)
+                if os.path.isfile(full):
+                    return full
+    return None
+
+
+def cmd_isolation_probe(spec_path, out_dir):
+    """导入隔离探针：在槽位里（1）确认被测试导入的模块解析到槽位；（2）破坏它，那个测试必须失败。"""
+    with open(spec_path) as f:
+        spec = json.load(f)
+    os.makedirs(out_dir, exist_ok=True)
+    if spec.get("slot") and spec.get("tree"):
+        export_slot(spec)
+    slot = spec["workspace"]
+    roots = [e for e in (spec.get("pythonpath_entries") or []) if e.startswith(slot)] + [slot]
+    result = {"ok": True, "inconclusive": True, "reason": "no test imports a source module in the verification "
+              "directory; nothing to check"}
+    tried = 0
+    for test_file in spec.get("candidates") or []:
+        full_test = os.path.join(slot, test_file)
+        if not os.path.isfile(full_test):
+            continue
+        for mod in _imported_modules(full_test):
+            src = _module_file(roots, mod, slot)
+            if not src or TEST_PATH.search(os.path.relpath(src, slot)):
+                continue
+            tried += 1
+            out = _sys_path(spec, mod)
+            m = re.search(r"^MODULE_FILE=(.*)$", out, re.M)
+            if not m:
+                if tried >= 5:
+                    break
+                continue                                # 导入本身失败：换一个模块
+            where = os.path.realpath(json.loads(m.group(1)) or "")
+            if not where.startswith(os.path.realpath(slot) + os.sep):
+                result = {"ok": False, "inconclusive": False, "module": mod,
+                          "reason": "importing %s in the verification directory resolves to %s" % (mod, where)}
+                print(json.dumps(result))
+                return
+            with open(src, "rb") as f:
+                original = f.read()
+            try:
+                with open(src, "wb") as f:
+                    f.write(b"raise ImportError('belay isolation probe')\n" + original)
+                cmd, has_target, _ = build_command(dict(spec, select=[test_file]))
+                log = os.path.join(out_dir, "probe.log")
+                rc, _ = run_shell(cmd, log, int(spec.get("timeout") or 600))
+                with open(log, "rb") as f:
+                    text = f.read().decode("utf-8", "replace")
+                passed = [t for t, st in PARSERS[spec.get("parser") or "parse_log_pytest"](text).items()
+                          if st == "PASSED"]
+            finally:
+                with open(src, "wb") as f:
+                    f.write(original)
+            if passed:
+                result = {"ok": False, "inconclusive": False, "module": mod, "test": test_file,
+                          "reason": "breaking %s in the verification directory did not break %s (%d passed)"
+                                    % (os.path.relpath(src, slot), test_file, len(passed))}
+            else:
+                result = {"ok": True, "inconclusive": False, "module": mod, "test": test_file,
+                          "reason": "imports resolve to the verification directory"}
+            print(json.dumps(result))
+            return
+    print(json.dumps(result))
 
 
 def main(argv):
@@ -370,6 +539,8 @@ def main(argv):
         cmd_strip_tests(argv[2], argv[3], argv[4])
     elif cmd == "probe":
         cmd_probe(argv[2])
+    elif cmd == "isolation-probe":
+        cmd_isolation_probe(argv[2], argv[3])
     else:
         sys.exit("unknown command: " + cmd)
 

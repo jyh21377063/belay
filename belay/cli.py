@@ -3,10 +3,13 @@
   python -m belay.cli run    --workdir /path/to/repo --task-file task.md [--gate gate.json] [--run-dir runs/x]
   python -m belay.cli run    --docker <容器> --workdir /testbed --task-file task.md --gate gate.json --record rec.jsonl
   python -m belay.cli resume --run-dir runs/x                 # runtime 崩溃后：重放事件 → 对账 → 继续
+  python -m belay.cli resume --run-dir runs/x --rebuild [--docker <新容器>]
+                                                              # 容器 / 工作区 / 影子仓库丢了：从 git bundle 重建
   python -m belay.cli ledger --run-dir runs/x                 # 从事件库重放出账本
   python -m belay.cli flat   --workdir /path/to/repo --task-file task.md   # B 组：同一个 worker，不用图
 
-模型配置从环境变量读取：DEEPSEEK_API_KEY（或 ANTHROPIC_API_KEY）、ANTHROPIC_BASE_URL、BELAY_MODEL。
+模型配置从环境变量读取：DEEPSEEK_API_KEY（或 ANTHROPIC_API_KEY）、ANTHROPIC_BASE_URL、BELAY_MODEL；
+诊断者、复查者、存档标签可以用较便宜的模型（--aux-model / BELAY_AUX_MODEL，默认与 worker 相同）。
 --gate 兼容 eval 的 gate.json（test_cmd / parser / prelude / commands / timeout_sec，可加 public_checks）。
 """
 from __future__ import annotations
@@ -19,14 +22,15 @@ import time
 from pathlib import Path
 
 
-def _llm(args, record: str | None):
+def _llm(args, record: str | None, model: str | None = None):
     from belay.llm import LLM, ReplayLLM
     if getattr(args, "replay", None):
         return ReplayLLM(args.replay)
     key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise SystemExit("需要设置 DEEPSEEK_API_KEY")
-    return LLM(args.model, key, base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
+    return LLM(model or args.model, key,
+               base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
                effort=args.effort or None, thinking=not args.no_thinking, record_path=record, log=print)
 
 
@@ -41,9 +45,11 @@ def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--no-thinking", action="store_true")
     ap.add_argument("--record", help="把模型回复录制到该文件")
     ap.add_argument("--replay", help="回放录制的模型回复，不调用模型")
+    ap.add_argument("--aux-model", default=os.environ.get("BELAY_AUX_MODEL"),
+                    help="诊断者、复查者、存档标签用的模型（默认与 worker 相同）")
 
 
-def _run_belay(args, resume: bool) -> None:
+def _run_belay(args, resume: bool, rebuild: bool = False) -> None:
     from belay.core.config import BelayConfig
     from belay.runtime.driver import BelayRun, RunSettings
     from belay.runtime.verifier import VerifierSpec
@@ -52,22 +58,27 @@ def _run_belay(args, resume: bool) -> None:
     saved = run_dir / "cli.json"
     if resume:
         conf = json.loads(saved.read_text())
+        if rebuild and getattr(args, "docker", None):          # 在新容器上重建
+            conf["docker"] = args.docker
+            saved.write_text(json.dumps(conf, indent=1))
     else:
         run_dir.mkdir(parents=True, exist_ok=True)
         state = "/opt/belay" if args.docker else str((run_dir / "state").resolve())
         conf = {"workdir": args.workdir, "docker": args.docker, "budget_sec": args.budget_min * 60,
-                "git_dir": f"{state}/git", "jobs_dir": f"{state}/jobs",
+                "git_dir": f"{state}/git", "jobs_dir": f"{state}/jobs", "verify_dir": f"{state}/verify",
                 "gate": json.loads(Path(args.gate).read_text()) if args.gate else {},
                 "config": json.loads(Path(args.config).read_text()) if args.config else {}}
         saved.write_text(json.dumps(conf, indent=1))
     env = _env(conf["docker"], conf["workdir"])
     record = args.record or str(run_dir / "llm_record.jsonl")
     settings = RunSettings(run_dir=str(run_dir), budget_sec=conf["budget_sec"], git_dir=conf["git_dir"],
-                           jobs_dir=conf["jobs_dir"])
-    run = BelayRun(_llm(args, record), env, settings, BelayConfig.from_dict(conf["config"]),
-                   VerifierSpec.from_dict(conf["gate"]), log=print)
+                           jobs_dir=conf["jobs_dir"], verify_dir=conf.get("verify_dir"))
+    llm = _llm(args, record)
+    aux = _llm(args, None, args.aux_model) if args.aux_model and not getattr(args, "replay", None) else None
+    run = BelayRun(llm, env, settings, BelayConfig.from_dict(conf["config"]),
+                   VerifierSpec.from_dict(conf["gate"]), aux_llm=aux, log=print)
     if resume:
-        res = asyncio.run(run.resume())
+        res = asyncio.run(run.resume(rebuild=rebuild))
     else:
         task = Path(args.task_file).read_text() if args.task_file else args.task
         if not task:
@@ -115,6 +126,8 @@ def main() -> None:
     _common(run)
     res = sub.add_parser("resume", help="runtime 崩溃后继续")
     res.add_argument("--run-dir", required=True)
+    res.add_argument("--rebuild", action="store_true", help="容器、工作区或影子仓库丢失：从宿主机上的 git bundle 重建")
+    res.add_argument("--docker", help="重建时使用的新容器（从原始镜像启动）")
     _common(res)
     led = sub.add_parser("ledger", help="从事件库重放出账本")
     led.add_argument("--run-dir", required=True)
@@ -131,7 +144,7 @@ def main() -> None:
     if args.cmd == "run":
         _run_belay(args, resume=False)
     elif args.cmd == "resume":
-        _run_belay(args, resume=True)
+        _run_belay(args, resume=True, rebuild=args.rebuild)
     elif args.cmd == "ledger":
         _ledger(args)
     else:

@@ -2,6 +2,11 @@
 
 全部是不可变 dataclass：reduce 返回新图，旧图保持不变（结构共享，只复制被修改的那张表）。
 字段后面的注释标明来源：obs（观察）/ rule（规则）/ llm（LLM 提议）/ self（自述）。
+
+三层状态（模块 B、C）：
+  快照       runtime 在工具边界自动拍：某一刻工作区的样子（恢复工作区、定位回归）
+  暂存存档   related 档位验证通过：相关测试上没有回归（回退、继续推进）
+  确认存档   全量验证通过：全部守护测试上没有回归（交付）
 """
 from __future__ import annotations
 
@@ -12,7 +17,7 @@ from typing import Any, Optional, Union
 
 # ---- 任务状态
 OPEN = "open"                        # 没有人持有
-ACTIVE = "active"                    # 有租约，正在做
+ACTIVE = "active"                    # 有持有者，正在做
 REVIEW = "review"                    # 已声明做完，等存档与证据
 DONE = "done"                        # 关联检查在存档上全部通过
 DONE_UNVERIFIED = "done_unverified"  # 没有检查；工作已进入存档
@@ -22,10 +27,23 @@ TASK_STATUSES = (OPEN, ACTIVE, REVIEW, DONE, DONE_UNVERIFIED, BLOCKED, SPLIT)
 FINISHED = (DONE, DONE_UNVERIFIED)
 RESOLVED = (DONE, DONE_UNVERIFIED, BLOCKED)
 
+# ---- 步骤
+STEP_PLANNED, STEP_ACTIVE, STEP_DECLARED, STEP_ANCHORED = "planned", "active", "declared", "anchored"
+
 # ---- 作业
 JOB_RUNNING, JOB_FINISHED, JOB_UNKNOWN, JOB_CANCELLED = "running", "finished", "unknown", "cancelled"
+# 作业在哪里运行：slot（验证目录）| workspace（切换工作区：降级模式与基线的工作区那一次）| live（活的工作区，开发检查）
+WHERE_SLOT, WHERE_WORKSPACE, WHERE_LIVE = "slot", "workspace", "live"
 # ---- 存档尝试
-ATT_PENDING, ATT_ADVANCING, ATT_CREATED, ATT_REJECTED = "pending", "advancing", "created", "rejected"
+ATT_PENDING, ATT_ADVANCING, ATT_CREATED, ATT_REJECTED, ATT_SUPERSEDED = (
+    "pending", "advancing", "created", "rejected", "superseded")
+LANE_FG, LANE_BG = "fg", "bg"
+# ---- 存档级别
+PROVISIONAL, CONFIRMED = "provisional", "confirmed"
+# 存档类别：里程碑 = worker 手动存档、步骤完成、ready_for_review、交接与收尾
+KIND_AUTO, KIND_STEP, KIND_MILESTONE, KIND_REVIEW, KIND_HANDOFF, KIND_FINAL, KIND_BASE = (
+    "auto", "step", "milestone", "review", "handoff", "final", "baseline")
+MILESTONE_KINDS = (KIND_STEP, KIND_MILESTONE, KIND_REVIEW, KIND_HANDOFF, KIND_FINAL, KIND_BASE)
 # ---- 运行
 RUN_RUNNING, RUN_DONE, RUN_INCOMPLETE = "running", "done", "incomplete"
 
@@ -46,7 +64,7 @@ class Task:
     title: str
     description: str = ""
     links: tuple[str, ...] = ()              # → Requirement（llm / self）
-    blocked_by: tuple[str, ...] = ()         # → Task
+    blocked_by: tuple[str, ...] = ()         # → Task：排序提示（单 worker 下不再是硬依赖）
     parent: Optional[str] = None             # 拆分自哪个任务
     discovered_from: Optional[str] = None    # 在做哪个任务时发现的
     priority: int = 0                        # llm 的优先级提示，只用来打破平局
@@ -58,6 +76,7 @@ class Task:
     review_attempt: Optional[str] = None
     review_checkpoint: Optional[int] = None  # 在哪个存档上判定证据
     done_checkpoint: Optional[int] = None
+    done_seq: Optional[int] = None
     verified: bool = False
     reopen_count: int = 0
     reopen_reason: Optional[str] = None
@@ -66,6 +85,28 @@ class Task:
     blocked_reason: Optional[str] = None     # self
     blocked_quote: Optional[str] = None      # self，规则校验逐字存在
     children: tuple[str, ...] = ()
+    claimed_head: Optional[int] = None       # rule：认领时的链头（恢复点的基底）
+    passed_checks: tuple[str, ...] = ()      # obs：在某个存档上第一次通过过的检查（进展）
+    review: Optional[str] = None             # llm：复查结论 running | yes | partial | no | reading | none
+    review_missing: tuple[str, ...] = ()     # llm
+    review_reopens: int = 0                  # rule：被复查者重开的次数
+    history: tuple[tuple[int, str, str], ...] = ()   # rule：(序号, 状态, 原因)，最多保留最近 30 条
+
+
+@dataclass(frozen=True)
+class Step:
+    id: str                                  # T3.2
+    task: str
+    n: int
+    title: str
+    status: str = STEP_PLANNED               # self / rule：planned → active → declared → anchored
+    anchor_snapshot: Optional[int] = None    # obs：step_done 时强制拍下的快照
+    anchor_epoch: Optional[int] = None
+    checkpoint: Optional[int] = None         # rule：包含锚点的存档
+    summary: str = ""                        # self
+    files: tuple[tuple[str, int, int], ...] = ()   # obs：相对上一个锚点的改动
+    order: int = 0                           # 在最新计划里的位置
+    declared_seq: Optional[int] = None
 
 
 # ======================================================================== 视图 B：执行状态
@@ -83,40 +124,68 @@ class Session:
     id: str
     worker: str
     n: int                                   # 这个 worker 的第几个会话（从 1 开始）
-    reason: str                              # 为什么开：first | handoff | restart | recover | crash
+    reason: str                              # first | handoff | restart | recover | crash | rebuild | resume
     started_seq: int
     started_t: float
     opening: dict = field(default_factory=dict)   # rule：开场上下文的摘要（各段 token、被裁的段）
-    transcript: Optional[str] = None         # obs：完整对话记录（只用于审计，恢复时不重放）
+    transcript: Optional[str] = None         # obs：完整对话记录（读盘重放用）
     ended_t: Optional[float] = None
-    end_reason: Optional[str] = None         # obs：done | handoff | crash | stuck | deadline | runtime_crash | max_turns
+    ended_seq: Optional[int] = None
+    end_reason: Optional[str] = None         # obs：done | handoff | crash | stuck | deadline | runtime_crash | ...
     peak_context: int = 0
     turns: int = 0
     compactions: tuple[tuple[int, int, int], ...] = ()   # (层级, 压缩前, 压缩后)
-    progress: bool = False                   # rule：会话期间（含结束后替它做的存档）是否有新证据
+    progress: bool = False                   # rule：会话期间（含结束后替它做的存档）是否有进展
+    resumes: tuple[str, ...] = ()            # obs：原样接上对话的方式 memory | replay
     error: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class Lease:
+    """当前焦点：active / review 的任务有且只有一个持有者（单 worker 下没有时效）。"""
     task: str
     worker: str
     acquired_t: float
-    expires_t: float
+    head: Optional[int] = None               # 认领时的链头
+    seq: int = 0
 
 
 @dataclass(frozen=True)
 class Wip:
-    """未验证的进度（观察）。"""
+    """未验证的进度（观察）：最近一张快照相对链头的样子。"""
     worker: str
     base: int                                # 基于哪个存档
     tree: str                                # 剔除测试改动后的候选树
     raw_tree: str = ""                       # 工作区原样的树
     files: tuple[tuple[str, int, int], ...] = ()   # 相对 base 的改动：(路径, 增, 删)
     dropped: tuple[str, ...] = ()            # 被剔除的测试路径改动
-    diff: Optional[str] = None               # 完整 diff 附件
+    snapshot: int = 0
     seq: int = 0
-    last_rejection: Optional[dict] = None    # 最近一次存档被拒的原因
+    last_rejection: Optional[dict] = None    # 最近一次 worker 能据此行动的被拒（手动、步骤、交接）
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    n: int
+    seq: int
+    t: float
+    worker: str
+    tree: str                                # 候选树（剔除测试改动）
+    raw_tree: str                            # 工作区原样
+    epoch: int
+    reason: str                              # writes | interval | model_test | session_end | handoff | step_done |
+    #                                          checkpoint | review | recover | deadline | final | suspend | gate
+    testable: bool
+    commit: str = ""                         # 影子仓库里包住这张快照的提交（refs/belay/snap/<n>）
+    base: int = 0                            # 拍下时的链头
+    files: tuple[tuple[str, int, int], ...] = ()
+    dropped: tuple[str, ...] = ()
+    held: tuple[str, ...] = ()               # 拍下时持有的任务
+    step: Optional[str] = None               # 拍下时的当前步骤
+    session: Optional[str] = None
+    tool_seq: int = 0
+    precheck: str = ""                       # 预检失败的原因
+    lost: bool = False                       # 容器重建时没能恢复（最后一次导出之后）
 
 
 @dataclass(frozen=True)
@@ -125,8 +194,9 @@ class Note:
     t: float
     worker: str
     session: Optional[str]
-    kind: str                                # note | todos
+    kind: str                                # note | todos | released
     text: str
+    task: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -135,18 +205,25 @@ class Job:
     key: str                                 # (树, 检查集合, 标签) 的键；同键只跑一次
     tree: str
     selection: Optional[tuple[str, ...]]     # None = 全量；否则测试文件或 cmd:<name>
-    purpose: str                             # baseline | verify | confirm | evidence | dev
+    purpose: str                             # baseline | verify | confirm | evidence | dev | promote | locate |
+    #                                          recheck | gate
     requested_by: str = "runtime"
     attempt: Optional[str] = None
     live: bool = False                       # 在活的工作区上跑（dev）：结果不作为存档证据
+    where: str = WHERE_SLOT
     tag: str = ""
+    locate: Optional[str] = None
+    checkpoint: Optional[int] = None         # promote / recheck 针对的存档
     state: str = JOB_RUNNING
     results: dict = field(default_factory=dict)   # obs：检查 id → PASSED | FAILED | ERROR | SKIPPED | XFAIL
+    reasons: dict = field(default_factory=dict)   # obs：失败原因（每条截断 400 字符）
     error: str = ""
     sec: float = 0.0
     started_t: float = 0.0
+    started_seq: int = 0
     finished_t: Optional[float] = None
     replaces: Optional[str] = None
+    preemptions: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,7 +246,51 @@ class Compaction:
     level: int
     before: int
     after: int
-    summary: Optional[str] = None            # llm（L3）
+    summary: Optional[str] = None            # llm（L3 / L4）
+
+
+@dataclass(frozen=True)
+class Persistent:
+    """持续性回归（rule）：同一个守护测试在连续几个可测快照上失败，或降级后在最新快照上仍然失败。"""
+    test: str
+    seq: int
+    t: float
+    since: int                               # 从哪张快照起失败
+    epoch: int
+    trigger: str                             # background | dev_check | demoted
+    checkpoint: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class Locate:
+    """快照二分定位（rule）。区间内各点的结果全部来自作业，所以状态由图推出，不单独记录中间步骤。"""
+    id: str
+    tests: tuple[str, ...]
+    bad_tree: str
+    bad_snapshot: Optional[int]              # 坏端的快照（None 表示坏端是某个存档本身）
+    bad_checkpoint: Optional[int]
+    epoch: int
+    lower: int                               # 该段起点存档（回退目标或 0 号）
+    trigger: str                             # rejected | demoted | persistent | step
+    started_seq: int
+    started_t: float
+    ref: Optional[str] = None                # 尝试 id 或 "cp:<k>"
+    status: str = "running"                  # running | concluded
+    groups: tuple[dict, ...] = ()            # 规则给出的分组结果
+    results: tuple[dict, ...] = ()           # regression_located（观察，含 diff）
+
+
+@dataclass(frozen=True)
+class Diagnosis:
+    id: str
+    trigger: str                             # rejected | demoted | persistent | repeated
+    tests: tuple[str, ...]
+    key: str                                 # (回归签名, 定位区间)：同一个键只诊断一次（repeated 除外）
+    seq: int
+    locate: Optional[str] = None
+    previous: Optional[str] = None
+    status: str = "requested"                # requested | recorded | failed
+    result: dict = field(default_factory=dict)   # llm
 
 
 # ======================================================================== 视图 C：存档链
@@ -178,9 +299,9 @@ class Compaction:
 class Attempt:
     id: str
     worker: str
-    trigger: str                             # worker | review | session_end | handoff | deadline | final
+    trigger: str                             # worker | review | auto | step | handoff | session_end | deadline | final
     tree: str
-    base: int                                # 尝试时的链头
+    base: int                                # 尝试时的链头（只作记录；父节点在推进时才确定）
     tier: str                                # related | full
     selection: Optional[tuple[str, ...]]
     tasks: tuple[str, ...] = ()              # 随这次尝试判定的待验证任务
@@ -195,6 +316,10 @@ class Attempt:
     summary: str = ""                        # self
     raw_tree: str = ""
     created_seq: int = 0
+    snapshot: int = 0
+    epoch: int = 0
+    lane: str = LANE_FG
+    kind: str = KIND_MILESTONE
 
 
 @dataclass(frozen=True)
@@ -208,9 +333,17 @@ class Checkpoint:
     attempt: Optional[str] = None
     tier: str = "baseline"
     trigger: str = "baseline"
-    files: tuple[tuple[str, int, int], ...] = ()   # obs：相对上一个存档的改动
-    tasks: tuple[str, ...] = ()              # rule：创建时 worker 持有 / 随尝试判定的任务
+    files: tuple[tuple[str, int, int], ...] = ()   # obs：相对父存档的改动
+    tasks: tuple[str, ...] = ()              # rule：创建时持有 / 随尝试判定的任务
     abandoned: bool = False
+    snapshot: int = 0
+    epoch: int = 0
+    kind: str = KIND_BASE
+    level: str = CONFIRMED
+    confirmed_seq: Optional[int] = None
+    demoted: bool = False
+    demote_regressions: tuple[str, ...] = ()
+    label: str = ""                          # llm：没有步骤时的一行说明
 
 
 # ======================================================================== 运行与整张图
@@ -228,8 +361,14 @@ class Run:
     status: str = RUN_RUNNING
     reserve: bool = False
     reserve_sec: float = 0.0
+    finalizing: bool = False
+    finalize_reason: str = ""
+    suspended: int = 0
     delivered: Optional[int] = None
+    delivered_level: Optional[str] = None
+    deliver_unconfirmed: Optional[bool] = None   # 交付时用的 deliver_unconfirmed 取值（账本写明）
     recoveries: int = 0
+    rebuilds: int = 0
     downtime_sec: float = 0.0
 
 
@@ -241,31 +380,51 @@ class Graph:
     requirements: dict[str, Requirement] = field(default_factory=dict)
     frozen: bool = False
     tasks: dict[str, Task] = field(default_factory=dict)
+    steps: dict[str, Step] = field(default_factory=dict)
     baseline: dict[str, str] = field(default_factory=dict)     # 检查 id → pass | fail | flaky | skip
     baseline_ready: bool = False
     baseline_sec: float = 0.0
+    isolation: dict = field(default_factory=dict)              # obs：{valid, reason, diff, probe}
     plans: tuple[dict, ...] = ()
     # B
     workers: dict[str, WorkerState] = field(default_factory=dict)
     sessions: dict[str, Session] = field(default_factory=dict)
-    leases: dict[str, Lease] = field(default_factory=dict)      # 任务 id → 租约
+    leases: dict[str, Lease] = field(default_factory=dict)      # 任务 id → 持有者
     wips: dict[str, Wip] = field(default_factory=dict)          # worker → WIP
+    snapshots: dict[int, Snapshot] = field(default_factory=dict)
+    epoch: int = 0
+    epoch_base: dict[int, int] = field(default_factory=lambda: {0: 0})   # 段号 → 段起点存档
     notes: tuple[Note, ...] = ()
     jobs: dict[str, Job] = field(default_factory=dict)
     job_keys: dict[str, str] = field(default_factory=dict)      # 键 → 有效的作业（running / finished）
     compactions: tuple[Compaction, ...] = ()
     stalls: tuple[Stall, ...] = ()
+    persistent: dict[str, Persistent] = field(default_factory=dict)   # 测试 id → 最近一次持续性回归记录
+    locates: dict[str, Locate] = field(default_factory=dict)
+    diagnoses: dict[str, Diagnosis] = field(default_factory=dict)
+    relations: tuple[tuple[str, str], ...] = ()                 # rule：(源文件, 测试文件)
+    summaries: tuple[dict, ...] = ()                            # llm：进度摘要
     # C
     checkpoints: dict[int, Checkpoint] = field(default_factory=dict)
     attempts: dict[str, Attempt] = field(default_factory=dict)
     head: Optional[int] = None
-    # 进展（rule）：最近一次新证据的时间与序号
+    confirmed: Optional[int] = None
+    # 进展（rule）：最近一次进展的时间与序号
     last_progress_t: float = 0.0
     last_progress_seq: int = 0
 
     @property
     def head_cp(self) -> Optional[Checkpoint]:
         return self.checkpoints.get(self.head) if self.head is not None else None
+
+    @property
+    def degraded(self) -> bool:
+        """导入隔离无效：验证回到切换工作区的方式，并且不做任何后台验证。"""
+        return self.isolation.get("valid") is False
+
+    @property
+    def last_snapshot(self) -> int:
+        return max(self.snapshots) if self.snapshots else 0
 
 
 # ======================================================================== 序列化（视图快照）

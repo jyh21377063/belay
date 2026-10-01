@@ -39,7 +39,39 @@ def _task(inp: dict) -> str:
 
 
 async def board(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("board"))
+    return _out(await _rt(ctx).request("board", status=inp.get("status"), requirement=inp.get("requirement"),
+                                       task=inp.get("task"), view=inp.get("view"), page=int(inp.get("page") or 1)))
+
+
+async def task(inp: dict, ctx: ToolContext) -> str:
+    tid = str(inp.get("id") or inp.get("task") or "").strip()
+    if not tid:
+        raise ToolError("id is required (e.g. \"T3\")")
+    return _out(await _rt(ctx).request("task", task=tid))
+
+
+async def step_done(inp: dict, ctx: ToolContext) -> str:
+    return _out(await _rt(ctx).request("step_done", summary=str(inp.get("summary") or "")))
+
+
+async def failure_log(inp: dict, ctx: ToolContext) -> str:
+    test = str(inp.get("test") or "").strip()
+    if not test:
+        raise ToolError("test is required (a test node id)")
+    return _out(await _rt(ctx).request("failure_log", test=test))
+
+
+async def revert_change(inp: dict, ctx: ToolContext) -> str:
+    loc = str(inp.get("located") or "").strip()
+    if not loc:
+        raise ToolError("located is required (e.g. \"L1#0\", from a located regression)")
+    return _out(await _rt(ctx).request("revert_change", located=loc))
+
+
+async def history(inp: dict, ctx: ToolContext) -> str:
+    a, b = inp.get("a"), inp.get("b")
+    return _out(await _rt(ctx).request("history", a=None if a in (None, "") else int(a),
+                                       b=None if b in (None, "") else int(b)))
 
 
 async def claim(inp: dict, ctx: ToolContext) -> str:
@@ -76,7 +108,8 @@ async def report_blocked(inp: dict, ctx: ToolContext) -> str:
 
 
 async def run_check(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("run_check", tests=_list(inp.get("tests"), "tests"), full=bool(inp.get("full"))))
+    return _out(await _rt(ctx).request("run_check", tests=_list(inp.get("tests"), "tests"), full=bool(inp.get("full")),
+                                       as_gate=bool(inp.get("as_gate"))))
 
 
 async def wait(inp: dict, ctx: ToolContext) -> str:
@@ -95,12 +128,21 @@ _TASK = {"type": "string", "description": "Task id, e.g. T3"}
 
 TOOLS = [
     Tool("board",
-         "Show the task graph the harness keeps for this run: requirements and their status, every task (who holds "
-         "it, what blocks it), a suggested order, the latest verified checkpoint and your unverified changes.",
-         {"type": "object", "properties": {}}, board, read_only=True),
+         "Show the task graph the harness keeps for this run. Without arguments: the latest checkpoints, your "
+         "changes that are not checkpointed yet, suggestions, counts, and the unfinished tasks. Filters: "
+         "status (open | active | review | done | done_unverified | blocked | split | unfinished), requirement "
+         "(e.g. \"R3\"), task (e.g. \"T7\"), view (\"checkpoints\" | \"failures\" | \"tasks\"), page.",
+         {"type": "object", "properties": {
+             "status": {"type": "string"}, "requirement": {"type": "string"}, "task": {"type": "string"},
+             "view": {"type": "string", "enum": ["tasks", "checkpoints", "failures"]}, "page": {"type": "integer"}}},
+         board, read_only=True),
+    Tool("task",
+         "Everything the harness knows about one task: its requirement quotes, checks, status history, why it was "
+         "rejected or reopened, all notes from every session, its steps and the files it changed.",
+         {"type": "object", "properties": {"id": _TASK}, "required": ["id"]}, task, read_only=True),
     Tool("claim",
-         "Claim a task before working on it. Claims are leases kept alive by your activity. You may claim any ready "
-         "task; the suggested order is only advice.",
+         "Make a task your current focus before working on it. You may claim any open task; dependencies and the "
+         "suggested order are only advice.",
          {"type": "object", "properties": {"task": _TASK}, "required": ["task"]}, claim),
     Tool("release",
          "Give a task back without finishing it (it becomes available again). Leave a note for whoever picks it up.",
@@ -112,27 +154,35 @@ TOOLS = [
          {"type": "object", "properties": {
              "title": {"type": "string"}, "description": {"type": "string"},
              "links": {"type": "array", "items": {"type": "string"}, "description": "Requirement ids, e.g. [\"R2\"]"},
-             "blocked_by": {"type": "array", "items": {"type": "string"}, "description": "Task ids"},
+             "blocked_by": {"type": "array", "items": {"type": "string"}, "description": "Task ids (ordering hint)"},
              "checks": {"type": "array", "items": {"type": "string"}, "description": "Existing test node ids"}},
           "required": ["title", "links"]}, add_task),
     Tool("note",
          "Leave a note for yourself or whoever continues this work in a later session: decisions and why, what you "
-         "tried that did not work, what to do next. Notes are kept across sessions and shown as your own "
-         "(unverified) notes; facts such as files changed and test results are tracked by the harness anyway.",
+         "tried that did not work, what to do next. Notes are kept with the task across sessions and shown as your "
+         "own (unverified) notes; facts such as files changed and test results are tracked by the harness anyway.",
          {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}, note),
+    Tool("step_done",
+         "Mark the current step of your task finished (the step list is your todo list for the task, which the "
+         "harness keeps). The harness snapshots your working tree as the step's anchor and verifies it in the "
+         "background; you do not wait. After an interruption you continue from the next step instead of re-reading "
+         "finished ones.",
+         {"type": "object", "properties": {
+             "summary": {"type": "string", "description": "One line: what the step did"}}},
+         step_done),
     Tool("checkpoint",
-         "Ask the harness to save your current working tree as a verified checkpoint. Changes under test paths are "
-         "restored to the original first (tests are the acceptance baseline). The tests that passed twice on the "
-         "original code and relate to your changes are run; if none of them fails, errors, is skipped or goes "
-         "missing, the checkpoint chain advances and this state becomes the deliverable. Otherwise nothing changes "
-         "and you get the failing checks back. Only checkpointed work is delivered.",
+         "Confirm your current working tree as a checkpoint now and label it (the harness also checkpoints in the "
+         "background, so you do not need this to avoid losing work). Changes under test paths are restored to the "
+         "original first. The tests related to your changes are run; if none of the tests that passed on the "
+         "original code fails, errors, is skipped or goes missing, the checkpoint chain advances. Otherwise nothing "
+         "changes and you get the failing checks back with their failure reasons.",
          {"type": "object", "properties": {"summary": {"type": "string", "description": "What this state contains"}}},
          checkpoint),
     Tool("ready_for_review",
          "Declare a task you hold finished. The harness checkpoints your working tree and then looks at the task's "
          "checks on that checkpoint: if they all pass the task is done; a task without checks becomes "
-         "done_unverified once its work is in a checkpoint. If the checkpoint is rejected or a check fails, the task "
-         "is reopened and stays yours.",
+         "done_unverified once its work is in a checkpoint (a reviewer may reopen it if parts are missing). If the "
+         "checkpoint is rejected or a check fails, the task is reopened and stays yours.",
          {"type": "object", "properties": {"task": _TASK, "summary": {"type": "string"}}, "required": ["task"]},
          ready_for_review),
     Tool("report_blocked",
@@ -149,21 +199,41 @@ TOOLS = [
           "required": ["task", "kind", "reason"]}, report_blocked),
     Tool("run_check",
          "Start a check as a background job run by the harness and return at once with a job id (or the cached "
-         "result if the same working tree was already checked). With no arguments it runs the tests related to your "
-         "changes; tests=[...] runs specific test files or node ids; full=true runs everything. Results are compared "
-         "with the original code: regressions, pre-existing failures and new tests. Keep working and call wait when "
-         "you need the result, instead of sleeping.",
+         "result if the same tree was already checked). With no arguments it runs the tests related to your "
+         "changes; tests=[...] runs specific test files or node ids; full=true runs everything. By default it runs "
+         "in your working tree as it is; as_gate=true runs it exactly as the regression gate does (your changes to "
+         "test files removed, in the harness's verification directory). Results are compared with the original "
+         "code: regressions, pre-existing failures and new tests. Keep working and call wait when you need the "
+         "result, instead of sleeping.",
          {"type": "object", "properties": {
-             "tests": {"type": "array", "items": {"type": "string"}}, "full": {"type": "boolean"}}}, run_check),
+             "tests": {"type": "array", "items": {"type": "string"}}, "full": {"type": "boolean"},
+             "as_gate": {"type": "boolean"}}}, run_check),
     Tool("wait",
          "Wait until the given jobs finish and return their results. Returns early with the current status after "
          "the timeout (seconds, default 600).",
          {"type": "object", "properties": {
              "jobs": {"type": "array", "items": {"type": "string"}}, "timeout": {"type": "integer"}},
           "required": ["jobs"]}, wait),
+    Tool("failure_log",
+         "Show the traceback of a failing test from the most recent harness run that included it (the harness's "
+         "own logs are otherwise not accessible).",
+         {"type": "object", "properties": {"test": {"type": "string", "description": "Test node id"}},
+          "required": ["test"]}, failure_log, read_only=True),
+    Tool("revert_change",
+         "Undo only the change that the harness located as the start of a regression (for example \"L1#0\" from a "
+         "located regression message): the difference between the last good and the first bad snapshot, limited to "
+         "the files it names, is reversed in your working tree. Later work is kept. If it conflicts with later "
+         "changes nothing is modified and you are told why.",
+         {"type": "object", "properties": {"located": {"type": "string"}}, "required": ["located"]}, revert_change),
+    Tool("history",
+         "List the checkpoint chain (kind, confirmed or provisional, demoted, labels). With a and b, show the diff "
+         "between two checkpoints.",
+         {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}}, history,
+         read_only=True),
     Tool("rollback",
-         "Discard your unverified changes and restore the working tree to a checkpoint (default: the latest one). "
-         "Rolling back to an earlier checkpoint also abandons the checkpoints after it, and tasks finished on them "
-         "are reopened. Use it when your working tree is broken beyond repair.",
+         "Discard your changes and restore the working tree to a checkpoint (default: the latest milestone, i.e. "
+         "your last checkpoint, finished step or finished task, not a background checkpoint). Rolling back to an "
+         "earlier checkpoint abandons the checkpoints after it, and tasks finished on them are reopened. Use it when "
+         "you have just broken things; for a regression found later, prefer revert_change.",
          {"type": "object", "properties": {"checkpoint": {"type": "integer"}}}, rollback),
 ]

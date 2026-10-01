@@ -79,20 +79,25 @@ python -m eval.report results/<run_id>                    # 重新生成汇总
 | `eval/agents/flat_agent.py` | B 组：自研执行器（骨架） |
 | `eval/agents/replay.py` | 评分用：在全新容器中应用补丁 |
 
-## belay 模块（v5：任务状态图 runtime）
+## belay 模块（v6：长程单 worker 的可靠性底座）
 
 设计见 [docs/design.md](docs/design.md)，目录与依赖规则见 [docs/architecture.md](docs/architecture.md)。
 一条只追加的事件日志是唯一真相；任务图、执行状态、存档链三个视图由纯函数从日志推出；runtime 是唯一写者。
 循环跑在宿主机进程里，工具经由 `Env` 在任务容器中执行；容器里只需要 bash、coreutils、git 与 python3。
 
+agent 只管写代码：runtime 在工具边界自动拍快照，在验证槽位里用原始测试验证并推进一条两级存档链（related 通过是暂存点，
+全量通过是确认点，交付最新的确认点）；被拒或降级时先用快照二分定位，再让诊断者解释；需求账本与复查者防止漏做和提前结束；
+交接落在步骤边界，开场上下文分层且有界；全部状态以事件日志和 git bundle 保存在宿主机上，会话、runtime 进程、容器都可以
+随时被替换（内存重试、读盘重放、`resume --rebuild`）。
+
 | 路径 | 职责 |
 | --- | --- |
 | `belay/core/` | **纯函数核心**：事件（`events`）、三个视图（`model`）、推导函数（`reduce`）、状态转换规则（`rules`）、验证规则（`verify`）、不变量（`invariants`）、调度建议（`suggest`）、上下文构建（`context`）、压缩规则 L0–L2（`compact`）、规划校验（`plan`）、副作用计划（`effects`）、文字渲染（`render`）、配置（`config`） |
 | `belay/runtime/` | **命令式外壳**：事件存储（`store`）、唯一写者（`runtime`）、影子仓库与 CAS（`gitops`）、作业与验证器（`verifier`）、会话循环与 L0–L4（`session`）、工具接口（`port`）、规划器（`planner`）、运行驱动（`driver`）、重启对账（`recovery`）、提示词（`prompts`） |
-| `belay/tools/` | 通用工具（文件、bash、todo、explore）与 Belay 工具（`belay.py`：board / claim / release / add_task / note / checkpoint / ready_for_review / report_blocked / run_check / wait / rollback） |
+| `belay/tools/` | 通用工具（文件、bash、todo、explore）与 Belay 工具（`belay.py`：board / task / claim / release / add_task / note / step_done / checkpoint / ready_for_review / report_blocked / run_check / wait / failure_log / revert_change / history / rollback） |
 | `belay/worker/` | B 组的 worker（同一套工具，不用图），也用来跑只读探索子 agent |
 | `belay/env.py`、`belay/llm.py` | 执行环境（Local / Docker / Pier）；模型客户端（重试、thinking、录制与回放、ScriptedLLM） |
-| `belay/container/runner.py` | 容器内的检查运行器（标准库）：临时切换候选树跑测试与命令检查、解析结果 |
+| `belay/container/runner.py` | 容器内的检查运行器（标准库）：把候选树增量导出到验证槽位（或降级时临时切换工作区）跑测试与命令检查、解析结果、导入隔离探针 |
 | `belay/cli.py` | 本地调试入口：`run` / `resume` / `ledger` / `flat` |
 
 ```bash
@@ -101,13 +106,15 @@ python -m belay.cli run --workdir /path/to/repo --task-file task.md --gate gate.
 python -m belay.cli run --docker <容器> --workdir /testbed --task-file task.md --gate gate.json --run-dir runs/x
 python -m belay.cli run ... --replay runs/x/llm_record.jsonl            # 回放录制的模型回复，不调用模型
 python -m belay.cli resume --run-dir runs/x                             # runtime 崩溃后：重放 → 对账 → 继续
+python -m belay.cli resume --run-dir runs/x --rebuild [--docker <新容器>] # 容器 / 工作区丢了：从 git bundle 重建
 python -m belay.cli ledger --run-dir runs/x                             # 从事件库重放出账本
 python -m belay.cli flat --workdir /path/to/repo --task-file task.md    # B 组
 ```
 
 运行目录：`events.sqlite`（事件与视图快照，唯一真相）、`events.jsonl`（同内容，便于阅读）、`sessions/S*.jsonl`
-（每个会话的完整对话，只用于审计）、`blobs/`（大工具输出、diff）、`checkpoints/<k>.diff`（每个存档的补丁镜像）、
-`deliverable.diff`（交付物 = 最近的存档）、`worktree.diff`（结束时工作区的完整改动）、`ledger.json` / `ledger.md`。
+（每个会话的完整对话与消息轨迹，用于审计与读盘重放）、`git/<m>.bundle`（影子仓库的增量镜像，用于重建）、`blobs/`
+（大工具输出、diff、压缩后的消息）、`checkpoints/<k>.diff`（每个存档的补丁镜像，给人看）、`deliverable.diff`
+（交付物 = 最新的确认点）、`worktree.diff`（结束时工作区的完整改动）、`ledger.json` / `ledger.md`（六类口径）。
 
 > eval 适配（`eval/agents/belay_agent.py`）仍指向 v4 的旧 runtime，接评测时按 `belay.runtime.driver.BelayRun` 重写。
 

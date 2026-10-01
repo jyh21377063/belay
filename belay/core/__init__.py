@@ -6,6 +6,6 @@ from belay.core.config import BelayConfig
 from belay.core.events import Event
 from belay.core.model import Graph
 from belay.core.reduce import IllegalEvent, apply, replay
-from belay.core.rules import Rejected, TreeObs, Tx
+from belay.core.rules import Rejected, SnapObs, Tx
 
-__all__ = ["BelayConfig", "Event", "Graph", "IllegalEvent", "Rejected", "TreeObs", "Tx", "apply", "replay"]
+__all__ = ["BelayConfig", "Event", "Graph", "IllegalEvent", "Rejected", "SnapObs", "Tx", "apply", "replay"]

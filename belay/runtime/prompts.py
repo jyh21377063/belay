@@ -24,13 +24,22 @@ packages from the internet.
 A runtime ("the harness") keeps a task graph for this run so that no progress is lost when a session ends, the \
 context is compacted, or something crashes:
 - Requirements were extracted verbatim from the task statement and are frozen; tasks are the work, linked to \
-requirements. `board` shows everything. Claim a task before you work on it and call `ready_for_review` when it is \
-finished; add tasks you discover with `add_task`; report tasks you cannot finish with `report_blocked`.
-- Only checkpointed work is delivered. `checkpoint` saves your working tree if no test that passed on the original \
-code fails, errors, is skipped or goes missing. Changes under test paths are never delivered: the existing tests are \
-the acceptance baseline. Checkpoint whenever you reach a sound intermediate state.
+requirements. `board` shows a summary (with filters), `task` shows everything about one task. Claim a task to make \
+it your current focus and call `ready_for_review` when it is finished; add tasks you discover with `add_task`; \
+report tasks you cannot finish with `report_blocked`. Dependencies between tasks are ordering hints only.
+- Your plan for the current task is its list of steps: `todo_write` records it with the harness, and `step_done` \
+marks the current step finished (marking a todo completed does the same). After an interruption the harness hands \
+the plan back to you with your progress, so keep it up to date.
+- The harness snapshots your working tree as you work and checkpoints it in the background whenever no test that \
+passed on the original code fails, errors, is skipped or goes missing. You do not have to remember to save; call \
+`checkpoint` when you want a sound state confirmed right away and labelled. Changes under test paths are never \
+delivered: the existing tests are the acceptance baseline.
 - A task counts as done only when the harness observes its checks passing on a checkpoint; a task without checks \
-becomes done_unverified. Your own statements are recorded as notes, not as evidence.
+becomes done_unverified and may be reviewed and reopened. Your own statements are recorded as notes, not as \
+evidence.
+- When a checkpoint is rejected you get the failing tests with their failure reasons; `failure_log` shows a full \
+traceback, `run_check` with as_gate=true reproduces a check exactly as the gate runs it, and when the harness has \
+located the change that broke a test, `revert_change` undoes just that change. `history` shows the checkpoints.
 - The harness manages your context automatically: when the conversation grows long it is compacted, or the work \
 continues in a fresh session that starts from the task graph (the same happens after a crash). The length of the \
 conversation does not limit how much work you can do. Use `note` for decisions, dead ends and next steps that a \
@@ -68,8 +77,8 @@ grep_search. Reserve bash for running programs, tests and builds. Use non-intera
 - Long outputs are truncated; the full text is saved to a file whose path is shown.
 {explore_hint}
 # Finishing
-When every task you can do is done or reported blocked, and your work is checkpointed, end your turn with a short \
-factual summary and no tool call. The harness then checks the task graph: if work remains, a new session \
+When every task you can do is done or reported blocked, end your turn with a short factual summary and no tool \
+call. The harness then checks the task graph: if work remains, a new session \
 continues it. Report what actually happened; a claim that something works must rest on a result you \
 observed.
 """
@@ -124,3 +133,34 @@ together cover all of its linked requirements. Reply with a single JSON object a
 def system_prompt(workdir: str, platform: str, has_explore: bool = True) -> str:
     return SYSTEM_PROMPT.format(workdir=workdir, platform=platform or "Linux",
                                 explore_hint=EXPLORE_HINT if has_explore else "")
+
+
+STEP_HINT = "When the current step is finished, call step_done."
+
+DIAGNOSE_SYSTEM = """You explain why a regression happened in a codebase that an autonomous coding agent is changing. \
+The harness has already located, from test runs on snapshots, the change after which the test started failing. You \
+only explain; you cannot change code or the rules. Reply with a single JSON object and nothing else:
+{"suspects": [{"file": "path", "hunk": "@@ ... @@", "confidence": 0.0, "reason": "one sentence"}],
+ "intentional": {"likely": false, "requirement": null, "quote": null},
+ "suggestion": "one or two sentences: the smallest change that keeps the intent and fixes the test",
+ "flaky_suspect": false}
+Set intentional.likely=true only if the change looks deliberately made for a requirement; then quote the task text \
+verbatim in intentional.quote. Keep the whole reply under 300 words."""
+
+REVIEW_SYSTEM = """You review whether a task in a software project was actually implemented. You can only find \
+problems: you cannot mark anything as done. Compare the requirement text with the diff. Reply with a single JSON \
+object and nothing else:
+{"implemented": "yes" | "partial" | "no", "missing": ["what is missing, concretely"], "evidence": ["path:line ..."]}
+Answer "yes" when the diff plausibly implements every part of the requirement."""
+
+REVIEW_BLOCKED_SYSTEM = """An autonomous coding agent reported that a task cannot be done because the task text \
+does not give enough information. Decide whether there is a reasonable reading of the task text that an engineer \
+would act on. Reply with a single JSON object and nothing else:
+{"reading": "the reasonable reading, in one or two sentences, or an empty string if there is none"}"""
+
+LABEL_SYSTEM = """Summarise in one line (at most 25 words) what the agent did in the conversation excerpt below, as \
+a label for a saved state of the code. Output only the line."""
+
+PROGRESS_SYSTEM = """The conversation excerpt below is the last part of an agent's session that was interrupted. \
+Write a short summary (at most 150 words) of what it was in the middle of and what it planned to do next. Output \
+only the summary."""

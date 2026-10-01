@@ -11,7 +11,7 @@ import posixpath
 import re
 from typing import Iterable, Optional
 
-from belay.core.model import JOB_FINISHED, JOB_RUNNING, Graph
+from belay.core.model import JOB_FINISHED, JOB_RUNNING, LANE_FG, WHERE_LIVE, Graph, Job
 
 # 与 belay/container/runner.py 的 TEST_PATH 保持一致（tests/unit/test_verify.py 检查二者相同）
 TEST_PATH = re.compile(r"(^|/)(tests?|testing|__tests__)/|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$")
@@ -120,21 +120,27 @@ def _tokens(test_file: str) -> set[str]:
     return {t for t in toks if t}
 
 
-def related_units(changed: Iterable[str], test_files: Iterable[str]) -> tuple[Optional[tuple[str, ...]], str]:
+def related_units(changed: Iterable[str], test_files: Iterable[str],
+                  relations: Iterable[tuple[str, str]] = ()) -> tuple[Optional[tuple[str, ...]], str]:
     """按文件路径的通用规则选相关测试文件。
 
     返回 (选择, 理由)：选择为 None 表示应当跑全量。规则：
       - 文档类文件（.md/.rst/.txt）不影响测试；测试路径下的改动会被剔除，也不参与选择；
       - 非 Python 源文件、全局配置（conftest、setup、pyproject、__init__ 等）→ 全量；
       - Python 源文件：测试文件名的词里含有源文件名 → 相关；否则同目录 / 镜像目录下的测试 → 相关；
+      - 学到的相关性（relation_learned：定位出的“源文件 → 测试文件”）一律加入；
       - 任何一个源文件找不到相关测试 → 全量。
     """
     tests = sorted(set(test_files))
+    learned: dict[str, set[str]] = {}
+    for src, tf in relations:
+        learned.setdefault(src, set()).add(tf)
     chosen: set[str] = set()
     for path in changed:
         if is_test_path(path) or path.endswith(_DOC_EXT):
             continue
         base = posixpath.basename(path)
+        extra = learned.get(path, set()) & set(tests)
         if base in _GLOBAL_FILES or not path.endswith(".py"):
             return None, f"{path} may affect any test"
         stem = _stem(path)
@@ -143,6 +149,7 @@ def related_units(changed: Iterable[str], test_files: Iterable[str]) -> tuple[Op
             d = posixpath.dirname(path)
             name = posixpath.basename(d)
             hits = [t for t in tests if d and (t.startswith(d + "/") or f"/{name}/" in f"/{t}")]
+        hits = sorted(set(hits) | extra)
         if not hits:
             return None, f"no test file is related to {path}"
         chosen.update(hits)
@@ -203,11 +210,84 @@ def tree_regressions(g: Graph, tree: str) -> tuple[str, ...]:
     return regressions(guard_set(g.baseline), results_for_tree(g, tree))
 
 
-def head_full_ok(g: Graph) -> bool:
-    """链头这棵树有全量结果且没有回归；没有任何可用检查时视为通过（账本里会注明未验证）。"""
-    cp = g.head_cp
+def checkpoint_full_ok(g: Graph, cid: Optional[int]) -> bool:
+    """这个存档的树有全量结果且没有回归；没有任何可用检查时视为通过（账本里会注明未验证）。"""
+    cp = g.checkpoints.get(cid) if cid is not None else None
     if cp is None:
         return False
     if cp.id == 0 or not guard_set(g.baseline):
         return True
     return full_verified(g, cp.tree) and not tree_regressions(g, cp.tree)
+
+
+def reasons_for_tree(g: Graph, tree: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for job in _jobs_on(g, tree, False):
+        if job.state == JOB_FINISHED:
+            out.update(job.reasons)
+    return out
+
+
+# ---------------------------------------------------------------- 定位：某一点上某个测试的状态
+
+PT_PASS, PT_FAIL, PT_UNKNOWN, PT_RUNNING, PT_UNTESTED = "pass", "fail", "unknown", "running", "untested"
+
+
+def jobs_by_tree(g: Graph) -> dict[str, list[Job]]:
+    """树 → 在它上面跑过的非 live 作业（按作业序号）。一次查询里要看很多点时先建这个索引。"""
+    out: dict[str, list[Job]] = {}
+    for j in sorted(g.jobs.values(), key=lambda j: _num(j.id)):
+        if not j.live:
+            out.setdefault(j.tree, []).append(j)
+    return out
+
+
+def point_status(g: Graph, tree: str, test: str, index: Optional[dict[str, list[Job]]] = None) -> str:
+    """一棵树上某个测试的状态（只看非 live 的作业）：
+    pass / fail（覆盖了它的作业跑出了结果；漏跑算失败）/ unknown（覆盖它的作业都没跑出任何结果）/
+    running / untested。"""
+    unit = check_unit(test)
+    had_empty = running = False
+    merged: dict[str, str] = {}
+    covered = False
+    for j in (index.get(tree, []) if index is not None else _jobs_on(g, tree, False)):
+        if not covers(j.selection, [unit]):
+            continue
+        if j.state == JOB_RUNNING:
+            running = True
+        elif j.state == JOB_FINISHED:
+            if j.results:
+                covered = True
+                merged.update(j.results)
+            else:
+                had_empty = True
+    if covered:
+        return PT_PASS if merged.get(test) == PASSED else PT_FAIL
+    if running:
+        return PT_RUNNING
+    return PT_UNKNOWN if had_empty else PT_UNTESTED
+
+
+# ---------------------------------------------------------------- 验证队列的四档优先级
+
+def job_priority(g: Graph, job: Job) -> int:
+    """1 收尾与交付 / 基线；2 worker 在等的（手动存档、review 与证据、步骤锚点、交接、定位、按门自查）；
+    3 后台提升；4 后台自动存档。"""
+    if job.purpose == "baseline" or (g.run is not None and g.run.finalizing):
+        return 1
+    a = g.attempts.get(job.attempt) if job.attempt else None
+    if a is not None:
+        if a.trigger in ("deadline", "final"):
+            return 1
+        if a.lane == LANE_FG or a.kind in ("step", "handoff"):
+            return 2
+        return 4
+    if job.purpose in ("promote",):
+        return 3
+    if job.purpose == "verify":             # 尝试已经结束（被取代）但作业还在
+        return 4
+    return 2
+
+
+def is_live(job: Job) -> bool:
+    return job.live or job.where == WHERE_LIVE

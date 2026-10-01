@@ -13,8 +13,9 @@ from belay.core.model import Graph
 
 @dataclass(frozen=True)
 class Effect:
-    kind: str                         # launch_job | advance_ref | mirror_checkpoint | restore_workspace |
-    args: dict = field(default_factory=dict)   # deliver | replan | stop_workers
+    kind: str                         # launch_job | advance_ref | mirror_checkpoint | restore_workspace | deliver |
+    args: dict = field(default_factory=dict)   # replan | stop_workers | cancel_orphans | locate_diff | diagnose |
+    #                                            review | label_checkpoint
 
 
 def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
@@ -26,6 +27,7 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
             out.append(Effect("advance_ref", {"attempt": e.get("attempt")}))
         elif e.type == "checkpoint_created" and int(e.get("checkpoint")) > 0:
             out.append(Effect("mirror_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
+            out.append(Effect("label_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
         elif e.type == "rollback":
             out.append(Effect("restore_workspace", {"worker": e.get("worker"), "checkpoint": int(e.get("to")),
                                                     "reset_ref": bool(e.get("abandoned"))}))
@@ -35,4 +37,12 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
             out.append(Effect("replan", {"task": e.get("task"), "worker": e.get("worker")}))
         elif e.type == "deadline_reserve":
             out.append(Effect("stop_workers", {"reason": "deadline"}))
+        elif e.type == "attempt_superseded":
+            out.append(Effect("cancel_orphans", {"attempt": e.get("attempt")}))
+        elif e.type == "locate_concluded":
+            out.append(Effect("locate_diff", {"locate": e.get("locate"), "groups": len(e.get("groups") or ())}))
+        elif e.type == "diagnosis_requested":
+            out.append(Effect("diagnose", {"diagnosis": e.get("diagnosis")}))
+        elif e.type == "review_started":
+            out.append(Effect("review", {"task": e.get("task"), "phase": e.get("phase")}))
     return out

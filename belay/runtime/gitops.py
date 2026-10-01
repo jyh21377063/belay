@@ -8,7 +8,10 @@ GIT_DIR 在工作区之外，work tree 指向工作区；仓库自己的 .git �
   strip_tests 把测试路径下的改动恢复为基线版本 → 候选树
   commit      确定的提交（日期取事件时间，所以重做得到同一个提交）
   cas         update-ref <新> <旧>：比较并交换推进存档链
-  checkout    把工作区精确切换为某棵树（回退、交付）
+  checkout    把工作区精确切换为某棵树（回退、交付、重建）
+  snapshot_commit  把一张快照（原样树 + 候选树）包成一个确定的提交，ref 为 refs/belay/snap/<n>（防 gc、便于导出）
+  bundle      增量 git bundle：宿主机上的镜像由它恢复（G3）
+  revert_files     只撤销“好 → 坏”之间、限定文件的改动（逐文件三方合并；有冲突就什么都不改）
 """
 from __future__ import annotations
 
@@ -20,6 +23,8 @@ from belay.core.verify import is_test_path
 from belay.env import Env
 
 REF = "refs/heads/belay"
+SNAP_REF = "refs/belay/snap/"
+CP_REF = "refs/belay/cp/"
 EXCLUDES = ["__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".hypothesis/",
             "*.belay-tmp", ".belay_checks/"]
 LARGE_FILE_MB = 20
@@ -163,3 +168,91 @@ class ShadowRepo:
         res = await self.env.run(f"{self._git()} show {tree}:{shlex.quote(path)} | head -c {max_chars}",
                                  timeout=60, cwd="/")
         return res.output if res.return_code == 0 else ""
+
+    # ---- 快照提交与引用（模块 B / G3）
+    async def snapshot_commit(self, n: int, raw_tree: str, cand_tree: str, parent: str | None, date: float) -> str:
+        """一张快照 = 一个提交：它的树是 {raw: 原样树, cand: 候选树}；父提交是上一张快照，所以一条链就能增量导出。"""
+        entries = f"040000 tree {raw_tree}\traw\n040000 tree {cand_tree}\tcand\n"
+        data = base64.b64encode(entries.encode()).decode()
+        tree = await self._run(f"printf %s {shlex.quote(data)} | base64 -d | {self._git()} mktree")
+        commit = await self.commit(tree.splitlines()[-1].strip(), parent, f"belay: snapshot {n}", date)
+        await self._run(f"{self._git()} update-ref {SNAP_REF}{int(n)} {commit}")
+        return commit
+
+    async def set_cp_ref(self, k: int, commit: str) -> None:
+        await self._run(f"{self._git()} update-ref {CP_REF}{int(k)} {commit}")
+
+    async def has_objects(self, shas: list[str]) -> dict[str, bool]:
+        if not shas:
+            return {}
+        script = "; ".join(f"{self._git()} cat-file -e {s} 2>/dev/null && echo {s}=1 || echo {s}=0" for s in shas)
+        out = (await self.env.run(script, timeout=300, cwd="/")).output
+        got = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        return {s: got.get(s) == "1" for s in shas}
+
+    async def bundle_create(self, path: str, tips: list[str], exclude: list[str]) -> bool:
+        """增量 bundle：包含 tips 可达、exclude 不可达的对象。没有新东西时返回 False。"""
+        revs = " ".join(shlex.quote(t) for t in tips) + " " + " ".join(f"^{e}" for e in exclude if e)
+        res = await self.env.run(f"{self._git()} bundle create {shlex.quote(path)} {revs}", timeout=1800, cwd="/")
+        if res.return_code != 0:
+            if "empty bundle" in res.output.lower() or "refusing to create empty bundle" in res.output.lower():
+                return False
+            raise GitError(f"bundle create failed: {res.output[-800:]}")
+        return True
+
+    async def bundle_unbundle(self, path: str) -> None:
+        await self._run(f"{self._git()} bundle unbundle {shlex.quote(path)} > /dev/null", timeout=1800)
+
+    async def update_ref(self, ref: str, commit: str) -> None:
+        await self._run(f"{self._git()} update-ref {ref} {commit}")
+
+    # ---- 只撤销这一段（D4）
+    async def revert_files(self, good_tree: str, bad_tree: str, paths: list[str]) -> tuple[bool, str]:
+        """对每个文件做三方合并：ours = 工作区，base = 坏端，theirs = 好端，即在当前状态上反向应用“好 → 坏”的改动。
+        全部干净合并才写回；任何冲突就什么都不改。返回（成功，说明）。"""
+        ws = self.workspace.rstrip("/")
+        tmp = f"/tmp/belay-revert-{abs(hash((good_tree, bad_tree))) % 10 ** 8}"
+        plan: list[tuple[str, str]] = []            # (路径, 动作 write|delete)
+        await self._run(f"rm -rf {tmp} && mkdir -p {tmp}")
+        try:
+            for i, path in enumerate(paths):
+                q = shlex.quote(path)
+                full = shlex.quote(f"{ws}/{path}")
+                probe = await self.env.run(
+                    f"{self._git()} cat-file -e {good_tree}:{q} 2>/dev/null && echo G; "
+                    f"{self._git()} cat-file -e {bad_tree}:{q} 2>/dev/null && echo B; test -f {full} && echo W",
+                    timeout=60, cwd="/")
+                has_g, has_b, has_w = ("G" in probe.output.split(), "B" in probe.output.split(),
+                                       "W" in probe.output.split())
+                if has_b and has_g:
+                    if not has_w:
+                        return False, f"{path} was deleted in your working tree"
+                    res = await self.env.run(
+                        f"{self._git()} show {bad_tree}:{q} > {tmp}/{i}.base && "
+                        f"{self._git()} show {good_tree}:{q} > {tmp}/{i}.theirs && cp {full} {tmp}/{i}.ours && "
+                        f"git merge-file -q {tmp}/{i}.ours {tmp}/{i}.base {tmp}/{i}.theirs", timeout=120, cwd="/")
+                    if res.return_code != 0:
+                        return False, f"{path} conflicts with later changes"
+                    plan.append((path, "write"))
+                elif has_b and not has_g:          # 这一段里新增的文件：内容没再变过才删除
+                    same = await self.env.run(f"{self._git()} show {bad_tree}:{q} | cmp -s - {full}", timeout=60,
+                                              cwd="/")
+                    if has_w and same.return_code != 0:
+                        return False, f"{path} was added in that change and has been modified since"
+                    if has_w:
+                        plan.append((path, "delete"))
+                elif has_g and not has_b:          # 这一段里删除的文件：工作区里没有才恢复
+                    if has_w:
+                        return False, f"{path} was deleted in that change and exists again now"
+                    await self._run(f"{self._git()} show {good_tree}:{q} > {tmp}/{i}.ours")
+                    plan.append((path, "write"))
+            for i, path in enumerate(paths):
+                act = dict(plan).get(path)
+                full = shlex.quote(f"{ws}/{path}")
+                if act == "write":
+                    await self._run(f"mkdir -p \"$(dirname {full})\" && cat {tmp}/{i}.ours > {full}")
+                elif act == "delete":
+                    await self._run(f"rm -f {full}")
+            return True, f"reverted {len(plan)} file(s)"
+        finally:
+            await self.env.run(f"rm -rf {tmp}", timeout=60, cwd="/")
