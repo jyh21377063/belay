@@ -158,9 +158,9 @@ async def reconcile(run: "BelayRun", rebuild: bool = False) -> dict:
     for d in g.diagnoses.values():
         if d.status == "requested":
             rt.spawn(Effect("diagnose", {"diagnosis": d.id}))
-    for t in g.tasks.values():
-        if t.review == "running":
-            rt.spawn(Effect("review", {"task": t.id, "phase": "blocked" if t.status == "blocked" else "done"}))
+    for v in g.reviews.values():
+        if v.status == "running":
+            rt.spawn(Effect("review", {"review": v.id}))
     for loc in g.locates.values():
         if loc.status == "concluded" and len(loc.results) < len(loc.groups):
             rt.spawn(Effect("locate_diff", {"locate": loc.id, "groups": len(loc.groups)}))

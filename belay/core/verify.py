@@ -326,17 +326,17 @@ def point_status(g: Graph, tree: str, test: str, index: Optional[dict[str, list[
 # ---------------------------------------------------------------- 验证队列的四档优先级
 
 def job_priority(g: Graph, job: Job) -> int:
-    """1 收尾与交付 / 基线；2 worker 在等的（手动存档、review 与证据、步骤锚点、交接、定位、按门自查）；
-    3 后台提升；4 已被取代但还在跑的后台作业（以及旧日志里的自动存档）。"""
+    """1 收尾与交付 / 基线；2 worker 在等的（submit 与证据、定位）；3 后台：最新快照的验证、提升；
+    4 已被取代但还在跑的后台作业。"""
     if job.purpose == "baseline" or (g.run is not None and g.run.finalizing):
         return 1
     a = g.attempts.get(job.attempt) if job.attempt else None
     if a is not None:
         if a.trigger in ("deadline", "final"):
             return 1
-        if a.lane == LANE_FG or a.kind in ("step", "handoff"):
+        if a.lane == LANE_FG:
             return 2
-        return 4
+        return 3 if a.status in ("pending", "advancing") else 4
     if job.purpose in ("promote",):
         return 3
     if job.purpose == "verify":             # 尝试已经结束（被取代）但作业还在

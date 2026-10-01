@@ -2,14 +2,15 @@
 
   模块 A  验证槽位：验证进行中 worker 修改同一文件不丢；导入隔离（破坏探针、sys.path 映射、基线双跑）；抢占
   模块 B  自动快照与后台存档（在 test_belay_run 里也覆盖）
-  模块 D  被拒信息：原因、failure_log、按门的口径复现、定位与只撤销这一段
+  模块 D  被拒信息：原因、failure_log、定位与只撤销这一段
   模块 G  runtime 重启时重新接上仍在运行的作业；删掉影子仓库与工作区后 resume --rebuild
-  模块 H  到软阈值后等 step_done 再交接；恢复后开场带步骤列表与部分改动
+  模块 H  到软阈值后等下一个自然停顿点（勾掉 todo）再交接；恢复后开场带 todo 与部分改动
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -25,8 +26,9 @@ from belay.runtime.driver import BelayRun, RunSettings
 from belay.runtime.runtime import Runtime
 from belay.runtime.store import EventStore
 from belay.runtime.verifier import RunnerVerifier, VerifierSpec
-from tests.integration.test_belay_run import (ADD, ADD_SUB, BLOCK_T2, FIX_ADD, MUL, PLANNER, READ, SPEC, TASK,
-                                              assert_t2_blocked, call, first_message, results, say, tu)
+from tests.integration.test_belay_run import (ADD, ADD_SUB, BLOCK_SUB, FIX_ADD, MUL, PLANNER, READ, SPEC, SUBMIT,
+                                              TASK, assert_sub_blocked, call, first_message, results, say,
+                                              tool_outputs, tu)
 
 MOD = "def add(a, b):\n    return a - b\n\n\ndef mul(a, b):\n    return a * b\n"
 TESTS = ("from pkg.mod import add, mul\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\n"
@@ -157,14 +159,13 @@ def test_degraded_mode_has_no_background_verification(tmp_path):
     reads_outside = TESTS + ("\n\ndef test_data():\n    import os\n    here = os.path.dirname(os.path.abspath(__file__))\n"
                              "    assert os.path.exists(os.path.join(here, '..', '..', 'outside.txt'))\n")
     h = H(tmp_path, repo_kw={"tests": reads_outside})
-    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
-                       call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+    llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(BLOCK_SUB)])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
     g = run.rt.graph
     assert g.degraded
-    assert_t2_blocked(run, res)
-    assert all(a.lane == "fg" for a in g.attempts.values())             # 没有后台存档
+    assert_sub_blocked(run, res)
+    assert all(a.lane == "fg" for a in g.attempts.values())             # 编辑之后没有后台存档（只验证交接快照）
     assert all(j.where in ("workspace", "live") for j in g.jobs.values() if j.purpose != "baseline")
     h.verify_log(run)
 
@@ -178,11 +179,11 @@ def test_worker_edits_during_verification_are_not_lost(tmp_path):
                new_string="def sub(a, b):\n    return a - b\n\n\ndef mul(a, b):")
     todos = tu("t", "todo_write", todos=[{"content": "fix add", "status": "in_progress"},
                                          {"content": "add sub", "status": "pending"}])
-    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ, todos), call(FIX_ADD),
-                       call(tu("sd", "step_done", summary="add fixed")),             # 步骤锚点进后台验证
-                       call(tu("s", "bash", command="sleep 0.5")), call(edit2),       # 后台验证正在跑
-                       call(tu("w", "bash", command="sleep 3")), call(BLOCK_T2),
-                       call(tu("3", "ready_for_review", task="T1")), say("done")])
+    done = tu("t2", "todo_write", todos=[{"content": "fix add", "status": "completed"},
+                                         {"content": "add sub", "status": "in_progress"}])
+    llm = ScriptedLLM([PLANNER, call(READ, todos), call(FIX_ADD), call(done),          # 后台正在验证这张快照
+                       call(tu("s", "bash", command="sleep 0.5")), call(edit2),
+                       call(tu("w", "bash", command="sleep 3")), call(SUBMIT)])
     run = h.make(llm)
     asyncio.run(run.start(TASK))
     text = (h.repo / "pkg/mod.py").read_text()
@@ -192,6 +193,7 @@ def test_worker_edits_during_verification_are_not_lost(tmp_path):
     shown = subprocess.run(["git", f"--git-dir={h.settings.git_dir}", "show", f"{first.tree}:pkg/mod.py"],
                            capture_output=True, text=True).stdout
     assert "return a + b" in shown and "def sub" not in shown             # 结果记在它验证的那棵树上
+    assert first.kind == "todo" and first.label == "fix add" and g.todos["P1"].status == "anchored"
     h.verify_log(run)
 
 
@@ -264,26 +266,22 @@ def test_preemption_lets_the_waiting_checkpoint_go_first(tmp_path):
 
 # ======================================================================== 模块 D：被拒信息补全与规则定位
 
-def test_rejection_reasons_failure_log_gate_check_and_revert_change(tmp_path):
+def test_rejection_reasons_failure_log_and_revert_change(tmp_path):
     h = H(tmp_path, BelayConfig(confirm_regressions=False))
     break_mul = tu("bm", "edit_file", file_path="pkg/mod.py", old_string="return a * b", new_string="return a + b + 0")
-    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(break_mul),
-                       call(tu("c", "checkpoint", summary="try")),
+    llm = ScriptedLLM([PLANNER, call(READ), call(break_mul), call(tu("c", "submit", summary="try")),
                        call(tu("f", "failure_log", test=MUL)),
-                       call(tu("g", "run_check", tests=[MUL], as_gate=True)), call(tu("w", "wait", jobs=["J4"])),
-                       call(tu("r", "revert_change", located="L1#0")), call(READ), call(FIX_ADD),
-                       call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+                       call(tu("r", "revert_change", located="L1#0")), call(READ), call(FIX_ADD), call(BLOCK_SUB)])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
     out = results(llm)
-    rej = out[3]
-    assert "Checkpoint rejected" in rej and "assert" in rej                     # D1：失败原因
+    rej = out[2]
+    assert "did not pass the regression gate" in rej and "assert" in rej        # D1：失败原因
     assert "first failed at" in rej and "revert_change(located=\"L1#0\")" in rej  # D3：定位随拒绝消息返回
-    assert "def test_mul" in out[4] and "assert 5 == 6" in out[4]               # failure_log：traceback 段落
-    assert "as the gate runs it" in out[5] and "REGRESSIONS" in out[6]           # D2：按门的口径复现
-    assert "Reverted the change" in out[7]
-    assert "return a * b" in out[8]                                             # D4：只撤销了那一段
-    assert_t2_blocked(run, res)
+    assert "def test_mul" in out[3] and "assert 5 == 6" in out[3]               # failure_log：traceback 段落
+    assert "Reverted the change" in out[4]
+    assert "return a * b" in out[5]                                             # D4：只撤销了那一段
+    assert_sub_blocked(run, res)
     g = run.rt.graph
     loc = g.locates["L1"]
     assert loc.results and loc.results[0]["exact"] and "pkg/mod.py" in json.dumps(loc.results[0]["files"])
@@ -324,15 +322,13 @@ def _phase1(h: H, cls, script, **attrs):
 def test_runtime_restart_reattaches_a_running_job(tmp_path):
     slow = TESTS.replace("def test_add():", "import time\n\n\ndef test_add():\n    time.sleep(6)")
     h = H(tmp_path, repo_kw={"tests": slow})
-    todos = tu("t", "todo_write", todos=[{"content": "fix add", "status": "in_progress"}])
-    _phase1(h, CrashDuringJob, [PLANNER, call(tu("1", "claim", task="T1"), READ, todos), call(FIX_ADD),
-                                call(tu("sd", "step_done", summary="add fixed")),   # 步骤锚点的验证作业
-                                call(tu("s", "bash", command="sleep 3"))])
+    _phase1(h, CrashDuringJob, [PLANNER, call(READ), call(FIX_ADD),           # 后台验证这张快照的作业
+                                call(tu("s", "bash", command="sleep 3")), call(tu("s2", "bash", command="sleep 3"))])
     assert not (tmp_path / "state/jobs/J3/done").exists()                     # 作业在 runtime 死后仍在跑
-    llm2 = ScriptedLLM([call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+    llm2 = ScriptedLLM([call(BLOCK_SUB)])
     run = h.make(llm2)
     res = asyncio.run(run.resume())
-    assert_t2_blocked(run, res)
+    assert_sub_blocked(run, res)
     events = h.verify_log(run)
     rec = next(e for e in events if e.type == "runtime_recovered")
     assert run.rt.graph.sessions["S1"].resumes == ("replay",)                   # 会话也原样接上
@@ -363,8 +359,8 @@ class CrashAfterMirror(ScriptedLLM):
 def test_rebuild_from_bundles_after_losing_the_container_state(tmp_path):
     h = H(tmp_path, BelayConfig(snapshot_bash_every=1))
     ref: list = []
-    script = [PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
-              call(tu("c", "checkpoint", summary="add fixed")), call(ADD_SUB), call(tu("x", "bash", command="true"))]
+    script = [PLANNER, call(READ), call(FIX_ADD), call(tu("w", "bash", command="sleep 2")), call(ADD_SUB),
+              call(tu("x", "bash", command="true"))]
 
     async def phase1():
         llm = CrashAfterMirror(script, at=7, run_ref=ref)
@@ -384,7 +380,7 @@ def test_rebuild_from_bundles_after_losing_the_container_state(tmp_path):
     subprocess.run(f"rm -rf {tmp_path / 'state'}", shell=True, check=True)
     subprocess.run("git checkout -q -- . && git clean -qfdx", shell=True, cwd=h.repo, check=True)
     assert "return a - b" in (h.repo / "pkg/mod.py").read_text()
-    llm2 = ScriptedLLM([call(READ), call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+    llm2 = ScriptedLLM([call(READ), call(BLOCK_SUB)])
     run = h.make(llm2)
     h.settings.deliver_checkout = False
     res = asyncio.run(run.resume(rebuild=True))
@@ -401,32 +397,33 @@ def test_rebuild_from_bundles_after_losing_the_container_state(tmp_path):
                         == 0 for s in kept)
     text = (h.repo / "pkg/mod.py").read_text()
     assert "return a + b" in text and "def sub(a, b)" in text               # 工作区 = 最新一张已导出快照
-    assert_t2_blocked(run, res)
+    assert_sub_blocked(run, res)
 
 
-# ======================================================================== 模块 H：交接落在步骤边界
+# ======================================================================== 模块 H：交接落在自然停顿点
 
-def test_soft_threshold_hands_off_at_the_next_step_done(tmp_path):
+def test_soft_threshold_hands_off_at_the_next_todo_completion(tmp_path):
     cfg = BelayConfig(l2_tokens=5000, l4_tokens=10 ** 9, l1_trigger_tokens=10 ** 9)
     h = H(tmp_path, cfg)
     todos = tu("t", "todo_write", todos=[{"content": "fix add", "status": "in_progress"},
                                          {"content": "add sub", "status": "pending"}])
-    script = [PLANNER, call(tu("1", "claim", task="T1"), todos), call(READ), call(FIX_ADD),
-              call(tu("sd", "step_done", summary="add fixed")),
+    done = tu("t2", "todo_write", todos=[{"content": "fix add", "status": "completed"},
+                                         {"content": "add sub", "status": "in_progress"}])
+    script = [PLANNER, call(todos), call(READ), call(FIX_ADD), call(done),
               say("Next I add sub."),                                             # 交接摘要
-              call(ADD_SUB), call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")]
-    llm = ScriptedLLM(script, context_tokens=[1000, 1000, 6000, 6000, 6000, 1000, 1000, 1000, 1000, 1000])
+              call(READ), call(ADD_SUB), call(SUBMIT)]
+    llm = ScriptedLLM(script, context_tokens=[1000, 1000, 6000, 6000, 6000, 1000, 1000, 1000, 1000])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
     g = run.rt.graph
     assert g.sessions["S1"].end_reason == "handoff"
     assert not [c for c in g.compactions if c.level in (2, 3)]                  # 软阈值后没有做 L2
-    assert g.steps["T1.1"].status == "anchored" and g.steps["T1.1"].summary == "add fixed"
+    assert g.todos["P1"].status in ("completed", "anchored")
     opening2 = first_message(llm.requests[6])
-    assert "T1.1 fix add — done" in opening2 and "T1.2 add sub  <- current step" in opening2
+    assert "[x] fix add" in opening2 and "[~] add sub  <- in progress" in opening2 and "Next I add sub" in opening2
     tr = [json.loads(x) for x in open(g.sessions["S1"].transcript) if x.strip()]
-    assert any(r["type"] == "handoff" and r.get("at_step_boundary") for r in tr)
-    assert_t2_blocked(run, res)
+    assert any(r["type"] == "handoff" and r.get("at_boundary") for r in tr)
+    assert res.status == "DONE"
     h.verify_log(run)
 
 
@@ -443,15 +440,17 @@ class KillMidStep(ScriptedLLM):
         return await super().call(system, tools, messages, tool_choice)
 
 
-def test_killed_mid_step_resumes_with_steps_and_partial_diff(tmp_path):
-    cfg = BelayConfig(resume_max_downtime_sec=0)                              # 停机太久：不原样接上，开新会话
+def test_killed_mid_work_resumes_with_todos_and_partial_diff(tmp_path):
+    cfg = BelayConfig(resume_max_downtime_sec=0, background="off")         # 停机太久：不原样接上，开新会话
     h = H(tmp_path, cfg)
     todos = tu("t", "todo_write", todos=[{"content": "read code", "status": "in_progress"},
-                                         {"content": "fix add", "status": "pending"},
+                                         {"content": "fix add in pkg/mod.py", "status": "pending"},
+                                         {"content": "add sub", "status": "pending"}])
+    done = tu("t2", "todo_write", todos=[{"content": "read code", "status": "completed"},
+                                         {"content": "fix add in pkg/mod.py", "status": "in_progress"},
                                          {"content": "add sub", "status": "pending"}])
     ref: list = []
-    script = [PLANNER, call(tu("1", "claim", task="T1"), todos), call(READ),
-              call(tu("sd", "step_done", summary="read it")), call(FIX_ADD), say("never reached")]
+    script = [PLANNER, call(todos), call(READ), call(done), call(FIX_ADD), say("never reached")]
 
     async def phase1():
         run = h.make(KillMidStep(script, at=6, ref=ref))
@@ -463,17 +462,17 @@ def test_killed_mid_step_resumes_with_steps_and_partial_diff(tmp_path):
             t.cancel()
         run.store.close()
     asyncio.run(phase1())
-    llm2 = ScriptedLLM([call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+    llm2 = ScriptedLLM([call(BLOCK_SUB)])
     run = h.make(llm2)
     res = asyncio.run(run.resume())
     g = run.rt.graph
     assert g.sessions["S1"].end_reason == "runtime_crash" and g.sessions["S2"].reason == "recover"
     opening = first_message(llm2.requests[0])
-    assert "T1.1 read code — done" in opening and "T1.2 fix add  <- current step" in opening
+    assert "[x] read code" in opening and "[~] fix add in pkg/mod.py  <- in progress" in opening
     assert "+    return a + b" in opening                                    # 部分改动：保留在工作区，交还给模型
     assert "Your last actions before the interruption" in opening
-    assert "Files of the current step (re-read by the harness)" in opening
-    assert_t2_blocked(run, res)
+    assert "Files you were changing (re-read by the harness)" in opening
+    assert_sub_blocked(run, res)
     h.verify_log(run)
 
 
@@ -493,14 +492,16 @@ class RoleLLM:
         if system == PR.REVIEW_SYSTEM:
             self.calls.append("review")
             self.reviews += 1
-            text = json.dumps({"implemented": "no" if self.reviews == 1 else "yes",
-                               "missing": ["sub() is not defined"], "evidence": []})
+            assert "Requirements to review" in body and "def sub" not in body or self.reviews > 1
+            ids = sorted(set(re.findall(r"- (R\d+): ", messages[0]["content"])))
+            text = json.dumps({"requirements": [{"id": i, "implemented": "no" if self.reviews == 1 else "yes",
+                                                 "missing": ["sub() is not defined"], "evidence": []} for i in ids]})
         elif system == PR.DIAGNOSE_SYSTEM:
             self.calls.append("diagnose")
             assert "test_mul" in body and "Located change" in body              # 输入来自图：测试源码、定位出的 diff
             text = json.dumps({"suspects": [{"file": "pkg/mod.py", "hunk": "@@", "confidence": 0.9,
                                              "reason": "mul now adds"}],
-                               "intentional": {"likely": True, "requirement": "R1", "quote": "not in the task"},
+                               "intentional": {"likely": True, "requirement": "R2", "quote": "not in the task"},
                                "suggestion": "restore a * b", "flaky_suspect": False})
         elif system == PR.LABEL_SYSTEM:
             self.calls.append("label")
@@ -515,13 +516,9 @@ def test_diagnoser_and_reviewer_only_explain_or_tighten(tmp_path):
     h = H(tmp_path, BelayConfig(confirm_regressions=False))
     break_mul = tu("bm", "edit_file", file_path="pkg/mod.py", old_string="return a * b", new_string="return a + b + 0")
     fix_mul = tu("fm", "edit_file", file_path="pkg/mod.py", old_string="return a + b + 0", new_string="return a * b")
-    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(break_mul),
-                       call(tu("c", "checkpoint")), call(tu("w", "bash", command="sleep 1")), call(READ),
-                       call(fix_mul), call(FIX_ADD), call(tu("3", "ready_for_review", task="T1")),
-                       call(tu("4", "claim", task="T2")), call(tu("6", "ready_for_review", task="T2")),
-                       call(tu("w2", "bash", command="sleep 1")),
-                       call(tu("7", "claim", task="T2")), call(tu("r2", "read_file", file_path="pkg/mod.py")),
-                       call(ADD_SUB), call(tu("8", "ready_for_review", task="T2")), say("done")])
+    llm = ScriptedLLM([PLANNER, call(READ), call(break_mul), call(tu("c", "submit", summary="try")),
+                       call(tu("w", "bash", command="sleep 1")), call(READ), call(fix_mul), call(FIX_ADD),
+                       call(SUBMIT), call(READ), call(ADD_SUB), call(SUBMIT)])
     aux = RoleLLM()
     run = h.make(llm, aux=aux)
     res = asyncio.run(run.start(TASK))
@@ -530,32 +527,30 @@ def test_diagnoser_and_reviewer_only_explain_or_tighten(tmp_path):
     assert d.status == "recorded" and d.result["intentional"]["likely"] is False   # 引文不在原文里：丢弃这一项
     notices = json.dumps([r["messages"][-1]["content"] for r in llm.requests])
     assert "Diagnosis of tests/test_mod.py::test_mul" in notices and "restore a * b" in notices
-    assert "A reviewer reopened T2: sub() is not defined" in notices
-    t2 = g.tasks["T2"]
-    assert t2.status == "done_unverified" and t2.review_reopens == 1 and aux.reviews == 1   # 第二次声明做完不再复查
+    returned = [o for o in tool_outputs(run, "submit") if "not accepted yet" in o]
+    assert returned and "sub() is not defined" in returned[0]
+    r3 = g.requirements["R3"]
+    assert r3.status == "submitted" and r3.review_reopens == 1 and aux.reviews == 1   # 第二次提交不再复查
     events = h.verify_log(run)
-    llm_events = [e for e in events if e.source == "llm" and e.type not in ("plan_proposed", "task_added",
-                                                                            "task_split", "compacted")]
+    llm_events = [e for e in events if e.source == "llm" and e.type not in ("plan_proposed", "compacted")]
     assert {e.type for e in llm_events} <= {"diagnosis_recorded", "review_recorded", "checkpoint_labeled"}
     assert res.status == "DONE"
 
 
-
 def test_bundles_are_consolidated_and_restore_every_checkpoint(tmp_path):
-    """G3：增量 bundle 够数后合并成一份完整的；只用宿主机上的 bundle 就能还原全部快照与里程碑存档，
-    自动存档的提交可以从快照的树原样重做。"""
+    """G3：增量 bundle 够数后合并成一份完整的；只用宿主机上的 bundle 就能还原全部快照与存档，
+    后台存档的提交可以从快照的树原样重做。"""
     h = H(tmp_path, BelayConfig(mirror_consolidate=2, mirror_every=1, snapshot_bash_every=1))
     edit = lambda i, a, b: tu(f"e{i}", "edit_file", file_path="pkg/mod.py", old_string=a, new_string=b)  # noqa: E731
-    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
-                       call(tu("c1", "checkpoint", summary="one")),
+    wait = lambda i: call(tu(f"w{i}", "bash", command="sleep 1.5"))        # noqa: E731
+    llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), wait(1),
                        call(edit(2, "def mul(a, b):", "def sub(a, b):\n    return a - b\n\n\ndef mul(a, b):")),
-                       call(tu("c2", "checkpoint", summary="two")),
+                       wait(2),
                        call(edit(3, "def mul(a, b):", "def neg(a):\n    return -a\n\n\ndef mul(a, b):")),
-                       call(tu("c3", "checkpoint", summary="three")),
-                       call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+                       wait(3), call(SUBMIT)])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert_t2_blocked(run, res)
+    assert res.status == "DONE"
     meta = EventStore(h.settings.run_dir).get_meta("mirror")
     files = sorted(p.name for p in (tmp_path / "run" / "git").glob("*.bundle"))
     assert any(f.endswith("-full.bundle") for f in files) and files == sorted(meta["bundles"])
@@ -567,7 +562,7 @@ def test_bundles_are_consolidated_and_restore_every_checkpoint(tmp_path):
     from belay.runtime.gitops import ShadowRepo
     base_commit, _tree = asyncio.run(ShadowRepo(LocalEnv(str(orig)), str(fresh), str(orig)).init())
     g = run.rt.graph
-    assert base_commit == g.checkpoints[0].commit
+    assert base_commit == g.checkpoints[0].commit and len(g.checkpoints) >= 3
     for name in meta["bundles"]:
         subprocess.run(["git", f"--git-dir={fresh}", "bundle", "unbundle", str(tmp_path / "run" / "git" / name)],
                        check=True, capture_output=True)
@@ -592,8 +587,7 @@ def test_prepare_then_run_starts_the_budget_clock_late(tmp_path):
         run.store.close()
 
     async def run_phase():
-        llm = ScriptedLLM([call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
-                           call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+        llm = ScriptedLLM([call(READ), call(FIX_ADD), call(BLOCK_SUB)])
         run = BelayRun(llm, LocalEnv(str(h.repo)), h.settings, h.cfg, h.spec, aux_llm=ScriptedLLM([]),
                        log=h.logs.append)
         assert run.prepared(TASK) and not run.prepared(TASK + " more")
@@ -606,4 +600,4 @@ def test_prepare_then_run_starts_the_budget_clock_late(tmp_path):
     clock_ev = next(e for e in events if e.type == "clock_started")
     assert started.get("deadline_t") == 1600.0 and clock_ev.get("deadline_t") > 1600.0 + 10 ** 6
     assert types.index("clock_started") < types.index("session_started")
-    assert_t2_blocked(run, res)
+    assert_sub_blocked(run, res)

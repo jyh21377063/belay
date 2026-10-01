@@ -115,7 +115,7 @@ agents:
       # policy: {git_write: audit, network: audit, disk_search: audit, harness_paths: deny}   # 默认值
     pricing: *claude_code_pricing
 
-  belay: &belay               # Belay 组：自研 worker + 任务状态图 runtime（v6：长程单 worker 的可靠性底座）
+  belay: &belay               # Belay 组：自研 worker + 任务状态图 runtime（v7：worker 只做自然的事，状态由图从观察推出）
     <<: *flat
     import_path: "eval.agents.belay_agent:BelayAgent"
     gate: true                          # runner 读取任务目录下的 gate.json 作为测试配置；没有时不带测试验证运行
@@ -127,12 +127,13 @@ agents:
       finalize_margin_sec: 150          # 预算里留给收尾的余量（runtime 截止后还会等最后的验证最多 60 秒）
       runtime: &belay_runtime           # belay/core/config.py 的 BelayConfig；未知字段会报错；每个机制都可以关掉
         verify_slots: 1                 # 验证槽位数（并发验证作业数）；8 vCPU / 并发 2 题时建议 1
+        background: latest              # 后台空闲时验证最新的可测快照（handoff = v6 的只验交接快照；off = 只在提交时验证）
         diagnoser: true
-        reviewer: true
+        reviewer: true                  # 提交时复查没有证据检查的需求（只能重开，不能判定完成）
         # 压缩阈值默认按 Claude Code 的量级（L1 50 万 / L2 70 万 / 硬交接 76 万 token），与 flat 的 clear / reset 对齐
 
   # 消融：同一套 runtime 关掉某个机制
-  belay-no-locate:            # 前台存档被拒时不做快照二分定位（只给失败的测试与原因）
+  belay-no-locate:            # 提交被拒时不做快照二分定位（只给失败的测试与原因）
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, locate: false}}
 
@@ -140,9 +141,13 @@ agents:
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, graph_context: false}}
 
-  belay-no-llm-help:          # 没有诊断者与复查者（只有规则定位）
+  belay-no-llm-help:          # 没有诊断者与复查者（只有规则定位；提交的需求按自述接受）
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, diagnoser: false, reviewer: false, labeler: false}}
+
+  belay-handoff-only:         # 后台只验证交接快照（v6 的做法）：看持续存档带来多少收益
+    <<: *belay
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, background: handoff}}
 
 # ---------------------------------------------------------------------
 # Profiles

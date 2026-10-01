@@ -1,27 +1,28 @@
 """BelayConfig：runtime 的全部阈值与机制开关（纯数据，core 与 runtime 共用）。
 
 每个机制都能关，用消融实验看哪些在承重：
-  suggest=False          不给调度建议
   graph_context=False    开场与 L2 不用 build_context，改用模型写的完整摘要（“Belay − 图上下文”）
   confirm_regressions    回归先重跑一次确认，重跑通过的记为 flaky
   protect_tests          候选剔除测试路径下的改动
   stall=False            不做停滞检测
   locate=False           前台存档被拒时不做快照二分定位
   diagnoser=False        不做 LLM 诊断，worker 只拿到规则定位的结果
-  reviewer=False         不做收紧式复查
+  reviewer=False         不做收紧式复查（提交的需求直接按自述接受）
+  background=handoff     后台只验证交接快照（v6）；off 不做后台验证
 压缩阈值按 Claude Code 的量级设定（只在真正接近上下文上限时才压缩），跑起来再调。
 
-三层：存（每次实际改动都拍快照，不验证、不打扰 worker）→ 验（只在语义节点验证：步骤完成、交接、手动存档、review、
-收尾；没有基于时间的后台存档）→ 查（只有 worker 声明完成的前台存档被拒时，才在快照上二分定位并告诉 worker）。
+三层：存（每次实际改动都拍快照，不打扰 worker）→ 验（后台空闲时验证最新的可测快照，新快照胜出；submit 与收尾在前台
+验证；没有基于时间的存档）→ 查（只有 worker 的提交被拒、或提交的存档被降级时，才在快照上二分定位并告诉 worker）。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, replace
 
-# 开场上下文各段的上限（token，初始值）。受保护段（task / requirements / focus / pending）不会被去掉，只按上限截短；
+# 开场上下文各段的上限（token，初始值）。受保护段（task / requirements / pending / todos / summary / workspace）
+# 不会被去掉，只按上限截短；
 # 受保护段的上限之和应当小于 opening_budget_tokens。
-DEFAULT_CAPS = {"focus": 6000, "pending": 2000, "away": 2000, "workspace": 2000, "progress": 3000,
-                "next": 500, "gate": 1000}
+DEFAULT_CAPS = {"pending": 2000, "progress": 3000, "todos": 1500, "summary": 3000, "workspace": 5000,
+                "away": 2000, "gate": 1000}
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,9 @@ class BelayConfig:
     confirm_regressions: bool = True
     protect_tests: bool = True
     deliver_unconfirmed: bool = False       # 除基线外没有确认点时：False 交付基线，True 交付最新暂存点
+    # ---- 后台验证：latest = 空闲时验证最新的可测快照（v7）；handoff = 只验证交接 / 会话结束的快照（v6 的做法，
+    #      用于消融）；off = 不做后台验证（只有 submit 与收尾在前台验证）
+    background: str = "latest"
     # ---- 快照（模块 B）：edit_file / write_file 之后都拍；只有 bash 时每这么多次拍一次（树没变就不记）
     snapshot_bash_every: int = 5
     precheck_python: bool = True            # 快照前对改动的 .py 文件做语法检查（不写 .pyc）
@@ -49,7 +53,13 @@ class BelayConfig:
     diagnose_input_tokens: int = 30_000
     # ---- 复查（模块 F）
     reviewer: bool = True
-    review_max_reopens: int = 1
+    review_max_reopens: int = 1             # 每条需求最多被复查者重开这么多次，之后只记进账本
+    review_batch: int = 5                   # 一次复查调用看几条需求
+    review_input_chars: int = 60_000        # 一次复查的输入上限（相关改动按需求筛过）
+    # ---- 提交（唯一的完成声明）
+    submit_wait_sec: float = 1800           # submit 最多等这么久（存档验证 + 复查），超时就先把当前状态返回
+    nudge_on_stop: bool = True              # 模型停下不调用工具：先追问一次，再次停下就当作提交
+    max_implicit_submits: int = 3           # 一个会话里最多这么多次隐式提交，之后会话结束
     # ---- 回归门豁免：worker 引用任务原文声明某个现有测试与要求冲突，且它确实在候选上失败过 → 从门里去掉
     waivers: bool = True
     waive_max_tests: int = 20
@@ -70,14 +80,13 @@ class BelayConfig:
     resume_max_failures: int = 2            # 同一会话连续恢复失败这么多次 → 开新会话
     mirror_every: int = 10                  # 每这么多张快照导出一次 git bundle
     mirror_consolidate: int = 32            # 增量 bundle 累积到这么多份时合并成一份完整的
-    # ---- 步骤与交接时机（模块 H）
-    handoff_soft_tokens: int = 0            # 0 = 等于 l2_tokens
-    step_done_hint: bool = False            # 软阈值后是否提示“当前步骤完成后请调用 step_done”
-    labeler: bool = True                    # 没有步骤时给里程碑存档生成一行标签（LLM）
+    # ---- todo 与交接时机（模块 H）
+    handoff_soft_tokens: int = 0            # 0 = 等于 l2_tokens；有进行中的 todo 时等下一个自然停顿点再交接
+    todo_reminder_turns: int = 30           # 这么多轮没更新 todo 就提醒一次（第一次改文件时还没有 todo 也提醒一次）
+    todo_reminder_max: int = 3              # 一个会话里最多提醒这么多次
+    labeler: bool = True                    # 没有标签的里程碑存档生成一行标签（LLM）
     label_every: int = 5
-    # ---- 调度建议与上下文（模块 I）
-    suggest: bool = True
-    suggest_top: int = 5
+    # ---- 上下文（模块 I）
     graph_context: bool = True
     opening_budget_tokens: int = 24_000
     opening_caps: dict = field(default_factory=lambda: dict(DEFAULT_CAPS))
@@ -129,6 +138,8 @@ class BelayConfig:
         cfg = cls(**d)
         if cfg.checkpoint_tier not in ("related", "full"):
             raise ValueError("checkpoint_tier 只能是 related / full")
+        if cfg.background not in ("latest", "handoff", "off"):
+            raise ValueError("background 只能是 latest / handoff / off")
         if cfg.l3_mode not in ("overflow", "always", "off"):
             raise ValueError("l3_mode 只能是 overflow / always / off")
         if cfg.snapshot_bash_every < 1:

@@ -23,7 +23,7 @@ async def bash(inp: dict, ctx: ToolContext) -> str:
         ctx.check_read_only(command)
 
     if inp.get("run_in_background"):
-        # M1 的简单版本：后台启动，输出写到日志文件。M2 起改由 run_check / wait 负责长时间操作。
+        # 简单版本：后台启动，输出写到日志文件。
         job = uuid.uuid4().hex[:8]
         log = f"{BG_DIR}/{job}.log"
         res = await ctx.env.run(f"mkdir -p {BG_DIR} && (setsid nohup bash -c {shlex.quote(command)} "

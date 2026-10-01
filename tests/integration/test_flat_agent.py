@@ -78,8 +78,7 @@ def test_flat_agent_end_to_end(setup):
 
 
 TASK = "Fix add() in calc.py so that it returns the sum of its arguments."
-PLAN = {"requirements": [{"id": "R1", "quote": TASK, "summary": "fix add"}],
-        "tasks": [{"id": "T1", "title": "Fix add", "links": ["R1"]}]}
+PLAN = {"requirements": [{"id": "R1", "kind": "actionable", "quote": TASK, "summary": "fix add"}]}
 PLANNER = [{"type": "text", "text": json.dumps(PLAN)}]
 QUIET = {"reviewer": False, "labeler": False, "diagnoser": False}       # 这些后台 LLM 调用会打乱脚本的顺序
 
@@ -88,11 +87,10 @@ def tu(i, name, **inp):
     return {"type": "tool_use", "id": i, "name": name, "input": inp}
 
 
-WORKER = [[tu("1", "claim", task="T1"), tu("2", "read_file", file_path="calc.py")],
+WORKER = [[tu("2", "read_file", file_path="calc.py")],
           [tu("3", "edit_file", file_path="calc.py", old_string="a - b", new_string="a + b")],
           [tu("4", "bash", command="git stash list")],
-          [tu("5", "ready_for_review", task="T1")],
-          [{"type": "text", "text": "done"}]]
+          [tu("5", "submit", summary="fixed add")]]
 
 
 def belay_agent(agent_dir, **kw):
@@ -117,7 +115,7 @@ def test_belay_agent_without_gate_runs_strict_and_delivers(setup):
     assert denied["is_error"] and "Git write" in denied["content"]          # Belay 组：越界直接拒绝
     meta = context.metadata
     assert meta["belay_status"] == "DONE" and meta["delivered_level"] == "confirmed", meta
-    assert meta["prepared_in_setup"] is False and context.n_agent_steps == 5
+    assert meta["prepared_in_setup"] is False and context.n_agent_steps == 4
     patch = (agent_dir / "patch.diff").read_text()
     assert "+    return a + b" in patch
     for name in ("ledger.json", "events.jsonl", "setup.json", "deliverable.diff"):
@@ -153,12 +151,22 @@ def test_belay_agent_prepares_in_setup_and_verifies_with_the_gate(setup):
     assert "+    return a + b" in patch and "tests/" not in patch
 
 
+def _with_tests(repo: Path) -> dict:
+    (repo / "tests").mkdir()
+    (repo / "tests/test_calc.py").write_text("from calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+                                             "\n\ndef test_zero():\n    assert add(0, 0) == 0\n")
+    subprocess.run("git add -A && git -c user.email=a@b -c user.name=t commit -qm tests", shell=True, cwd=repo,
+                   check=True)
+    return {"workdir": str(repo), "test_cmd": "python -m pytest -rA -p no:cacheprovider tests", "timeout_sec": 120}
+
+
 def test_belay_agent_cancelled_by_the_harness_delivers_the_confirmed_checkpoint(setup):
     repo, agent_dir = setup
+    gate = _with_tests(repo)
     env = FakePierEnvironment(repo, agent_dir)
-    agent = belay_agent(agent_dir)
-    script = [PLANNER, WORKER[0], WORKER[1], [tu("c", "checkpoint", summary="fixed")],
-              [tu("e2", "edit_file", file_path="calc.py", old_string="a + b", new_string="a * b")],
+    agent = belay_agent(agent_dir, gate_spec=json.dumps(gate), task_instruction=TASK)
+    script = [PLANNER, WORKER[0], WORKER[1], [tu("w", "bash", command="sleep 4")],      # 后台验证并提升这一版
+              [tu("e2", "edit_file", file_path="calc.py", old_string="a + b", new_string="a + b + 1")],   # 回归：不进链
               [tu("s", "bash", command="sleep 30")]]
     llm = ScriptedLLM([list(s) for s in script])
     agent._make_llm = lambda: llm
@@ -167,11 +175,11 @@ def test_belay_agent_cancelled_by_the_harness_delivers_the_confirmed_checkpoint(
     async def go():
         await agent.setup(env)
         task = asyncio.create_task(agent.run(TASK, env, context))
-        for _ in range(200):                               # 等到 worker 开始跑那个长命令
+        for _ in range(300):                               # 等到 worker 开始跑那个长命令
             await asyncio.sleep(0.1)
             if len(llm.requests) >= 6:
                 break
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(3.0)
         task.cancel()                                      # 评测框架超时
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -179,4 +187,4 @@ def test_belay_agent_cancelled_by_the_harness_delivers_the_confirmed_checkpoint(
     assert context.metadata["worker_status"] == "cancelled"
     assert context.metadata["belay_emergency_checkpoint"] is not None
     patch = (agent_dir / "patch.diff").read_text()
-    assert "+    return a + b" in patch and "a * b" not in patch          # 交付的是确认过的存档，不是半成品
+    assert "+    return a + b\n" in patch and "a + b + 1" not in patch  # 交付的是确认过的存档，不是半成品

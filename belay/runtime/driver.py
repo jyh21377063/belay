@@ -2,12 +2,12 @@
 
   start(task)   准备：run_started → 影子仓库与 0 号存档 → 基线（工作区一次 + 验证槽位一次，比对导入隔离）与规划并行
                 → 冻结需求
-  _main()       循环问 next_step(图)：开会话 / 接上会话 / 复查 / 等 / 收尾。会话结束不等于运行结束。
+  _main()       循环问 next_step(图)：开会话 / 接上会话 / 等 / 收尾。会话结束不等于运行结束；提交被接受才收尾。
   _finalize()   停 worker → 取消后台尝试 → 对当前 WIP 做一次全量存档尝试 → 交付最新的确认点
   resume()      runtime 崩溃后：快照 + 重放 → 对账（recovery.py）→ 回到循环；rebuild=True 时先从 git bundle 重建容器状态
   suspend()     外层调度挂起：强制快照 → 导出 bundle → 结束会话
 
-副作用（作业、git CAS、镜像、还原工作区、交付、重新规划、停 worker、取消孤儿作业、定位 diff、诊断、复查、标签）
+副作用（作业、git CAS、镜像、还原工作区、交付、停 worker、取消孤儿作业、定位 diff、诊断、复查、标签）
 都由已经写入日志的事件触发。worker 与后台只通过事件日志交汇，后台从不碰 worker 的工作区（隔离无效时降级）。
 """
 from __future__ import annotations
@@ -26,11 +26,10 @@ from belay.core.config import BelayConfig
 from belay.core.context import build_context, resume_reminder
 from belay.core.effects import Effect
 from belay.core.model import (ATT_ADVANCING, ATT_PENDING, JOB_RUNNING, LANE_BG, LANE_FG, MILESTONE_KINDS,
-                              STEP_ANCHORED, STEP_DECLARED, WHERE_SLOT, WHERE_WORKSPACE)
+                              WHERE_SLOT, WHERE_WORKSPACE)
 from belay.core.plan import renumber, validate_plan
-from belay.core.queries import (active_step, declared_steps, delivery_checkpoint, focus_task,
-                                last_ended_session, latest_snapshot, next_id, open_attempt, resume_point, steps_of,
-                                task_files)
+from belay.core.queries import (current_todo, delivery_checkpoint, last_ended_session, latest_handoff_summary,
+                                latest_snapshot, next_id, open_attempt, resume_point)
 from belay.core.render import ledger, ledger_markdown
 from belay.core.rules import Rejected, SnapObs
 from belay.core.verify import (guard_set, is_test_path, job_priority, reasons_for_tree, suite_layout, test_files_of,
@@ -40,6 +39,7 @@ from belay.llm import Usage
 from belay.runtime import planner as P
 from belay.runtime.gitops import CP_REF, SNAP_REF, ShadowRepo
 from belay.runtime.port import WorkerPort
+from belay.runtime.review import review_input
 from belay.runtime.prompts import (DIAGNOSE_SYSTEM, LABEL_SYSTEM, REVIEW_BLOCKED_SYSTEM,
                                    REVIEW_SYSTEM, system_prompt)
 from belay.runtime.runtime import Runtime
@@ -107,9 +107,10 @@ class _Hooks:
         await self.run.rt.submit(R.record_compaction, self.run.w, level, before, after, summary)
 
     async def before_tool(self, tu: dict) -> None:
-        """模型自己跑测试或构建前拍一张（只存，不验证：调试中的中间态测不过是常态）。"""
+        """模型自己跑测试或构建前拍一张：这时代码通常是连贯的（后台空闲时会验证它；它也是交接的自然停顿点）。"""
         if tu.get("name") == "bash" and TEST_CMD.search(str((tu.get("input") or {}).get("command") or "")):
             await self.run.take_snapshot("model_test")
+            self.run.boundaries += 1
 
     async def after_tools(self, tool_uses: list[dict], results: list, todos) -> None:
         """存：编辑类工具之后一定拍；bash 不一定写文件，累计 snapshot_bash_every 次再拍。树没变时不记新快照。"""
@@ -119,18 +120,32 @@ class _Hooks:
         run.tool_seq += len(tool_uses)
         run.bash_since += sum(1 for n in ok if n == "bash")
         if todos is not None:
-            await run.update_steps(todos)
+            await run.update_todos(todos)
+        if any(tu.get("name") == "submit" for tu in tool_uses):
+            run.boundaries += 1                          # 拿到了提交结果
         if edits or run.bash_since >= run.cfg.snapshot_bash_every:
             await run.take_snapshot("writes")
 
     def write_guard(self):
         return self.run.write_guard()
 
-    def step_count(self) -> int:
-        return declared_steps(self.run.rt.graph, self.run.w)
+    def boundary_count(self) -> int:
+        return self.run.boundaries
 
-    def has_active_step(self) -> bool:
-        return active_step(self.run.rt.graph, self.run.w) is not None
+    def has_active_todo(self) -> bool:
+        return current_todo(self.run.rt.graph) is not None
+
+    def has_todos(self) -> bool:
+        return bool(self.run.rt.graph.todos)
+
+    async def implicit_submit(self, summary: str) -> tuple[str, bool]:
+        """模型停下不调用工具：当作一次提交（结果交还给它）。"""
+        try:
+            text, accepted = await self.port.submit(summary=summary, blocked=[], implicit=True)
+        except Rejected as e:
+            return str(e), False
+        self.run.boundaries += 1
+        return text, accepted
 
 
 class _WriteGuard:
@@ -182,6 +197,7 @@ class BelayRun:
         self.tools_running = 0
         self.tool_seq = 0
         self.bash_since = 0
+        self.boundaries = 0                        # 自然停顿点计数（软阈值后在这里交接）
         self.session_task: Optional[asyncio.Task] = None
         self.session: Optional[BelaySession] = None
         self.usage = Usage()                       # 全部会话累计的用量（评测框架的 context 用）
@@ -317,13 +333,12 @@ class BelayRun:
                             warnings=r.warnings)
         known = sorted(R.known_checks(rt.graph))
         final = outcome.rounds[-1].proposal
-        rep = validate_plan(task, final, known)
+        rep = validate_plan(task, final, known)          # 基线之后再校验一次检查项（规划与基线并行）
         if rep.ok:
-            reqs, tasks = renumber(rep)
-            source = outcome.source
+            reqs = renumber(rep)
         else:                                            # 只可能是原文异常；用规划器返回的结果
-            reqs, tasks, source = outcome.requirements, outcome.tasks, outcome.source
-        await rt.submit(R.freeze_plan, reqs, tasks, source=source)
+            reqs = outcome.requirements
+        await rt.submit(R.freeze_plan, reqs, source=outcome.source)
 
     async def _wait_jobs(self, *jids: str) -> None:
         await self.rt.wait_until(lambda g: all(g.jobs[j].state != JOB_RUNNING for j in jids if j))
@@ -399,9 +414,6 @@ class BelayRun:
                 if action == "wait":
                     await self.rt.changed(timeout=self.s.tick_sec)
                     continue
-                if action == "review":
-                    await self.rt.submit(R.request_final_reviews)
-                    continue
                 if action == "finalize":
                     if reason == "no_progress":
                         await self.rt.submit(R.stall_stop, self.w)
@@ -451,9 +463,8 @@ class BelayRun:
 
     # ================================================================ 快照（模块 B）
     async def take_snapshot(self, reason: str) -> Optional[int]:
-        """在工具边界拍快照（何时拍由调用方决定，见 after_tools；没有时间限流）。快照用于恢复、回退与事后二分；
-        只有原因是语义节点（步骤完成、交接、会话结束）的快照才进后台验证。树与上一张相同时不记新快照，
-        返回那一张的序号。"""
+        """在工具边界拍快照（何时拍由调用方决定，见 after_tools；没有时间限流）。快照用于恢复、事后二分，
+        后台空闲时验证最新的一张。树与上一张相同时不记新快照，返回那一张的序号。"""
         async with self._snap_lock:
             g = self.rt.graph
             if g.head_cp is None or not g.baseline_ready:
@@ -508,36 +519,17 @@ class BelayRun:
                 return False, res.output.strip()[-1000:]
         return True, ""
 
-    async def step_files(self, n: Optional[int]) -> list:
-        """相邻锚点之间的改动（观察）：上一个完成步骤的锚点（或认领时的链头）→ 这张快照。"""
+    async def update_todos(self, todos: list[dict]) -> None:
+        """todo_write 的列表镜像到图上；新勾掉的条目先强制拍一张锚点快照（它是交接的自然停顿点）。"""
         g = self.rt.graph
-        t = focus_task(g, self.w)
-        if n is None or n not in g.snapshots or t is None:
-            return []
-        prev = [s for s in steps_of(g, t.id) if s.status in (STEP_DECLARED, STEP_ANCHORED) and s.anchor_snapshot]
-        if prev:
-            last = max(prev, key=lambda s: s.anchor_snapshot)
-            a = g.snapshots[last.anchor_snapshot].tree if last.anchor_snapshot in g.snapshots else g.head_cp.tree
+        if R.newly_completed(g, todos):
+            n = await self.take_snapshot("todo")
+            await self.rt.submit(R.update_todos, self.w, todos, n)
+            self.boundaries += 1
         else:
-            base = t.claimed_head if t.claimed_head in g.checkpoints else 0
-            a = g.checkpoints[base].tree
-        b = g.snapshots[n].tree
-        return await self.repo.numstat(a, b) if a != b else []
+            await self.rt.submit(R.update_todos, self.w, todos)
 
-    async def update_steps(self, todos: list[dict]) -> None:
-        g = self.rt.graph
-        if R.newly_completed(g, self.w, todos):
-            n = await self.take_snapshot("step_done")
-            files = await self.step_files(n)
-            await self.rt.submit(R.plan_steps, self.w, todos, n, files)
-        else:
-            await self.rt.submit(R.plan_steps, self.w, todos)
 
-    async def observe_raw(self, worker: str) -> tuple[str, list[str]]:
-        raw = await self.repo.snapshot(worker)
-        head = self.rt.graph.head_cp.tree
-        changed = [p for p, _a, _d in await self.repo.numstat(head, raw)] if raw != head else []
-        return raw, changed
 
     # ================================================================ 会话
     async def context(self, mode: str, away=(), recent_calls=(), extra: Optional[dict] = None):
@@ -546,7 +538,7 @@ class BelayRun:
                              blobs, mode=mode, away=away, recent_calls=recent_calls)
 
     async def _context_blobs(self, mode: str) -> dict[str, str]:
-        """当前步骤的部分改动 diff（恢复点：基底存档 → 最新快照的原样树）。"""
+        """链头以来的改动 diff（恢复点：链头 → 最新快照的原样树）。"""
         g = self.rt.graph
         out: dict[str, str] = {}
         rp = resume_point(g, self.w)
@@ -608,7 +600,7 @@ class BelayRun:
         ctx = await self.context(mode="first" if reason == "first" else "resume", away=away, recent_calls=calls,
                                  extra=extra)
         pre: list[str] = []
-        if reason != "first":                                          # 预读当前步骤涉及的文件
+        if reason != "first":                                          # 预读链头以来改过的文件、当前 todo 提到的文件
             g = rt.graph
             snap = latest_snapshot(g, self.w)
             rp = resume_point(g, self.w)
@@ -616,9 +608,9 @@ class BelayRun:
                 base = g.checkpoints[rp["base"]].tree
                 if base != snap.raw_tree:
                     pre = [p for p, _a, _d in await self.repo.numstat(base, snap.raw_tree)][:3]
-            step = g.steps.get(rp.get("step") or "")
-            if step is not None:                                        # 步骤描述中提到且存在的路径
-                for tok in re.findall(r"[\w./-]+\.\w+|[\w.-]+/[\w./-]+", f"{step.title} {step.summary}"):
+            todo = g.todos.get(rp.get("todo") or "")
+            if todo is not None:                                        # 当前 todo 中提到且存在的路径
+                for tok in re.findall(r"[\w./-]+\.\w+|[\w.-]+/[\w./-]+", todo.title):
                     if tok not in pre and len(pre) < self.cfg.l2_reread_files and \
                             (await self.env.run(f"test -f {shlex.quote(tok)}", timeout=10)).return_code == 0:
                         pre.append(tok)
@@ -673,7 +665,7 @@ class BelayRun:
                 reread = await session.preread(pre)
                 if reread:
                     session.messages[0]["content"] += \
-                        f"\n## Files of the current step (re-read by the harness)\n{reread}\n"
+                        f"\n## Files you were changing (re-read by the harness)\n{reread}\n"
             await rt.submit(R.start_session, self.w, reason, summary, tpath)
         self.session = session
         self.stop_event.clear()
@@ -721,7 +713,7 @@ class BelayRun:
         self.usage.add(session.usage)
         self.turns += session.turns
         self.peak_context = max(self.peak_context, session.peak_context)
-        await rt.submit(R.end_session, self.w, end, session.peak_context, session.turns, error, session.ctx.todos)
+        await rt.submit(R.end_session, self.w, end, session.peak_context, session.turns, error)
         if end != "deadline" and not rt.graph.run.reserve and not rt.graph.run.finalizing:
             await self.take_snapshot("handoff" if end == "handoff" else "session_end")
             if rt.graph.degraded:                                      # 切换工作区的验证结束前不能开新会话
@@ -955,12 +947,10 @@ class BelayRun:
         await self.mirror("milestone")
 
     async def _eff_label_checkpoint(self, checkpoint: int) -> None:
-        """没有步骤时的兜底：里程碑存档（以及每 label_every 个其他存档）生成一行“这段做了什么”（llm）。"""
+        """没有标签时的兜底：里程碑存档（以及每 label_every 个其他存档）生成一行“这段做了什么”（llm）。"""
         g = self.rt.graph
         cp = g.checkpoints.get(checkpoint)
         if cp is None or cp.label or not self.cfg.labeler or self.aux_llm is None:
-            return
-        if any(steps_of(g, t) for t in cp.tasks):
             return
         if cp.kind not in MILESTONE_KINDS and checkpoint % max(1, self.cfg.label_every):
             return
@@ -1005,23 +995,6 @@ class BelayRun:
         finally:
             self.delivered.set()
 
-    async def _eff_replan(self, task: str, worker: Optional[str]) -> None:
-        g = self.rt.graph
-        t = g.tasks.get(task)
-        if t is None or self.planner_llm is None:
-            return
-        reqs = {r: g.requirements[r].quote for r in t.links}
-        w = g.wips.get(worker or self.w)
-        failures = list(t.last_failure) + (list((w.last_rejection or {}).get("regressions") or []) if w else [])
-        try:
-            children = await P.propose_split(self.planner_llm, g.run.task,
-                                             {"id": t.id, "title": t.title, "description": t.description,
-                                              "links": list(t.links)}, reqs, failures)
-            await self.rt.submit(R.split_task, task, children)
-        except Rejected as e:
-            await self.rt.submit(R.propose_plan, 1, {"task": task}, False, [str(e)], purpose="split")
-        except Exception as e:
-            self.log(f"replan failed: {type(e).__name__}: {e}")
 
     async def _eff_stop_workers(self, reason: str) -> None:
         self.stop_event.set()
@@ -1107,17 +1080,11 @@ class BelayRun:
             diff = self.store.read_blob(rec["diff"], 20000) if rec.get("diff") else ""
             parts.append(f"## Located change ({rec['good'].get('id')} -> {rec['bad'].get('id')})\n```diff\n{diff}\n```")
             att = rec.get("attribution") or {}
-            for tid in att.get("held") or []:
-                t = g.tasks.get(tid)
-                if t is None:
-                    continue
-                parts.append(f"## Task being worked on then: {t.id} {t.title}\n{t.description[:1000]}")
-                for rid in t.links:
+            todo = g.todos.get(att.get("todo") or "")
+            if todo is not None:
+                parts.append(f"## What the agent was working on then (its todo item): {todo.title}")
+                for rid in todo.requirements:
                     parts.append(f"- {rid}: \"{g.requirements[rid].quote[:800]}\"")
-                for s in steps_of(g, tid):
-                    parts.append(f"- step {s.id} [{s.status}] {s.title} {s.summary}")
-                for n in [n for n in g.notes if n.task == tid][-8:]:
-                    parts.append(f"- note (self-reported): {n.text[:500]}")
             sess = att.get("session")
             for c in [c for c in g.compactions if c.session == sess and c.summary][-1:]:
                 parts.append(f"## Summary written in that session (model-written)\n{c.summary[:3000]}")
@@ -1132,32 +1099,36 @@ class BelayRun:
         text = "\n\n".join(parts)
         return text[:int(budget)]
 
-    async def _eff_review(self, task: str, phase: str) -> None:
+    async def _eff_review(self, review: str) -> None:
+        """复查一批需求（llm 只能收紧）：输入是需求原文 + 按需求筛过的相关改动 + 全部改动文件的列表。"""
         g = self.rt.graph
-        t = g.tasks.get(task)
-        if t is None:
+        v = g.reviews.get(review)
+        if v is None:
             return
+        results: dict = {}
         try:
             if self.aux_llm is None:
                 raise RuntimeError("no model for the reviewer")
-            quotes = "\n".join(f"- {r}: \"{g.requirements[r].quote}\"" for r in t.links)
-            if phase == "blocked":
-                body = (f"<task_statement>\n{g.run.task.strip()[:8000]}\n</task_statement>\n\nTask {t.id}: {t.title}\n"
-                        f"{t.description}\nLinked requirements:\n{quotes}\nThe agent's reason: {t.blocked_reason}")
+            reqs = [g.requirements[r] for r in v.requirements]
+            if v.phase == "blocked":
+                body = (f"<task_statement>\n{g.run.task.strip()[:8000]}\n</task_statement>\n\n" + "\n".join(
+                    f"- {r.id}: \"{r.quote}\"\n  the agent's reason: {r.blocked_reason}" for r in reqs))
                 resp = await self.aux_llm.call(REVIEW_BLOCKED_SYSTEM, [], [{"role": "user", "content": body}])
             else:
-                files = task_files(g, task)
-                cp = g.checkpoints.get(t.done_checkpoint)
-                base = g.checkpoints.get(t.claimed_head if t.claimed_head in g.checkpoints else 0)
-                diff = await self.repo.diff(base.tree, cp.tree, max_bytes=40000) if cp and base else ""
-                steps = "\n".join(f"- {s.id} {s.title}: {s.summary}" for s in steps_of(g, task))
-                notes = "\n".join(n.text[:400] for n in g.notes if n.task == task)[-3000:]
-                body = (f"Task {t.id}: {t.title}\n{t.description}\nRequirements:\n{quotes}\nSteps:\n{steps}\n"
-                        f"The agent's notes:\n{notes}\nFiles: {', '.join(f[0] for f in files[:40])}\n"
-                        f"```diff\n{diff}\n```")
+                cp = g.checkpoints.get(v.checkpoint) if v.checkpoint is not None else g.head_cp
+                base = g.checkpoints[0]
+                diff = await self.repo.diff(base.tree, cp.tree) if cp is not None and cp.tree != base.tree else ""
+                files = await self.repo.numstat(base.tree, cp.tree) if diff else []
+                sub = g.submits.get(v.submit or "")
+                body = review_input(reqs, diff, files, summary=sub.summary if sub else "",
+                                    todos=[t.title for t in g.todos.values()],
+                                    notes=latest_handoff_summary(g, self.w) or "",
+                                    budget=self.cfg.review_input_chars)
                 resp = await self.aux_llm.call(REVIEW_SYSTEM, [], [{"role": "user", "content": body}])
-            result = P.extract_json(resp.text) or {"implemented": "failed"}
+            data = P.extract_json(resp.text) or {}
+            for item in data.get("requirements") or []:
+                if isinstance(item, dict) and str(item.get("id") or "") in v.requirements:
+                    results[str(item["id"])] = item
         except Exception as e:
-            self.log(f"review of {task} failed: {type(e).__name__}: {e}")
-            result = {"implemented": "failed"}
-        await self.rt.submit(R.record_review, task, phase, result)
+            self.log(f"review {review} failed: {type(e).__name__}: {e}")
+        await self.rt.submit(R.record_review, review, results)

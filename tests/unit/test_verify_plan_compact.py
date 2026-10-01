@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 
 from belay.core.compact import CLEARED_PREFIX, count_results, l0_shrink, l1_clear, l2_rebuild, safe_cut
-from belay.core.plan import mechanical_plan, renumber, uncovered_units, validate_plan, validate_split
+from belay.core.plan import mechanical_plan, renumber, uncovered_units, validate_plan
 from belay.core.verify import (classify_baseline, failure_signature, guard_set, is_test_path, regressions,
                                related_units, suite_layout_of)
 from belay.runtime.planner import extract_json
@@ -42,6 +42,7 @@ def test_related_units():
 
 TASK = """# Release notes
 
+The code is at /testbed and is version 1.0.
 - Fix add so that add(1, 2) returns 3.
 - Add a sub function that returns a minus b.
 
@@ -51,12 +52,14 @@ Deprecate the old mul_legacy helper and emit a warning."""
 
 
 def _plan(**over):
-    p = {"requirements": [{"id": "A", "quote": "Fix add so that add(1, 2) returns 3.", "summary": "add"},
-                          {"id": "B", "quote": "Add a sub function that returns a minus b.", "summary": "sub"},
+    p = {"requirements": [{"id": "Z", "kind": "context", "quote": "The code is at /testbed and is version 1.0.",
+                           "summary": "where the code is"},
+                          {"id": "A", "quote": "Fix add so that add(1, 2) returns 3.", "summary": "add",
+                           "checks": ["tests/t.py::test_add", "nope"]},
+                          {"id": "B", "kind": "actionable", "quote": "Add a sub function that returns a minus b.",
+                           "summary": "sub"},
                           {"id": "C", "quote": "Deprecate the old mul_legacy helper and emit a warning.",
-                           "summary": "deprecate"}],
-         "tasks": [{"id": "x", "title": "add", "links": ["A"], "checks": ["tests/t.py::test_add", "nope"]},
-                   {"id": "y", "title": "sub+dep", "links": ["B", "C"], "blocked_by": ["x"]}]}
+                           "summary": "deprecate"}]}
     p.update(over)
     return p
 
@@ -82,45 +85,39 @@ def test_validate_plan_ok_and_renumber():
     rep = validate_plan(TASK, _plan(), known_checks=["tests/t.py::test_add"])
     assert rep.ok, rep.problems
     assert any("nope" in w for w in rep.warnings)
-    reqs, tasks = renumber(rep)
-    assert [r["id"] for r in reqs] == ["R1", "R2", "R3"]
-    assert tasks[0]["id"] == "T1" and tasks[0]["checks"] == ["tests/t.py::test_add"]
-    assert tasks[1]["blocked_by"] == ["T1"] and tasks[1]["links"] == ["R2", "R3"]
+    reqs = renumber(rep)
+    assert [r["id"] for r in reqs] == ["R1", "R2", "R3", "R4"]
+    assert [r["kind"] for r in reqs] == ["context", "actionable", "actionable", "actionable"]
+    assert reqs[1]["checks"] == ["tests/t.py::test_add"] and reqs[0]["checks"] == []
 
 
-def test_validate_plan_rejects_non_verbatim_uncovered_unlinked_cycles():
+def test_validate_plan_rejects_non_verbatim_uncovered_bad_kind_and_all_context():
     p = _plan()
-    p["requirements"][0]["quote"] = "Fix add so it returns the sum."             # 不是原文
+    p["requirements"][1]["quote"] = "Fix add so it returns the sum."             # 不是原文
     rep = validate_plan(TASK, p)
     assert not rep.ok and any("not verbatim" in x for x in rep.problems)
     assert any("not covered" in x and "Fix add" in x for x in rep.problems)
     p = _plan()
-    p["tasks"][1]["links"] = ["B"]                                                # C 没有任务链接
-    assert any("C is not linked" in x for x in validate_plan(TASK, p).problems)
+    p["requirements"][2]["kind"] = "background"
+    assert any("kind must be" in x for x in validate_plan(TASK, p).problems)
     p = _plan()
-    p["tasks"][0]["blocked_by"] = ["y"]
-    assert any("cycle" in x for x in validate_plan(TASK, p).problems)
-    # 空白差异不影响“逐字”
-    p = _plan()
-    p["requirements"][1]["quote"] = "Add a sub   function that\nreturns a minus b."
+    for r in p["requirements"]:
+        r["kind"] = "context"
+    assert any("no requirement is actionable" in x for x in validate_plan(TASK, p).problems)
+    # 空白差异不影响“逐字”；旧格式里的 tasks 被忽略
+    p = _plan(tasks=[{"id": "x"}])
+    p["requirements"][2]["quote"] = "Add a sub   function that\nreturns a minus b."
     assert validate_plan(TASK, p).ok
 
 
 def test_uncovered_units_skip_headings_and_mechanical_plan_covers():
-    assert uncovered_units(TASK, []) == ["- Fix add so that add(1, 2) returns 3.",
+    assert uncovered_units(TASK, []) == ["The code is at /testbed and is version 1.0.",
+                                        "- Fix add so that add(1, 2) returns 3.",
                                         "- Add a sub function that returns a minus b.",
                                         "Deprecate the old mul_legacy helper and emit a warning."]
     mp = mechanical_plan(TASK)
-    assert validate_plan(TASK, mp).ok and len(mp["requirements"]) == 3
-
-
-def test_validate_split():
-    kids, problems = validate_split(["R1", "R2"], [{"title": "a", "links": ["R1"]}, {"title": "b", "links": ["R9"]}],
-                                    ["R1", "R2"])
-    assert problems and "R2" in problems[0]
-    kids, problems = validate_split(["R1", "R2"], [{"title": "a", "links": ["R1"]}, {"title": "b", "links": ["R2"]}],
-                                    ["R1", "R2"])
-    assert not problems and len(kids) == 2
+    rep = validate_plan(TASK, mp)
+    assert rep.ok and len(mp["requirements"]) == 4 and all(r["kind"] == "actionable" for r in rep.requirements)
 
 
 def test_extract_json():

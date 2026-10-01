@@ -14,8 +14,8 @@ from belay.core.model import Graph
 @dataclass(frozen=True)
 class Effect:
     kind: str                         # launch_job | advance_ref | mirror_checkpoint | restore_workspace | deliver |
-    args: dict = field(default_factory=dict)   # replan | stop_workers | cancel_orphans | locate_diff | diagnose |
-    #                                            review | label_checkpoint
+    args: dict = field(default_factory=dict)   # stop_workers | cancel_orphans | locate_diff | diagnose | review |
+    #                                            label_checkpoint
 
 
 def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
@@ -35,8 +35,6 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
                                                     "reset_ref": bool(e.get("abandoned"))}))
         elif e.type == "delivered":
             out.append(Effect("deliver", {"checkpoint": e.get("checkpoint"), "status": e.get("status")}))
-        elif e.type == "stall_detected" and e.get("action") == "replan" and e.get("task"):
-            out.append(Effect("replan", {"task": e.get("task"), "worker": e.get("worker")}))
         elif e.type == "deadline_reserve":
             out.append(Effect("stop_workers", {"reason": "deadline"}))
         elif e.type == "attempt_superseded":
@@ -46,5 +44,5 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
         elif e.type == "diagnosis_requested":
             out.append(Effect("diagnose", {"diagnosis": e.get("diagnosis")}))
         elif e.type == "review_started":
-            out.append(Effect("review", {"task": e.get("task"), "phase": e.get("phase")}))
+            out.append(Effect("review", {"review": e.get("review")}))
     return out

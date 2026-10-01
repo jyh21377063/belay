@@ -1,6 +1,6 @@
 """工具输出的截断：保留开头、结尾和中间的报错行。
 
-所有工具共用（bash、M2 起的 run_check / wait）。思路参考 mini_claude（MIT），测试日志改为保留报错块。
+所有工具共用（bash 等）。思路参考 mini_claude（MIT），测试日志改为保留报错块。
 """
 from __future__ import annotations
 

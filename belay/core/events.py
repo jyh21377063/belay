@@ -3,8 +3,8 @@
 每条事件 = seq（连续递增，也是图的版本号）、t（墙钟秒）、type、actor、source、payload。
 这里定义事件类型、每种事件必需的 payload 字段和允许的来源；reduce.py 负责把事件应用到视图上。
 
-来源纪律：存档、完成、提升只能由 observed 与 rule 驱动；llm 的事件只能引起重开与新增
-（诊断、复查、标签只记录，不改变任何完成或存档类状态）。
+来源纪律：存档、验证通过、提升只能由 observed 与 rule 驱动；worker 的自述（提交时记下的 submitted / blocked）
+只是自述，账本如实区分；llm 的事件只能引起重开与新增（诊断、复查、标签只记录，不改变任何完成或存档类状态）。
 """
 from __future__ import annotations
 
@@ -49,29 +49,26 @@ EVENT_SPECS: dict[str, Spec] = {
     "deadline_reserve": Spec(("reserve_sec",), (RULE,)),
     "finalize_started": Spec(("reason",), (RULE,)),
     "delivered": Spec(("checkpoint", "status"), (RULE,)),
-    # ---- 任务
+    # ---- 需求
     "plan_proposed": Spec(("round", "valid", "problems"), (LLM, RULE)),
     "requirement_frozen": Spec(("requirements",), (RULE,)),
-    "task_added": Spec(("task", "title"), (LLM, SELF_REPORT, RULE)),
-    "task_split": Spec(("task", "children"), (LLM, SELF_REPORT)),
-    "task_claimed": Spec(("task", "worker", "head"), (RULE,)),
-    "task_released": Spec(("task", "worker"), (RULE,)),
-    "review_requested": Spec(("task", "worker"), (RULE,)),
-    "task_done": Spec(("task", "checkpoint", "verified"), (RULE,)),
-    "task_blocked": Spec(("task", "kind", "reason"), (SELF_REPORT,)),
-    "task_reopened": Spec(("task", "reason"), (RULE,)),
-    # ---- 步骤（模块 H）
-    "steps_planned": Spec(("worker", "task", "steps"), (SELF_REPORT,)),
-    "step_started": Spec(("worker", "step"), (SELF_REPORT,)),
-    "step_done": Spec(("worker", "step", "snapshot"), (SELF_REPORT,)),
-    "step_anchored": Spec(("step", "checkpoint"), (RULE,)),
-    "step_invalidated": Spec(("step", "reason"), (RULE,)),
+    "requirement_verified": Spec(("requirement", "checkpoint", "evidence"), (RULE,)),
+    "requirement_submitted": Spec(("requirement", "checkpoint", "submit"), (SELF_REPORT,)),
+    "requirement_blocked": Spec(("requirement", "kind", "reason", "submit"), (SELF_REPORT,)),
+    "requirement_reopened": Spec(("requirement", "reason"), (RULE,)),
+    # ---- todo（运行级步骤）
+    "todos_updated": Spec(("worker", "todos"), (SELF_REPORT,)),
+    "todo_completed": Spec(("worker", "todo", "snapshot"), (SELF_REPORT,)),
+    "todo_anchored": Spec(("todo", "checkpoint"), (RULE,)),
+    "todo_invalidated": Spec(("todo", "reason"), (RULE,)),
+    # ---- 提交（唯一的完成声明）
+    "submit_requested": Spec(("submit", "worker", "snapshot"), (RULE,)),
+    "submit_updated": Spec(("submit", "status"), (RULE,)),
     # ---- 执行
     "session_started": Spec(("session", "worker", "reason", "opening"), (RULE,)),
     "session_resumed": Spec(("session", "mode"), (OBSERVED,)),
     "session_ended": Spec(("session", "worker", "reason"), (OBSERVED,)),
     "compacted": Spec(("session", "level", "before", "after"), (RULE, LLM)),
-    "note": Spec(("worker", "kind", "text"), (SELF_REPORT,)),
     "snapshot_taken": Spec(("snapshot", "worker", "tree", "raw_tree", "reason", "testable"), (OBSERVED,)),
     "stall_detected": Spec(("kind", "action"), (RULE,)),
     # ---- 验证
@@ -79,8 +76,8 @@ EVENT_SPECS: dict[str, Spec] = {
     "job_preempted": Spec(("job",), (OBSERVED,)),
     "job_finished": Spec(("job", "state", "results"), (OBSERVED,)),
     "baseline_recorded": Spec(("classes", "available"), (OBSERVED,)),
-    "checkpoint_attempted": Spec(("attempt", "worker", "trigger", "tree", "base", "tier", "selection", "tasks",
-                                  "snapshot", "lane"), (RULE,)),
+    "checkpoint_attempted": Spec(("attempt", "worker", "trigger", "tree", "base", "tier", "selection", "snapshot",
+                                  "lane"), (RULE,)),
     "attempt_superseded": Spec(("attempt", "reason"), (RULE,)),
     "checkpoint_advancing": Spec(("attempt", "parent_commit", "date"), (RULE,)),
     "checkpoint_created": Spec(("checkpoint", "commit", "tree"), (OBSERVED,)),
@@ -97,10 +94,10 @@ EVENT_SPECS: dict[str, Spec] = {
     "relation_learned": Spec(("pairs",), (RULE,)),
     "diagnosis_requested": Spec(("diagnosis", "trigger", "tests"), (RULE,)),
     "diagnosis_recorded": Spec(("diagnosis",), (LLM,)),
-    "review_started": Spec(("task", "phase"), (RULE,)),
-    "review_recorded": Spec(("task", "phase", "implemented"), (LLM,)),
+    "review_started": Spec(("review", "phase", "requirements"), (RULE,)),
+    "review_recorded": Spec(("review", "results"), (LLM,)),
     "checkpoint_labeled": Spec(("checkpoint", "label"), (LLM,)),
-    "check_waived": Spec(("task", "tests", "quote", "reason"), (RULE,)),
+    "check_waived": Spec(("tests", "quote", "reason"), (RULE,)),
 }
 EVENT_TYPES = tuple(EVENT_SPECS)
 # llm 来源的事件：只能记录、重开、新增，永远不能引起完成、存档、提升（不变量检查）

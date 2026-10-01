@@ -218,8 +218,13 @@ def render_belay(ev: dict, st: State) -> list[str]:
     elif t == "compact":
         lines.append(f"{when}       ✂️  压缩 L{ev.get('level')}：{ev.get('before', 0):,} → {ev.get('after', 0):,}")
     elif t in ("handoff", "soft_handoff"):
-        what = "交接" if t == "handoff" else "到软阈值，等当前步骤完成再交接"
+        what = "交接" if t == "handoff" else "到软阈值，等下一个自然停顿点再交接"
         lines.append(f"{when}       🔄 {what}（上下文 {ev.get('context', 0):,}）")
+    elif t == "nudge":
+        lines.append(f"{when}       ✋ 模型停下没调工具：追问一次")
+    elif t == "implicit_submit":
+        lines.append(f"{when}       📮 再次停下，当作提交（第 {ev.get('n')} 次）："
+                     + ("被接受" if ev.get("accepted") else "交还清单，会话继续"))
     elif t == "end" and "reason" in ev:                   # Belay 的会话结束：运行本身由 runtime 决定是否继续
         st.done = True
         lines.append(f"── 会话结束：{ev.get('reason')}  轮数={ev.get('turns')}  耗时={round(st.elapsed / 60, 1)}min"

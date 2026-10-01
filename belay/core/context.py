@@ -1,11 +1,12 @@
 """分层开场上下文 build_context：每次开会话（首次、交接、恢复、崩溃后、容器重建）以及 L2 压缩都用它。
 
 原则（模块 I）：
-  - 受保护的段，规模只取决于任务本身：任务原文、需求索引、当前焦点、待处理的问题；它们不会被去掉。
-  - 随运行增长的内容一律折叠，每个折叠都留下查询入口（board / task / history / failure_log）。
+  - 受保护的段，规模只取决于任务本身：任务原文、需求索引、待处理的问题、todo、交接摘要、工作区；它们不会被去掉。
+  - 随运行增长的内容一律折叠，每个折叠都留下查询入口（board / failure_log）。
   - 稳定的在前，易变的在后：前缀是任务原文 + 需求索引（冻结后逐字不变），状态都放在后面，前缀缓存整次运行都能命中。
   - 每段有自己的上限（cfg.opening_caps），不再用一个总预算从下往上裁。
   - 每段标明来源；仍是纯函数：blobs 是调用方读出的附件（diff、离开期间工作区的变化），away 是上个会话之后的事件。
+v7：没有“当前焦点”和“建议顺序”。恢复时给出：需求状态、worker 自己的 todo、它写的交接摘要、链头以来的改动。
 """
 from __future__ import annotations
 
@@ -15,32 +16,33 @@ from typing import Iterable, Mapping, Optional
 
 from belay.core.config import BelayConfig
 from belay.core.events import Event
-from belay.core.model import (ACTIVE, BLOCKED, CONFIRMED, DONE, DONE_UNVERIFIED, OPEN, REVIEW, STEP_ANCHORED,
-                              STEP_DECLARED, Graph)
-from belay.core.queries import (chain, focus_task, held_tasks, id_ranges, latest_handoff_summary, notes_of_task,
-                                num, open_persistent, requirement_status, resume_point, steps_of, task_files)
-from belay.core.render import checkpoint_line, render_diagnosis, render_located
-from belay.core.suggest import suggest
-from belay.core.verify import (B_FAIL, B_FLAKY, active_guard, check_unit, reasons_for_tree, related_units,
-                               regression_ids, results_for_tree, test_files_of)
+from belay.core.model import (CONFIRMED, REQ_BLOCKED, REQ_FINISHED, REQ_OPEN, REQ_SUBMITTED, REQ_VERIFIED,
+                              TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED, Graph)
+from belay.core.queries import (actionable, chain, id_ranges, latest_handoff_summary, num, open_persistent,
+                                todos_in_order)
+from belay.core.render import checkpoint_line, render_diagnosis, render_located, requirement_line
+from belay.core.verify import (B_FAIL, B_FLAKY, active_guard, check_unit, reasons_for_tree, regression_ids,
+                               related_units, test_files_of)
 
 LABEL = {"original": "task statement, verbatim", "rule": "derived by the harness from its task graph",
-         "observed": "observed by the harness (git / test runs)", "self_report": "your own earlier notes, "
-         "self-reported and unverified", "llm": "model-written, may be incomplete",
+         "observed": "observed by the harness (git / test runs)", "self_report": "your own earlier list, "
+         "self-reported", "llm": "model-written, may be incomplete",
          "mixed": "from the task graph; parts marked (self-reported) or (model-written) are not verified"}
 
 INTRO = {
-    "first": "You are starting work on the task below. The harness keeps a task graph for this run: requirements, "
-             "tasks, steps, verified checkpoints and your notes. This opening context was generated from that graph.",
+    "first": "You are starting work on the task below. The harness keeps a record of this run: the requirements "
+             "extracted from the task, verified checkpoints of your work and your todo list. This opening context "
+             "was generated from that record.",
     "resume": "You are continuing work in a new session. Nothing from earlier sessions is in your context except "
-              "what is below, which the harness rebuilt from its task graph. Files you read before are not in "
-              "context: read a file again before editing it. You do not need to re-read the code of steps that are "
-              "already done; focus on the current step.",
+              "what is below, which the harness rebuilt from its record. Files you read before are not in context: "
+              "read a file again before editing it. Your earlier changes are still in the working tree.",
     "compaction": "Your earlier conversation in this session was replaced with the context below, rebuilt by the "
-                  "harness from its task graph, followed by your most recent messages. Files you read earlier are "
-                  "no longer in context unless re-read below: read a file again before editing it.",
+                  "harness from its record, followed by your most recent messages. Files you read earlier are no "
+                  "longer in context unless re-read below: read a file again before editing it.",
 }
-PROTECTED = ("task", "requirements", "focus", "pending")
+PROTECTED = ("task", "requirements", "pending", "todos", "summary", "workspace")
+SUBMIT_LINE = ("When you believe every requirement on the checklist is done, call submit: the harness tests your "
+               "work, checks each requirement and tells you what is still missing.")
 
 
 @dataclass(frozen=True)
@@ -95,103 +97,17 @@ def _fmt_files(files, limit: int = 20) -> str:
 # ---------------------------------------------------------------- 1、2：稳定的前缀
 
 def _requirement_index(g: Graph) -> str:
-    """需求索引：id + 一行摘要，不带状态（状态在“进度总览”里），冻结后逐字不变。"""
+    """需求清单的索引：actionable 需求的 id + 一行摘要，不带状态（状态在后面），冻结后逐字不变。"""
     lines = []
-    for rid in sorted(g.requirements, key=num):
-        r = g.requirements[rid]
+    for r in actionable(g):
         s = " ".join((r.summary or r.quote).split())
-        lines.append(f"- {rid} {s[:80]}")
+        lines.append(f"- {r.id} {s[:100]}")
+    if len(lines) < len(g.requirements):
+        lines.append("(Headings and background lines of the task text are not on the checklist.)")
     return "\n".join(lines) or "(requirements are not frozen yet)"
 
 
-# ---------------------------------------------------------------- 3：当前焦点（恢复点）
-
-def _evidence_line(g: Graph, t) -> str:
-    if not t.checks:
-        return "no checks: when you finish, it becomes done_unverified once your work is in a checkpoint"
-    cp = g.head_cp
-    res = results_for_tree(g, cp.tree) if cp else {}
-    parts = [f"{c}={res.get(c, 'not run on checkpoint ' + str(cp.id if cp else '-'))}" for c in t.checks[:10]]
-    more = f" (+{len(t.checks) - 10} more; task(id=\"{t.id}\"))" if len(t.checks) > 10 else ""
-    return "checks on the latest checkpoint: " + "; ".join(parts) + more
-
-
-def _focus(g: Graph, worker: str, blobs: Mapping[str, str], cfg: BelayConfig, mode: str,
-           recent_calls: Iterable[str]) -> str:
-    t = focus_task(g, worker)
-    held = held_tasks(g, worker)
-    if t is None:
-        return "You hold no task. Pick one with claim (see Next below, or call board)."
-    out = [f"### {t.id} [{t.status}] {t.title}"]
-    if t.description:
-        out.append(_clip(t.description.strip(), 1500, f"task(id=\"{t.id}\")"))
-    for rid in t.links[:5]:
-        r = g.requirements.get(rid)
-        if r:
-            out.append(f"- {rid} (task text): \"{_clip(r.quote, 600)}\"")
-    if len(t.links) > 5:
-        out.append(f"- ... {len(t.links) - 5} more linked requirements: task(id=\"{t.id}\")")
-    out.append(f"- evidence: {_evidence_line(g, t)}")
-    if t.reopen_count and t.reopen_reason:
-        fail = "; ".join(t.last_failure[:8])
-        out.append(f"- reopened ({t.reopen_reason})" + (f": {fail}" if fail else ""))
-    if t.status == REVIEW:
-        out.append("- under review: the harness is checking it")
-    others = [x for x in held if x.id != t.id]
-    for x in others:
-        out.append(f"- you also hold {x.id} [{x.status}] {x.title}")
-    # 步骤：计划做到了哪一步、还剩什么
-    steps = steps_of(g, t.id)
-    rp = resume_point(g, worker)
-    if steps:
-        out.append("Steps (your plan, kept by the harness; update it with todo_write, mark a step finished with "
-                   "step_done):")
-        for s in steps:
-            mark = {"planned": "[ ]", "active": "[~]", "declared": "[x]", "anchored": "[x]"}.get(s.status, "[ ]")
-            line = f"  {mark} {s.id} {s.title}"
-            if s.status in (STEP_DECLARED, STEP_ANCHORED):
-                cpv = "not yet in a checkpoint"
-                if s.status == STEP_ANCHORED and s.checkpoint in g.checkpoints:
-                    c = g.checkpoints[s.checkpoint]
-                    state = ("demoted: it failed the full suite" if c.demoted else
-                             "not yet confirmed by the full suite" if c.level != CONFIRMED else "confirmed")
-                    cpv = f"in checkpoint {s.checkpoint} ({state})"
-                line += f" — done, {cpv}"
-                if s.summary:
-                    line += f": {s.summary[:160]} (self-reported)"
-                if s.files:
-                    line += "; files: " + ", ".join(f"{p} (+{a} -{d})" for p, a, d in s.files[:5])
-            elif s.id == rp.get("step"):
-                line += "  <- current step"
-            out.append(line)
-    elif mode != "first":
-        labels = [c for c in chain(g) if c.label and t.id in c.tasks][:5]
-        if labels:
-            out.append("What earlier checkpoints of this task did (model-written labels):")
-            out.extend(f"  checkpoint {c.id}: {c.label}" for c in reversed(labels))
-    # 部分改动（当前步骤里还没进存档的工作）
-    partial = blobs.get("partial_diff")
-    if partial and mode != "first":
-        base = rp.get("base")
-        out.append(f"Partial changes since checkpoint {base} ({rp.get('base_reason')}), kept in your working tree "
-                   "(undo them yourself if they are wrong; nothing was rolled back):")
-        out.append("```diff\n" + _clip(partial, cfg.context_diff_chars, "history(a=..., b=...)") + "\n```")
-    notes = [n for n in notes_of_task(g, t.id, worker) if n.kind in ("note", "released")][-8:]
-    if notes:
-        out.append("Your notes on this task (self-reported):")
-        out.extend(f"- {_clip(n.text, 600)}" for n in notes)
-    if mode != "first":
-        summ = latest_handoff_summary(g, worker)
-        if summ:
-            out.append("Summary you wrote at the last compaction or handoff (model-written):\n" + _clip(summ, 4000))
-    calls = list(recent_calls)
-    if calls:
-        out.append("Your last actions before the interruption (already done; do not repeat them blindly):")
-        out.extend(f"- {_clip(c, 300)}" for c in calls[-6:])
-    return "\n".join(out)
-
-
-# ---------------------------------------------------------------- 4：待处理的问题
+# ---------------------------------------------------------------- 3：待处理的问题
 
 def open_problem_tests(g: Graph) -> set[str]:
     return {t for t in g.persistent if open_persistent(g, t)}
@@ -218,8 +134,7 @@ def _pending(g: Graph, worker: str) -> str:
                            "(the related tests did not select them).")
     shown = 0
     for loc in sorted(g.locates.values(), key=lambda l: -l.started_seq):
-        if loc.epoch != g.epoch or not loc.results or not (set(loc.tests) & open_tests or loc.trigger in
-                                                            ("rejected", "step")):
+        if loc.epoch != g.epoch or not loc.results or not (set(loc.tests) & open_tests or loc.trigger == "rejected"):
             continue
         txt = render_located(g, loc.id)
         if txt:
@@ -242,17 +157,17 @@ def _pending(g: Graph, worker: str) -> str:
         for r in regs[:8]:
             why = reasons.get(regression_ids([r])[0])
             lines.append(f"{r}" + (f" — {why[:160]}" if why else ""))
-        out.append(f"- Last rejected checkpoint attempt {rej.get('attempt')} ({rej.get('kind', '')}, "
-                   f"{rej.get('reason')}): " + ("; ".join(lines) + extra if lines else rej.get("detail", "")))
+        out.append(f"- Your last submit was rejected (attempt {rej.get('attempt')}, {rej.get('reason')}): "
+                   + ("; ".join(lines) + extra if lines else rej.get("detail", "")))
     return "\n".join(out)
 
 
 # ---------------------------------------------------------------- 5：离开期间
 
 _IMPORTANCE = {"checkpoint_demoted": 0, "persistent_regression": 0, "regression_located": 0,
-               "diagnosis_recorded": 0, "task_reopened": 0, "task_split": 0, "rollback": 0,
-               "review_recorded": 1, "checkpoint_confirmed": 1, "checkpoint_rejected": 1, "step_anchored": 1,
-               "task_done": 1, "checkpoint_created": 2, "job_finished": 3, "runtime_recovered": 1}
+               "diagnosis_recorded": 0, "requirement_reopened": 0, "rollback": 0, "submit_updated": 0,
+               "review_recorded": 1, "checkpoint_confirmed": 1, "checkpoint_rejected": 1, "todo_anchored": 2,
+               "requirement_verified": 1, "checkpoint_created": 2, "job_finished": 3, "runtime_recovered": 1}
 
 
 def _away_line(g: Graph, e: Event) -> Optional[str]:
@@ -266,7 +181,7 @@ def _away_line(g: Graph, e: Event) -> Optional[str]:
         return f"checkpoint {e.get('checkpoint')} failed the full suite: {'; '.join(e.get('regressions')[:3])}"
     if t == "checkpoint_rejected":
         a = g.attempts.get(e.get("attempt"))
-        if a is None or (a.lane != "fg" and a.kind not in ("step", "handoff")) or not e.get("regressions"):
+        if a is None or (a.lane != "fg" and a.kind != "handoff") or not e.get("regressions"):
             return None
         return f"checkpoint attempt {a.id} ({a.kind}) was rejected: {'; '.join(e.get('regressions')[:3])}"
     if t == "persistent_regression":
@@ -275,17 +190,19 @@ def _away_line(g: Graph, e: Event) -> Optional[str]:
         return f"regression located: {', '.join(e.get('tests')[:3])} first failed at {e.get('bad', {}).get('id')}"
     if t == "diagnosis_recorded":
         return f"diagnosis {e.get('diagnosis')} recorded (see open problems)"
-    if t == "task_reopened":
-        return f"{e.get('task')} was reopened ({e.get('reason')})"
-    if t == "task_done":
-        return f"{e.get('task')} is {'done' if e.get('verified') else 'done_unverified'} on checkpoint " \
-               f"{e.get('checkpoint')}"
-    if t == "task_split":
-        return f"{e.get('task')} was split into {', '.join(c['id'] for c in e.get('children'))}"
-    if t == "step_anchored":
-        return f"step {e.get('step')} is in checkpoint {e.get('checkpoint')}"
+    if t == "requirement_reopened":
+        return f"{e.get('requirement')} was reopened ({e.get('reason')})"
+    if t == "requirement_verified":
+        return f"{e.get('requirement')} is verified by its checks on checkpoint {e.get('checkpoint')}"
+    if t == "submit_updated" and e.get("status") in ("accepted", "returned"):
+        return f"submit {e.get('submit')} was {e.get('status')}" + \
+            (f"; still open: {id_ranges(e.get('open'))}" if e.get("open") else "")
+    if t == "todo_anchored":
+        td = g.todos.get(e.get("todo"))
+        return f"todo \"{td.title[:60] if td else e.get('todo')}\" is in checkpoint {e.get('checkpoint')}"
     if t == "review_recorded":
-        return f"reviewer on {e.get('task')}: implemented={e.get('implemented')}"
+        res = e.get("results") or {}
+        return "reviewer: " + ", ".join(f"{k}={v.get('implemented')}" for k, v in sorted(res.items()))
     if t == "rollback":
         return f"the working tree was rolled back to checkpoint {e.get('to')}"
     if t == "job_finished" and e.get("state") == "finished":
@@ -321,9 +238,63 @@ def _away(g: Graph, away: Iterable[Event], blobs: Mapping[str, str], cfg: BelayC
     return "\n".join(out)
 
 
-# ---------------------------------------------------------------- 6–9
+# ---------------------------------------------------------------- 状态、todo、摘要、工作区
 
-def _workspace(g: Graph, worker: str) -> str:
+def _progress(g: Graph, cap_chars: int) -> str:
+    reqs = actionable(g)
+    counts: dict[str, int] = {}
+    for r in reqs:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    out = ["Checklist: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))]
+    ver = [r.id for r in reqs if r.status == REQ_VERIFIED]
+    sub = [r.id for r in reqs if r.status == REQ_SUBMITTED]
+    if ver:
+        out.append(f"Verified by their checks: {id_ranges(ver)}")
+    if sub:
+        out.append(f"Submitted earlier: {id_ranges(sub)}")
+    rest = [r for r in reqs if r.status in (REQ_OPEN, REQ_BLOCKED)]
+    lines = [f"- {requirement_line(g, r.id, 90)}" for r in rest]
+    body = "\n".join(lines)
+    if len(body) > cap_chars:                       # 太多：重开过的、受阻的优先，其余只列编号
+        first = [x for x, r in zip(lines, rest) if r.reopen_count or r.status == REQ_BLOCKED][:20]
+        others = [r.id for r in rest if not (r.reopen_count or r.status == REQ_BLOCKED)]
+        body = "\n".join(first) + (f"\n- not done yet: {id_ranges(others)} (board(status=\"open\"))" if others else "")
+    if rest:
+        out.append("Not done yet:\n" + body)
+    return "\n".join(out)
+
+
+def _todos(g: Graph) -> str:
+    items = todos_in_order(g)
+    if not items:
+        return ""
+    mark = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]", "anchored": "[x]"}
+    out = []
+    for t in items:
+        line = f"{mark.get(t.status, '[ ]')} {t.title}"
+        if t.status == TODO_ANCHORED and t.checkpoint is not None:
+            line += f"  (in checkpoint {t.checkpoint})"
+        elif t.status == TODO_COMPLETED:
+            line += "  (not yet in a checkpoint)"
+        elif t.status == TODO_ACTIVE:
+            line += "  <- in progress"
+        out.append(line)
+    return "\n".join(out)
+
+
+def _summary(g: Graph, worker: str, recent_calls: Iterable[str]) -> str:
+    out = []
+    summ = latest_handoff_summary(g, worker)
+    if summ:
+        out.append("What you wrote at the last compaction or handoff (model-written):\n" + _clip(summ, 8000))
+    calls = list(recent_calls)
+    if calls:
+        out.append("Your last actions before the interruption (already done; do not repeat them blindly):")
+        out.extend(f"- {_clip(c, 300)}" for c in calls[-6:])
+    return "\n".join(out)
+
+
+def _workspace(g: Graph, worker: str, blobs: Mapping[str, str], cfg: BelayConfig, mode: str) -> str:
     cp = g.head_cp
     if cp is None:
         return "(no checkpoint yet)"
@@ -335,61 +306,17 @@ def _workspace(g: Graph, worker: str) -> str:
         lines.append(f"Latest confirmed checkpoint (what would be delivered now): {conf}, {behind} checkpoint(s) "
                      "behind; provisional checkpoints are confirmed by the full suite in the background.")
     w = g.wips.get(worker)
-    if w is None or w.base != cp.id:
-        lines.append("Your working tree has changes that are not in a checkpoint yet (they become one when you "
-                     "finish a step, call checkpoint or ready_for_review).")
-    elif not w.files and not w.dropped:
+    if w is not None and w.dropped:
+        lines.append("Changes under test paths (never delivered; checks run against the original test files): "
+                     + ", ".join(w.dropped[:15]) + (" ..." if len(w.dropped) > 15 else ""))
+    partial = blobs.get("partial_diff")
+    if partial and mode != "first":
+        lines.append(f"Your changes since checkpoint {cp.id}, kept in your working tree (nothing was rolled back; "
+                     "the harness verifies them in the background):")
+        lines.append("```diff\n" + _clip(partial, cfg.context_diff_chars, "the rest is in your working tree")
+                     + "\n```")
+    elif w is not None and w.base == cp.id and not w.files and mode != "first":
         lines.append("Your working tree has no changes relative to it.")
-    else:
-        if w.files:
-            lines.append(f"Changes not in a checkpoint yet ({len(w.files)} file(s); they become one when you finish "
-                         f"a step, call checkpoint or ready_for_review):\n{_fmt_files(w.files, 20)}")
-        if w.dropped:
-            lines.append("Changes under test paths (never delivered; checks run against the original test files): "
-                         + ", ".join(w.dropped[:15]) + (" ..." if len(w.dropped) > 15 else ""))
-    return "\n".join(lines)
-
-
-def _progress(g: Graph, worker: str, cap_chars: int) -> str:
-    counts: dict[str, int] = {}
-    by_status: dict[str, list[str]] = {}
-    for rid in sorted(g.requirements, key=num):
-        st = requirement_status(g, rid)
-        counts[st] = counts.get(st, 0) + 1
-        by_status.setdefault(st, []).append(rid)
-    out = ["Requirements: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))]
-    done = by_status.get("done", []) + by_status.get("done_unverified", [])
-    if done:
-        out.append(f"Finished: {id_ranges(done)}")
-    rest = [t for t in sorted(g.tasks.values(), key=lambda t: num(t.id)) if t.status in (OPEN, ACTIVE, REVIEW, BLOCKED)]
-    lines = []
-    for t in rest:
-        extra = f" ({t.blocked_kind})" if t.status == BLOCKED else ""
-        lines.append(f"- {t.id} [{t.status}]{extra} {t.title[:80]} -> {', '.join(t.links[:4])}")
-    body = "\n".join(lines)
-    if len(body) > cap_chars:                       # 太多：只展开与当前任务相关的
-        f = focus_task(g, worker)
-        rel = set(f.links) if f else set()
-        near = [x for x, t in zip(lines, rest) if set(t.links) & rel or (f and t.id in f.blocked_by)]
-        body = "\n".join(near[:20]) + f"\n- ... {len(rest)} unfinished or blocked task(s) in all: " \
-                                      "board(status=\"unfinished\"), board(status=\"blocked\")"
-    if rest:
-        out.append("Unfinished and blocked tasks:\n" + body)
-    done_t = [t.id for t in g.tasks.values() if t.status in (DONE, DONE_UNVERIFIED)]
-    if done_t:
-        out.append(f"Finished tasks: {id_ranges(done_t)} (board(status=\"done\"))")
-    return "\n".join(out)
-
-
-def _next(g: Graph, worker: str, now: float, cfg: BelayConfig) -> str:
-    # 剩余时间只由 runtime 用来决定何时收尾，不写进给模型的文字。
-    ss = suggest(g, worker, now, cfg)[:3]
-    if not ss:
-        return ""
-    lines = ["Suggested order (you may claim any open task):"]
-    for s in ss:
-        t = g.tasks.get(s.task) if s.task else None
-        lines.append(f"{s.rank}. " + (f"{t.id} {t.title} — {s.reason}" if t else s.reason))
     return "\n".join(lines)
 
 
@@ -406,13 +333,10 @@ def _gate(g: Graph, worker: str) -> str:
         lines.append(f"{len(g.waived)} waived (the task asks for behaviour they contradict): "
                      + ", ".join(sorted(g.waived)[:10]) + (" ..." if len(g.waived) > 10 else ""))
     if g.degraded:
-        lines.append("(The tests cannot run outside the working tree here, so checks run only when you "
-                     "checkpoint, finish a task or a session ends.)")
-    f = focus_task(g, worker)
-    files = [p for p, _, _ in task_files(g, f.id)] if f else []
+        lines.append("(The tests cannot run outside the working tree here, so checks run only when you submit "
+                     "or a session ends.)")
     w = g.wips.get(worker)
-    if w:
-        files += [p for p, _, _ in w.files]
+    files = [p for p, _, _ in w.files] if w else []
     related = []
     if files and fails:
         sel, _ = related_units(files, test_files_of(g.baseline), g.relations)
@@ -432,31 +356,31 @@ def _gate(g: Graph, worker: str) -> str:
 def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: BelayConfig,
                   blobs: Optional[Mapping[str, str]] = None, mode: str = "first", away: Iterable[Event] = (),
                   recent_calls: Iterable[str] = ()) -> Context:
-    """mode：first | resume（交接、崩溃、恢复、容器重建）| compaction（会话内 L2）。"""
+    """mode：first | resume（交接、崩溃、恢复、容器重建）| compaction（会话内 L2）。now 不进入给模型的文字。"""
     blobs = blobs or {}
     cpt = cfg.chars_per_token
     fresh = mode == "first"
     secs = [
         Section("task", "Task", "original", f"<task>\n{g.run.task.strip()}\n</task>" if g.run else "", True),
-        Section("requirements", "Requirements (frozen index; status is in the progress overview)", "rule",
+        Section("requirements", "Requirements checklist (frozen index; status is below)", "rule",
                 _requirement_index(g), True),
-        Section("focus", "Current focus", "mixed",
-                _focus(g, worker, blobs, cfg, mode, recent_calls if mode == "resume" else ()), True),
         Section("pending", "Open problems", "observed", "" if fresh else _pending(g, worker), True),
+        Section("progress", "Requirement status", "rule", _progress(g, int(cfg.cap("progress") * cpt * 0.8))),
+        Section("todos", "Your todo list", "self_report", _todos(g), True),
+        Section("summary", "Your notes from earlier", "llm",
+                "" if fresh else _summary(g, worker, recent_calls if mode == "resume" else ()), True),
+        Section("workspace", "Working tree", "observed", _workspace(g, worker, blobs, cfg, mode), True),
         Section("away", "While you were away", "observed", _away(g, away, blobs, cfg) if mode == "resume" else ""),
-        Section("workspace", "Working tree", "observed", _workspace(g, worker)),
-        Section("progress", "Progress overview", "rule", _progress(g, worker, int(cfg.cap("progress") * cpt * 0.8))),
-        Section("next", "Next", "rule", _next(g, worker, now, cfg)),
         Section("gate", "Regression gate", "observed", _gate(g, worker)),
+        Section("next", "Finishing", "rule", SUBMIT_LINE),
     ]
-    entries = {"focus": "task(id=...) has the rest", "pending": "board() and failure_log(test=...)",
-               "away": "board()", "workspace": "board()", "progress": "board(status=...)", "next": "board()",
-               "gate": "board(view=\"failures\")"}
+    entries = {"pending": "board() and failure_log(test=...)", "progress": "board(status=...)", "todos": "",
+               "summary": "", "workspace": "board()", "away": "board()", "gate": "board(view=\"failures\")"}
     secs = [s for s in secs if s.text.strip()]
     trimmed = []
     capped = []
     for s in secs:
-        cap = None if s.key in ("task", "requirements") else cfg.cap(s.key)
+        cap = None if s.key in ("task", "requirements", "next") else cfg.cap(s.key)
         if cap is not None and estimate_tokens(s.text, cpt) > cap:
             s = Section(s.key, s.title, s.source, _clip(s.text, int(cap * cpt), entries.get(s.key, "")), s.protected)
             trimmed.append(s.key)
@@ -468,7 +392,7 @@ def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: Be
     for i in range(len(capped) - 1, -1, -1):        # 兜底：只有任务原文本身超大时才会发生
         if total <= budget_tokens:
             break
-        if capped[i].protected:
+        if capped[i].protected or capped[i].key == "next":
             continue
         total -= estimate_tokens(rendered[i], cpt)
         rendered[i] = ""
@@ -481,13 +405,13 @@ def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: Be
 
 def resume_reminder(g: Graph, worker: str, now: float, cfg: BelayConfig, blobs: Optional[Mapping[str, str]] = None,
                     away: Iterable[Event] = ()) -> str:
-    """原样接上对话时（G2），把恢复点、待处理的问题与离开期间的变化作为 system-reminder 追加在对话之后。"""
+    """原样接上对话时（G2），把待处理的问题、需求状态与离开期间的变化作为 system-reminder 追加在对话之后。"""
     blobs = blobs or {}
     parts = ["The session was interrupted and has been resumed with your conversation intact. The facts below come "
-             "from the harness's task graph and take precedence over what the conversation says. Read files again "
+             "from the harness's record and take precedence over what the conversation says. Read files again "
              "before editing them."]
-    for key, title, text in (("focus", "Current focus", _focus(g, worker, blobs, cfg, "resume", ())),
-                             ("pending", "Open problems", _pending(g, worker)),
+    for key, title, text in (("pending", "Open problems", _pending(g, worker)),
+                             ("progress", "Requirement status", _progress(g, int(cfg.cap("progress") * 3))),
                              ("away", "While you were away", _away(g, away, blobs, cfg))):
         if text.strip():
             parts.append(f"## {title}\n" + _clip(text, int(cfg.cap(key) * cfg.chars_per_token)))

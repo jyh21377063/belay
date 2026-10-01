@@ -94,13 +94,11 @@ def test_load_transcript_messages_adds_interrupted_results(tmp_path):
 def test_away_section_keeps_the_top_events_and_counts_the_rest():
     base = {"tests/test_a.py::test_a": "PASSED"}
     task = "Implement feature one in the core module now."
-    plan = {"requirements": [{"id": "r", "quote": task, "summary": "one"}],
-            "tasks": [{"id": "t", "title": "one", "links": ["r"]}]}
+    plan = {"requirements": [{"id": "r", "quote": task, "summary": "one"}]}
     cfg = BelayConfig(away_top=3, confirm_regressions=False)
     s = Sim(base, cfg=cfg)
     s.setup(task, plan)
     s.do(R.start_session, "w1", "first", {})
-    s.do(R.claim, "w1", "T1")
     s.do(R.end_session, "w1", "handoff")
     mark = s.g.seq
     for i in range(8):

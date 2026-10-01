@@ -1,7 +1,10 @@
 """Belay 工具：只读图和向图报告，不替换任何已有工具。
 
+v7 只留 worker 需要的五个：submit（唯一的完成声明）、board（只读）、以及被拒、被定位时消息里会点名的
+反应式工具 failure_log、revert_change、waive_check。认领、步骤、手动存档、回退这些需要模型主动想起来的流程工具都删掉了。
+
 工具只负责把请求交给 ctx.runtime（runtime/port.py 的 WorkerPort），不认识 runtime 的内部实现。
-回复是 {"text": 给模型看的文字, "error": 是否被拒绝}。
+回复是 {"text": 给模型看的文字, "error": 是否被拒绝}；submit 被接受时另带 {"accepted": True}，会话随之结束。
 """
 from __future__ import annotations
 
@@ -31,27 +34,21 @@ def _list(v, name: str) -> list[str]:
     return [str(x) for x in v]
 
 
-def _task(inp: dict) -> str:
-    t = str(inp.get("task") or "").strip()
-    if not t:
-        raise ToolError("task is required (e.g. \"T3\")")
-    return t
+async def submit(inp: dict, ctx: ToolContext) -> str:
+    blocked = inp.get("blocked") or []
+    if not isinstance(blocked, list) or not all(isinstance(b, dict) for b in blocked):
+        raise ToolError("blocked must be a list of objects {requirement, kind, reason, quote}")
+    reply = await _rt(ctx).request("submit", summary=str(inp.get("summary") or ""), blocked=blocked)
+    text = _out(reply)
+    if reply.get("accepted"):
+        ctx.submitted = True
+        ctx.summary = str(inp.get("summary") or "")
+    return text
 
 
 async def board(inp: dict, ctx: ToolContext) -> str:
     return _out(await _rt(ctx).request("board", status=inp.get("status"), requirement=inp.get("requirement"),
-                                       task=inp.get("task"), view=inp.get("view"), page=int(inp.get("page") or 1)))
-
-
-async def task(inp: dict, ctx: ToolContext) -> str:
-    tid = str(inp.get("id") or inp.get("task") or "").strip()
-    if not tid:
-        raise ToolError("id is required (e.g. \"T3\")")
-    return _out(await _rt(ctx).request("task", task=tid))
-
-
-async def step_done(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("step_done", summary=str(inp.get("summary") or "")))
+                                       view=inp.get("view"), page=int(inp.get("page") or 1)))
 
 
 async def failure_log(inp: dict, ctx: ToolContext) -> str:
@@ -68,173 +65,45 @@ async def revert_change(inp: dict, ctx: ToolContext) -> str:
     return _out(await _rt(ctx).request("revert_change", located=loc))
 
 
-async def history(inp: dict, ctx: ToolContext) -> str:
-    a, b = inp.get("a"), inp.get("b")
-    return _out(await _rt(ctx).request("history", a=None if a in (None, "") else int(a),
-                                       b=None if b in (None, "") else int(b)))
-
-
-async def claim(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("claim", task=_task(inp)))
-
-
-async def release(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("release", task=_task(inp), note=str(inp.get("note") or "")))
-
-
-async def add_task(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("add_task", title=str(inp.get("title") or ""),
-                                       description=str(inp.get("description") or ""),
-                                       links=_list(inp.get("links"), "links"),
-                                       blocked_by=_list(inp.get("blocked_by"), "blocked_by"),
-                                       checks=_list(inp.get("checks"), "checks")))
-
-
-async def note(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("note", text=str(inp.get("text") or "")))
-
-
-async def checkpoint(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("checkpoint", summary=str(inp.get("summary") or "")))
-
-
-async def ready_for_review(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("ready_for_review", task=_task(inp), summary=str(inp.get("summary") or "")))
-
-
-async def report_blocked(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("report_blocked", task=_task(inp), kind=str(inp.get("kind") or ""),
-                                       reason=str(inp.get("reason") or ""), quote=inp.get("quote")))
-
-
 async def waive_check(inp: dict, ctx: ToolContext) -> str:
     tests = _list(inp.get("tests"), "tests")
     if not tests:
         raise ToolError("tests is required")
-    return _out(await _rt(ctx).request("waive_check", task=_task(inp), tests=tests, quote=str(inp.get("quote") or ""),
-                                       reason=str(inp.get("reason") or "")))
+    req = str(inp.get("requirement") or "").strip() or None
+    return _out(await _rt(ctx).request("waive_check", tests=tests, quote=str(inp.get("quote") or ""),
+                                       reason=str(inp.get("reason") or ""), requirement=req))
 
-
-async def run_check(inp: dict, ctx: ToolContext) -> str:
-    return _out(await _rt(ctx).request("run_check", tests=_list(inp.get("tests"), "tests"), full=bool(inp.get("full")),
-                                       as_gate=bool(inp.get("as_gate"))))
-
-
-async def wait(inp: dict, ctx: ToolContext) -> str:
-    ids = _list(inp.get("jobs"), "jobs")
-    if not ids:
-        raise ToolError("jobs is required")
-    return _out(await _rt(ctx).request("wait", jobs=ids, timeout=float(inp.get("timeout") or 600)))
-
-
-async def rollback(inp: dict, ctx: ToolContext) -> str:
-    to = inp.get("checkpoint")
-    return _out(await _rt(ctx).request("rollback", checkpoint=None if to in (None, "") else int(to)))
-
-
-_TASK = {"type": "string", "description": "Task id, e.g. T3"}
 
 TOOLS = [
+    Tool("submit",
+         "Declare that you are done. The harness checkpoints your working tree (changes to test files are left out), "
+         "runs the regression gate, checks every requirement on the checklist, and has a reviewer look at the ones "
+         "without tests. If anything is missing you get the list back and keep working; call submit again when it "
+         "is done. In the summary, report what actually happened. If a requirement cannot be done here, list it in "
+         "blocked with a kind: insufficient_info (the task text does not say enough), environment (the environment "
+         "prevents it), check_conflict (the task text explicitly asks for something existing tests contradict; "
+         "quote the task text verbatim).",
+         {"type": "object", "properties": {
+             "summary": {"type": "string"},
+             "blocked": {"type": "array", "items": {"type": "object", "properties": {
+                 "requirement": {"type": "string", "description": "Requirement id, e.g. R3"},
+                 "kind": {"type": "string", "enum": ["insufficient_info", "environment", "check_conflict"]},
+                 "reason": {"type": "string"},
+                 "quote": {"type": "string", "description": "Verbatim task text (check_conflict)"}},
+                 "required": ["requirement", "kind", "reason"]}}},
+          "required": ["summary"]},
+         submit),
     Tool("board",
-         "Show the task graph the harness keeps for this run. Without arguments: the latest checkpoints, your "
-         "changes that are not checkpointed yet, suggestions, counts, and the unfinished tasks. Filters: "
-         "status (open | active | review | done | done_unverified | blocked | split | unfinished), requirement "
-         "(e.g. \"R3\"), task (e.g. \"T7\"), view (\"checkpoints\" | \"failures\" | \"tasks\"), page.",
+         "Show the requirements checklist the harness keeps for this run, with each requirement's status (open, "
+         "verified by its checks, submitted, blocked) and why a reopened one is not done; the latest checkpoints. "
+         "Filters: requirement (e.g. \"R3\") for its task text, checks and history; status (open | verified | "
+         "submitted | blocked | unfinished | done); view (\"requirements\" | \"checkpoints\" | \"failures\" for the "
+         "tests that already fail on the original code); page.",
          {"type": "object", "properties": {
-             "status": {"type": "string"}, "requirement": {"type": "string"}, "task": {"type": "string"},
-             "view": {"type": "string", "enum": ["tasks", "checkpoints", "failures"]}, "page": {"type": "integer"}}},
+             "requirement": {"type": "string"}, "status": {"type": "string"},
+             "view": {"type": "string", "enum": ["requirements", "checkpoints", "failures"]},
+             "page": {"type": "integer"}}},
          board, read_only=True),
-    Tool("task",
-         "Everything the harness knows about one task: its requirement quotes, checks, status history, why it was "
-         "rejected or reopened, all notes from every session, its steps and the files it changed.",
-         {"type": "object", "properties": {"id": _TASK}, "required": ["id"]}, task, read_only=True),
-    Tool("claim",
-         "Make a task your current focus before working on it. You may claim any open task; dependencies and the "
-         "suggested order are only advice.",
-         {"type": "object", "properties": {"task": _TASK}, "required": ["task"]}, claim),
-    Tool("release",
-         "Give a task back without finishing it (it becomes available again). Leave a note for whoever picks it up.",
-         {"type": "object", "properties": {"task": _TASK, "note": {"type": "string"}}, "required": ["task"]}, release),
-    Tool("add_task",
-         "Add a task you discovered while working (for example a prerequisite refactor or a bug the task needs "
-         "fixed). It must link to at least one requirement. checks may only name tests that exist on the original "
-         "code (see board); tests you write yourself are development signals, not verification.",
-         {"type": "object", "properties": {
-             "title": {"type": "string"}, "description": {"type": "string"},
-             "links": {"type": "array", "items": {"type": "string"}, "description": "Requirement ids, e.g. [\"R2\"]"},
-             "blocked_by": {"type": "array", "items": {"type": "string"}, "description": "Task ids (ordering hint)"},
-             "checks": {"type": "array", "items": {"type": "string"}, "description": "Existing test node ids"}},
-          "required": ["title", "links"]}, add_task),
-    Tool("note",
-         "Leave a note for yourself or whoever continues this work in a later session: decisions and why, what you "
-         "tried that did not work, what to do next. Notes are kept with the task across sessions and shown as your "
-         "own (unverified) notes; facts such as files changed and test results are tracked by the harness anyway.",
-         {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}, note),
-    Tool("step_done",
-         "Mark the current step of your task finished (the step list is your todo list for the task, which the "
-         "harness keeps). The harness snapshots your working tree as the step's anchor and verifies it in the "
-         "background; you do not wait. After an interruption you continue from the next step instead of re-reading "
-         "finished ones.",
-         {"type": "object", "properties": {
-             "summary": {"type": "string", "description": "One line: what the step did"}}},
-         step_done),
-    Tool("checkpoint",
-         "Confirm your current working tree as a checkpoint now and label it (finished steps are also verified in "
-         "the background; work in progress is only snapshotted, not tested). Changes under test paths are restored "
-         "to the original first. The tests related to your changes are run; if none of the tests that passed on the "
-         "original code fails, errors, is skipped or goes missing, the checkpoint chain advances. Otherwise nothing "
-         "changes and you get the failing checks back with their failure reasons.",
-         {"type": "object", "properties": {"summary": {"type": "string", "description": "What this state contains"}}},
-         checkpoint),
-    Tool("ready_for_review",
-         "Declare a task you hold finished. The harness checkpoints your working tree and then looks at the task's "
-         "checks on that checkpoint: if they all pass the task is done; a task without checks becomes "
-         "done_unverified once its work is in a checkpoint (a reviewer may reopen it if parts are missing). If the "
-         "checkpoint is rejected or a check fails, the task is reopened and stays yours.",
-         {"type": "object", "properties": {"task": _TASK, "summary": {"type": "string"}}, "required": ["task"]},
-         ready_for_review),
-    Tool("report_blocked",
-         "Report that a task cannot be finished, instead of working around it.\n"
-         "- insufficient_info: the task text does not give enough information.\n"
-         "- environment: the environment prevents it (missing service, permissions, network).\n"
-         "- check_conflict: the task text explicitly asks for something that existing tests contradict and you "
-         "cannot do the task at all (for specific gate tests that fail on your change, use waive_check instead "
-         "and keep working). Quote the task text verbatim in quote.\n"
-         "The task is set aside and listed honestly in the final report; you can work on other tasks.",
-         {"type": "object", "properties": {
-             "task": _TASK, "kind": {"type": "string", "enum": ["insufficient_info", "environment", "check_conflict"]},
-             "reason": {"type": "string"}, "quote": {"type": "string", "description": "Verbatim task text"}},
-          "required": ["task", "kind", "reason"]}, report_blocked),
-    Tool("waive_check",
-         "Take existing tests out of the regression gate because the task text explicitly asks for behaviour they "
-         "contradict (for example the task changes a default value or an error message that an old test asserts). "
-         "Use it only after the harness has seen these tests fail on your changes (a rejected checkpoint, or "
-         "run_check with as_gate=true), and only for that reason: never to get past a failure you caused by "
-         "mistake. quote must be copied verbatim from the task text; reason says how each test contradicts it. "
-         "Every waiver is listed in the final report. Then checkpoint again.",
-         {"type": "object", "properties": {
-             "task": _TASK, "tests": {"type": "array", "items": {"type": "string"},
-                                      "description": "Full test ids as the gate reports them"},
-             "quote": {"type": "string", "description": "Verbatim task text that asks for the new behaviour"},
-             "reason": {"type": "string"}},
-          "required": ["task", "tests", "quote", "reason"]}, waive_check),
-    Tool("run_check",
-         "Start a check as a background job run by the harness and return at once with a job id (or the cached "
-         "result if the same tree was already checked). With no arguments it runs the tests related to your "
-         "changes; tests=[...] runs specific test files or node ids; full=true runs everything. By default it runs "
-         "in your working tree as it is; as_gate=true runs it exactly as the regression gate does (your changes to "
-         "test files removed, in the harness's verification directory). Results are compared with the original "
-         "code: regressions, pre-existing failures and new tests. Keep working and call wait when you need the "
-         "result, instead of sleeping.",
-         {"type": "object", "properties": {
-             "tests": {"type": "array", "items": {"type": "string"}}, "full": {"type": "boolean"},
-             "as_gate": {"type": "boolean"}}}, run_check),
-    Tool("wait",
-         "Wait until the given jobs finish and return their results. Returns early with the current status after "
-         "the timeout (seconds, default 600).",
-         {"type": "object", "properties": {
-             "jobs": {"type": "array", "items": {"type": "string"}}, "timeout": {"type": "integer"}},
-          "required": ["jobs"]}, wait),
     Tool("failure_log",
          "Show the traceback of a failing test from the most recent harness run that included it (the harness's "
          "own logs are otherwise not accessible).",
@@ -246,15 +115,18 @@ TOOLS = [
          "the files it names, is reversed in your working tree. Later work is kept. If it conflicts with later "
          "changes nothing is modified and you are told why.",
          {"type": "object", "properties": {"located": {"type": "string"}}, "required": ["located"]}, revert_change),
-    Tool("history",
-         "List the checkpoint chain (kind, confirmed or provisional, demoted, labels). With a and b, show the diff "
-         "between two checkpoints.",
-         {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}}, history,
-         read_only=True),
-    Tool("rollback",
-         "Discard your changes and restore the working tree to a checkpoint (default: the latest milestone, i.e. "
-         "your last checkpoint, finished step or finished task, not one saved at a handoff). Rolling back to an "
-         "earlier checkpoint abandons the checkpoints after it, and tasks finished on them are reopened. Use it when "
-         "you have just broken things; for a regression found later, prefer revert_change.",
-         {"type": "object", "properties": {"checkpoint": {"type": "integer"}}}, rollback),
+    Tool("waive_check",
+         "Take existing tests out of the regression gate because the task text explicitly asks for behaviour they "
+         "contradict (for example the task changes a default value or an error message that an old test asserts). "
+         "Use it only after the harness has seen these tests fail on your changes (a rejected submit), and only for "
+         "that reason: never to get past a failure you caused by mistake. quote must be copied verbatim from the "
+         "task text; reason says how each test contradicts it. Every waiver is listed in the final report. Then "
+         "submit again.",
+         {"type": "object", "properties": {
+             "tests": {"type": "array", "items": {"type": "string"},
+                       "description": "Full test ids as the gate reports them"},
+             "quote": {"type": "string", "description": "Verbatim task text that asks for the new behaviour"},
+             "reason": {"type": "string"},
+             "requirement": {"type": "string", "description": "Requirement id, if one applies"}},
+          "required": ["tests", "quote", "reason"]}, waive_check),
 ]

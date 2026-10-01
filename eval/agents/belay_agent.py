@@ -102,12 +102,15 @@ class BelayAgent(FlatAgent):
             try:
                 await run.prepare(self.task_instruction, run_id=Path(self.logs_dir).parent.name or "trial")
                 g = run.rt.graph
+                actionable = [r for r in g.requirements.values() if r.kind == "actionable"]
                 info.update(prepared=True, sec=round(time.time() - t0, 1), requirements=len(g.requirements),
-                            tasks=len(g.tasks), guard_checks=sum(1 for c in g.baseline.values() if c == "pass"),
-                            isolation=g.isolation)
+                            actionable=len(actionable),
+                            checked=sum(1 for r in actionable if any(g.baseline.get(c) != "pass" for c in r.checks)),
+                            guard_checks=sum(1 for c in g.baseline.values() if c == "pass"), isolation=g.isolation)
                 self.prepared_sec = info["sec"]
-                self.logger.info(f"[belay] 准备完成（{info['sec']:.0f}s）：{info['requirements']} 条需求，"
-                                 f"{info['tasks']} 个任务，回归门 {info['guard_checks']} 个检查，"
+                self.logger.info(f"[belay] 准备完成（{info['sec']:.0f}s）：{info['requirements']} 条需求（"
+                                 f"{info['actionable']} 条在清单上，{info['checked']} 条有证据检查），"
+                                 f"回归门 {info['guard_checks']} 个检查，"
                                  f"隔离{'有效' if g.isolation.get('valid', True) else '无效（降级）'}")
             except Exception as e:                           # 准备失败：run() 里从头 start()
                 info.update(error=f"{type(e).__name__}: {e}")

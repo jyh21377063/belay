@@ -10,17 +10,18 @@ from dataclasses import replace
 from typing import Callable, Iterable, Optional
 
 from belay.core.events import Event, actor_worker, validate
-from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, ATT_REJECTED, ATT_SUPERSEDED, BLOCKED,
-                              CONFIRMED, DONE, DONE_UNVERIFIED, FINISHED, JOB_FINISHED, JOB_RUNNING, KIND_FINAL,
-                              KIND_MILESTONE, KIND_REVIEW, KIND_STEP, LANE_BG, LANE_FG, OPEN, PROVISIONAL, REVIEW,
-                              RUN_DONE, RUN_INCOMPLETE, RUN_RUNNING, SPLIT, STEP_ACTIVE, STEP_ANCHORED, STEP_DECLARED,
-                              STEP_PLANNED, WHERE_LIVE, WHERE_SLOT, Attempt, Checkpoint, Compaction, Diagnosis, Graph,
-                              Job, Lease, Locate, Note, Persistent, Requirement, Run, Session, Snapshot, Stall, Step,
-                              Task, Waiver, Wip, WorkerState)
-from belay.core.queries import has_cycle, is_ancestor, last_session, latest_confirmed_ancestor
+from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, ATT_REJECTED, ATT_SUPERSEDED,
+                              CONFIRMED, JOB_FINISHED, JOB_RUNNING, KIND_AUTO, KIND_HANDOFF, KIND_SUBMIT, KIND_TODO,
+                              LANE_BG, LANE_FG, PROVISIONAL, REQ_BLOCKED, REQ_KINDS, REQ_OPEN, REQ_SUBMITTED,
+                              REQ_VERIFIED, RUN_DONE, RUN_INCOMPLETE, RUN_RUNNING, SUB_ACCEPTED, SUB_CHECKPOINTED,
+                              SUB_OPEN, SUB_PENDING, SUB_REJECTED, SUB_RETURNED, SUB_REVIEWING, TODO_ACTIVE,
+                              TODO_ANCHORED, TODO_COMPLETED, TODO_PENDING, WHERE_LIVE, WHERE_SLOT, Attempt,
+                              Checkpoint, Compaction, Diagnosis, Graph, Job, Locate, Persistent, Requirement, Review,
+                              Run, Session, Snapshot, Stall, Submit, Todo, Waiver, Wip, WorkerState)
+from belay.core.queries import evidence_checks, is_ancestor, last_session, latest_confirmed_ancestor
 from belay.core.verify import PASSED, results_for_tree
 
-PROGRESS_KINDS = (KIND_MILESTONE, KIND_STEP, KIND_REVIEW, KIND_FINAL)   # 交接存档（及旧日志里的自动存档）不算进展
+MARKABLE_KINDS = (KIND_TODO, KIND_SUBMIT)       # 声明的单元落在已有的自动 / 交接存档上时可以升级成这些
 
 
 class IllegalEvent(ValueError):
@@ -44,16 +45,20 @@ def _drop(d: dict, k) -> dict:
     return out
 
 
-def _task(g: Graph, tid: str) -> Task:
-    _need(tid in g.tasks, f"unknown task {tid}")
-    return g.tasks[tid]
+def _req(g: Graph, rid: str) -> Requirement:
+    _need(rid in g.requirements, f"unknown requirement {rid}")
+    return g.requirements[rid]
 
 
-def _set_task(g: Graph, t: Task, e: Optional[Event] = None, reason: str = "") -> Graph:
-    old = g.tasks.get(t.id)
-    if e is not None and (old is None or old.status != t.status):
-        t = replace(t, history=(t.history + ((e.seq, t.status, reason or e.type),))[-30:])
-    return replace(g, tasks=_put(g.tasks, t.id, t))
+def _set_req(g: Graph, r: Requirement, e: Optional[Event] = None, reason: str = "") -> Graph:
+    old = g.requirements.get(r.id)
+    if e is not None and (old is None or old.status != r.status):
+        r = replace(r, history=(r.history + ((e.seq, r.status, reason or e.type),))[-30:])
+    return replace(g, requirements=_put(g.requirements, r.id, r))
+
+
+def _set_sub(g: Graph, s: Submit) -> Graph:
+    return replace(g, submits=_put(g.submits, s.id, s))
 
 
 def _set_cp(g: Graph, cp: Checkpoint) -> Graph:
@@ -73,17 +78,18 @@ def _progress(g: Graph, e: Event, worker: Optional[str]) -> Graph:
 
 
 def _check_passes(g: Graph, e: Event, tree: str) -> Graph:
-    """某个任务的检查项第一次在存档上通过：算进展。"""
+    """某条需求的证据检查第一次在存档上通过：算进展。"""
     if not any(cp.tree == tree and not cp.abandoned for cp in g.checkpoints.values()):
         return g
     res = results_for_tree(g, tree)
     progressed = False
-    for t in list(g.tasks.values()):
-        if not t.checks or t.status == SPLIT:
+    for r in list(g.requirements.values()):
+        ev = evidence_checks(g, r)
+        if not ev:
             continue
-        new = [c for c in t.checks if res.get(c) == PASSED and c not in t.passed_checks]
+        new = [c for c in ev if res.get(c) == PASSED and c not in r.passed_checks]
         if new:
-            g = _set_task(g, replace(t, passed_checks=t.passed_checks + tuple(new)))
+            g = _set_req(g, replace(r, passed_checks=r.passed_checks + tuple(new)))
             progressed = True
     return _progress(g, e, None) if progressed else g
 
@@ -175,206 +181,186 @@ def _requirement_frozen(g: Graph, e: Event) -> Graph:
     for r in e.get("requirements"):
         _need(r["id"] not in reqs, f"duplicate requirement {r['id']}")
         _need(bool(r.get("quote")), f"requirement {r['id']} has no quote")
-        reqs[r["id"]] = Requirement(r["id"], r["quote"], r.get("summary", ""), r.get("origin", "llm"))
+        kind = r.get("kind") or ACTIONABLE
+        _need(kind in REQ_KINDS, f"requirement {r['id']} has a bad kind {kind}")
+        reqs[r["id"]] = Requirement(r["id"], r["quote"], r.get("summary", ""), r.get("origin", "llm"), kind,
+                                    tuple(r.get("checks") or ()), history=((e.seq, REQ_OPEN, "frozen"),))
     _need(bool(reqs), "no requirements")
+    _need(any(r.kind == ACTIONABLE for r in reqs.values()), "no actionable requirement")
     return replace(g, requirements=reqs, frozen=True)
 
 
-def _new_task(g: Graph, spec: dict, seq: int, origin: str, parent: str | None = None) -> Task:
-    tid = spec["id"] if "id" in spec else spec["task"]
-    _need(tid not in g.tasks, f"task {tid} exists")
-    links = tuple(spec.get("links") or ())
-    blocked_by = tuple(spec.get("blocked_by") or ())
-    for r in links:
-        _need(r in g.requirements, f"task {tid} links unknown requirement {r}")
-    for d in blocked_by:
-        _need(d in g.tasks, f"task {tid} blocked_by unknown task {d}")
-    return Task(id=tid, title=spec.get("title", ""), description=spec.get("description", ""), links=links,
-                blocked_by=blocked_by, parent=parent, discovered_from=spec.get("discovered_from"),
-                priority=int(spec.get("priority") or 0), checks=tuple(spec.get("checks") or ()), origin=origin,
-                created_seq=seq, history=((seq, OPEN, "created"),))
-
-
-def _task_added(g: Graph, e: Event) -> Graph:
+def _requirement_verified(g: Graph, e: Event) -> Graph:
     _running(g)
-    _need(g.frozen, "tasks are added after requirements are frozen")
-    t = _new_task(g, e.payload, e.seq, e.source)
-    if t.discovered_from is not None:
-        _need(t.discovered_from in g.tasks, f"discovered_from unknown task {t.discovered_from}")
-    g = _set_task(g, t)
-    _need(has_cycle({x.id: x.blocked_by for x in g.tasks.values()}) is None, "task_added creates a cycle")
-    return g
-
-
-def _task_split(g: Graph, e: Event) -> Graph:
-    _running(g)
-    parent = _task(g, e.get("task"))
-    _need(parent.status in (OPEN, ACTIVE, BLOCKED), f"cannot split {parent.id} in status {parent.status}")
-    children = []
-    covered: set[str] = set()
-    for spec in e.get("children"):
-        c = _new_task(g, spec, e.seq, e.source, parent=parent.id)
-        g = _set_task(g, c)
-        children.append(c.id)
-        covered.update(c.links)
-    _need(bool(children), "split without children")
-    _need(set(parent.links) <= covered, f"split of {parent.id} drops requirement links "
-                                        f"{sorted(set(parent.links) - covered)}")
-    edges = {t.id: t.blocked_by for t in g.tasks.values()}
-    _need(has_cycle(edges) is None, "split creates a dependency cycle")
-    g = replace(g, leases=_drop(g.leases, parent.id))
-    return _set_task(g, replace(parent, status=SPLIT, children=tuple(children)), e)
-
-
-def _task_claimed(g: Graph, e: Event) -> Graph:
-    _running(g)
-    t = _task(g, e.get("task"))
-    w = e.get("worker")
-    _need(w in g.workers, f"unknown worker {w}")
-    _need(t.status == OPEN, f"cannot claim {t.id} in status {t.status}")
-    _need(t.id not in g.leases, f"{t.id} is already held")
-    head = e.get("head")
-    g = replace(g, leases=_put(g.leases, t.id, Lease(t.id, w, e.t, head, e.seq)))
-    return _set_task(g, replace(t, status=ACTIVE, claimed_head=head), e)
-
-
-def _task_released(g: Graph, e: Event) -> Graph:
-    _running(g)
-    t = _task(g, e.get("task"))
-    lease = g.leases.get(t.id)
-    _need(t.status == ACTIVE and lease is not None and lease.worker == e.get("worker"),
-          f"{e.get('worker')} does not hold active task {t.id}")
-    g = replace(g, leases=_drop(g.leases, t.id))
-    return _set_task(g, replace(t, status=OPEN), e)
-
-
-def _review_requested(g: Graph, e: Event) -> Graph:
-    _running(g)
-    t = _task(g, e.get("task"))
-    lease = g.leases.get(t.id)
-    _need(t.status == ACTIVE and lease is not None and lease.worker == e.get("worker"),
-          f"{e.get('worker')} does not hold active task {t.id}")
+    r = _req(g, e.get("requirement"))
+    _need(r.kind == ACTIONABLE, f"{r.id} is not actionable")
+    _need(r.status == REQ_OPEN, f"{r.id} must be open to be verified (is {r.status})")
     cp = e.get("checkpoint")
-    if cp is not None:
-        _need(cp == g.head, "review on a checkpoint that is not the head")
-    return _set_task(g, replace(t, status=REVIEW, review_seq=e.seq, review_attempt=None, review_checkpoint=cp), e)
-
-
-def _task_done(g: Graph, e: Event) -> Graph:
-    _running(g)
-    t = _task(g, e.get("task"))
-    _need(t.status == REVIEW, f"{t.id} must be in review to be done (is {t.status})")
-    cp = e.get("checkpoint")
-    _need(cp is not None and cp == t.review_checkpoint, f"{t.id} done on checkpoint {cp}, reviewed on "
-                                                        f"{t.review_checkpoint}")
     _need(cp in g.checkpoints and not g.checkpoints[cp].abandoned, f"checkpoint {cp} is not on the chain")
-    verified = bool(e.get("verified"))
-    _need(verified == bool(t.checks), f"{t.id}: verified must be {bool(t.checks)}")
-    worker = g.leases[t.id].worker if t.id in g.leases else None
-    g = replace(g, leases=_drop(g.leases, t.id))
-    g = _set_task(g, replace(t, status=DONE if verified else DONE_UNVERIFIED, done_checkpoint=cp, done_seq=e.seq,
-                             verified=verified, last_failure=(), review=None, review_missing=()), e)
-    return _progress(g, e, worker)
+    ev = evidence_checks(g, r)
+    _need(bool(ev), f"{r.id} has no evidence checks")
+    res = results_for_tree(g, g.checkpoints[cp].tree)
+    _need(all(res.get(c) == PASSED for c in ev), f"{r.id}: evidence does not pass on checkpoint {cp}")
+    g = _set_req(g, replace(r, status=REQ_VERIFIED, checkpoint=cp, status_seq=e.seq, last_failure=(), review=None,
+                            review_missing=()), e)
+    return _progress(g, e, None)
 
 
-def _task_blocked(g: Graph, e: Event) -> Graph:
+def _requirement_submitted(g: Graph, e: Event) -> Graph:
     _running(g)
-    t = _task(g, e.get("task"))
-    _need(t.status in (OPEN, ACTIVE, REVIEW), f"cannot block {t.id} in status {t.status}")
-    worker = actor_worker(e.actor)
-    g = replace(g, leases=_drop(g.leases, t.id))
-    g = _set_task(g, replace(t, status=BLOCKED, blocked_kind=e.get("kind"), blocked_reason=e.get("reason"),
-                             blocked_quote=e.get("quote"), review_attempt=None, review_checkpoint=None,
-                             review=None), e, e.get("kind"))
-    return _progress(g, e, worker)
+    r = _req(g, e.get("requirement"))
+    _need(r.kind == ACTIONABLE, f"{r.id} is not actionable")
+    _need(r.status == REQ_OPEN, f"{r.id} must be open to be submitted (is {r.status})")
+    sid = e.get("submit")
+    _need(sid in g.submits, f"unknown submit {sid}")
+    cp = e.get("checkpoint")
+    _need(cp is not None and cp == g.submits[sid].checkpoint, f"{r.id} submitted on checkpoint {cp}, the submit is "
+                                                             f"on {g.submits[sid].checkpoint}")
+    _need(cp in g.checkpoints and not g.checkpoints[cp].abandoned, f"checkpoint {cp} is not on the chain")
+    g = _set_req(g, replace(r, status=REQ_SUBMITTED, checkpoint=cp, status_seq=e.seq, submit=sid, last_failure=(),
+                            review=None, review_missing=()), e)
+    return _progress(g, e, g.submits[sid].worker)
 
 
-def _task_reopened(g: Graph, e: Event) -> Graph:
+def _requirement_blocked(g: Graph, e: Event) -> Graph:
     _running(g)
-    t = _task(g, e.get("task"))
-    _need(t.status in (REVIEW, DONE, DONE_UNVERIFIED, BLOCKED), f"cannot reopen {t.id} in status {t.status}")
-    status = ACTIVE if (t.status == REVIEW and t.id in g.leases) else OPEN
-    if status == OPEN:
-        g = replace(g, leases=_drop(g.leases, t.id))
+    r = _req(g, e.get("requirement"))
+    _need(r.kind == ACTIONABLE, f"{r.id} is not actionable")
+    _need(r.status == REQ_OPEN, f"cannot block {r.id} in status {r.status}")
+    sid = e.get("submit")
+    _need(sid in g.submits, f"unknown submit {sid}")
+    g = _set_req(g, replace(r, status=REQ_BLOCKED, status_seq=e.seq, submit=sid, blocked_kind=e.get("kind"),
+                            blocked_reason=e.get("reason"), blocked_quote=e.get("quote"), review=None,
+                            review_missing=(), checkpoint=None), e, e.get("kind"))
+    return _progress(g, e, g.submits[sid].worker)
+
+
+def _requirement_reopened(g: Graph, e: Event) -> Graph:
+    _running(g)
+    r = _req(g, e.get("requirement"))
+    _need(r.status in (REQ_VERIFIED, REQ_SUBMITTED, REQ_BLOCKED), f"cannot reopen {r.id} in status {r.status}")
     by_review = e.get("reason") in ("review_missing", "review_reading")
-    t2 = replace(t, status=status, reopen_count=t.reopen_count + 1, reopen_reason=e.get("reason"),
-                 last_failure=tuple(e.get("failures") or ()), review_attempt=None, review_checkpoint=None,
-                 review_seq=None, done_checkpoint=None, done_seq=None, verified=False, blocked_kind=None,
-                 blocked_reason=None, blocked_quote=None,
-                 review_reopens=t.review_reopens + (1 if by_review else 0))
-    return _set_task(g, t2, e, e.get("reason"))
+    r2 = replace(r, status=REQ_OPEN, reopen_count=r.reopen_count + 1, reopen_reason=e.get("reason"),
+                 last_failure=tuple(e.get("failures") or ()), checkpoint=None, status_seq=e.seq, submit=None,
+                 blocked_kind=None, blocked_reason=None, blocked_quote=None,
+                 review_reopens=r.review_reopens + (1 if by_review else 0))
+    return _set_req(g, r2, e, e.get("reason"))
 
 
-# ======================================================================== 步骤
+# ======================================================================== todo（运行级步骤）
 
-def _steps_planned(g: Graph, e: Event) -> Graph:
+def _todos_updated(g: Graph, e: Event) -> Graph:
     _running(g)
-    tid = e.get("task")
-    _task(g, tid)
-    keep = {s.id for s in g.steps.values() if s.task == tid and s.status in (STEP_DECLARED, STEP_ANCHORED)}
+    keep = {t.id for t in g.todos.values() if t.status in (TODO_COMPLETED, TODO_ANCHORED)}
     listed = set()
-    steps = dict(g.steps)
-    for spec in e.get("steps"):
-        sid = spec["id"]
-        listed.add(sid)
-        cur = steps.get(sid)
-        status = spec.get("status", STEP_PLANNED)
+    todos = dict(g.todos)
+    for spec in e.get("todos"):
+        tid = spec["id"]
+        listed.add(tid)
+        cur = todos.get(tid)
+        status = spec.get("status", TODO_PENDING)
+        reqs = tuple(spec.get("requirements") or ())
+        for rid in reqs:
+            _need(rid in g.requirements, f"todo {tid} mentions unknown requirement {rid}")
         if cur is None:
-            _need(status in (STEP_PLANNED, STEP_ACTIVE), f"new step {sid} must be planned or active")
-            steps[sid] = Step(sid, tid, int(spec["n"]), spec["title"], status, order=int(spec.get("order", 0)))
+            _need(status in (TODO_PENDING, TODO_ACTIVE), f"new todo {tid} must be pending or in progress")
+            todos[tid] = Todo(tid, int(spec["n"]), spec["title"], status, int(spec.get("order", 0)), reqs)
         else:
-            _need(cur.task == tid, f"step {sid} belongs to {cur.task}")
-            if cur.status in (STEP_DECLARED, STEP_ANCHORED):
+            if cur.status in (TODO_COMPLETED, TODO_ANCHORED):
                 status = cur.status
-            steps[sid] = replace(cur, title=spec["title"], status=status, order=int(spec.get("order", 0)))
-    for sid in [s.id for s in steps.values() if s.task == tid]:
-        if sid not in listed and sid not in keep:
-            del steps[sid]
-    return replace(g, steps=steps)
+            else:
+                _need(status in (TODO_PENDING, TODO_ACTIVE), f"todo {tid} is completed only by todo_completed")
+            todos[tid] = replace(cur, title=spec["title"], status=status, order=int(spec.get("order", 0)),
+                                 requirements=reqs)
+    for tid in list(todos):
+        if tid not in listed and tid not in keep:
+            del todos[tid]
+    return replace(g, todos=todos)
 
 
-def _step(g: Graph, sid: str) -> Step:
-    _need(sid in g.steps, f"unknown step {sid}")
-    return g.steps[sid]
+def _todo(g: Graph, tid: str) -> Todo:
+    _need(tid in g.todos, f"unknown todo {tid}")
+    return g.todos[tid]
 
 
-def _step_started(g: Graph, e: Event) -> Graph:
-    s = _step(g, e.get("step"))
-    _need(s.status in (STEP_PLANNED, STEP_ACTIVE), f"cannot start step {s.id} in status {s.status}")
-    return replace(g, steps=_put(g.steps, s.id, replace(s, status=STEP_ACTIVE)))
-
-
-def _step_done(g: Graph, e: Event) -> Graph:
-    s = _step(g, e.get("step"))
-    _need(s.status in (STEP_PLANNED, STEP_ACTIVE), f"cannot finish step {s.id} in status {s.status}")
+def _todo_completed(g: Graph, e: Event) -> Graph:
+    t = _todo(g, e.get("todo"))
+    _need(t.status in (TODO_PENDING, TODO_ACTIVE), f"cannot complete todo {t.id} in status {t.status}")
     n = int(e.get("snapshot"))
     _need(n == 0 or n in g.snapshots, f"unknown anchor snapshot {n}")
     epoch = g.snapshots[n].epoch if n in g.snapshots else 0
     if e.get("anchor_epoch") is not None:
         epoch = int(e.get("anchor_epoch"))
-    s2 = replace(s, status=STEP_DECLARED, anchor_snapshot=n, anchor_epoch=epoch, summary=e.get("summary", ""),
-                 files=tuple(tuple(f) for f in (e.get("files") or ())), declared_seq=e.seq)
-    return replace(g, steps=_put(g.steps, s.id, s2))
+    t2 = replace(t, status=TODO_COMPLETED, anchor_snapshot=n, anchor_epoch=epoch, completed_seq=e.seq)
+    return replace(g, todos=_put(g.todos, t.id, t2))
 
 
-def _step_anchored(g: Graph, e: Event) -> Graph:
-    s = _step(g, e.get("step"))
-    _need(s.status == STEP_DECLARED, f"step {s.id} is {s.status}, not declared")
+def _todo_anchored(g: Graph, e: Event) -> Graph:
+    t = _todo(g, e.get("todo"))
+    _need(t.status == TODO_COMPLETED, f"todo {t.id} is {t.status}, not completed")
     cid = int(e.get("checkpoint"))
     cp = g.checkpoints.get(cid)
     _need(cp is not None and not cp.abandoned, f"anchor checkpoint {cid} is not on the chain")
-    _need(cp.epoch == s.anchor_epoch and cp.snapshot >= (s.anchor_snapshot or 0),
-          f"checkpoint {cid} does not contain the anchor of {s.id}")
-    g = replace(g, steps=_put(g.steps, s.id, replace(s, status=STEP_ANCHORED, checkpoint=cid)))
-    h = g.leases.get(s.task)
-    return _progress(g, e, h.worker if h else None)
+    _need(cp.epoch == t.anchor_epoch and cp.snapshot >= (t.anchor_snapshot or 0),
+          f"checkpoint {cid} does not contain the anchor of {t.id}")
+    g = replace(g, todos=_put(g.todos, t.id, replace(t, status=TODO_ANCHORED, checkpoint=cid)))
+    return _progress(g, e, None)
 
 
-def _step_invalidated(g: Graph, e: Event) -> Graph:
-    s = _step(g, e.get("step"))
-    _need(s.status in (STEP_DECLARED, STEP_ANCHORED), f"step {s.id} is {s.status}")
-    s2 = replace(s, status=STEP_ACTIVE, anchor_snapshot=None, anchor_epoch=None, checkpoint=None)
-    return replace(g, steps=_put(g.steps, s.id, s2))
+def _todo_invalidated(g: Graph, e: Event) -> Graph:
+    t = _todo(g, e.get("todo"))
+    _need(t.status in (TODO_COMPLETED, TODO_ANCHORED), f"todo {t.id} is {t.status}")
+    t2 = replace(t, status=TODO_ACTIVE, anchor_snapshot=None, anchor_epoch=None, checkpoint=None)
+    return replace(g, todos=_put(g.todos, t.id, t2))
+
+
+# ======================================================================== 提交
+
+def _submit_requested(g: Graph, e: Event) -> Graph:
+    _running(g)
+    sid = e.get("submit")
+    _need(sid not in g.submits, f"submit {sid} exists")
+    w = e.get("worker")
+    _need(w in g.workers, f"unknown worker {w}")
+    _need(not any(x.worker == w and x.status in SUB_OPEN for x in g.submits.values()),
+          f"{w} already has a submit in progress")
+    cp, aid = e.get("checkpoint"), e.get("attempt")
+    _need((cp is None) != (aid is None), "a submit has either an attempt or a checkpoint")
+    if cp is not None:
+        _need(cp == g.head, "a submit without an attempt is on the head")
+    blocked = tuple(dict(b) for b in (e.get("blocked") or ()))
+    for b in blocked:
+        _need(b.get("requirement") in g.requirements, f"submit blocks unknown requirement {b.get('requirement')}")
+    s = Submit(id=sid, worker=w, seq=e.seq, t=e.t, summary=str(e.get("summary") or ""), blocked=blocked,
+               implicit=bool(e.get("implicit")), snapshot=int(e.get("snapshot") or 0), attempt=aid, checkpoint=cp,
+               status=SUB_CHECKPOINTED if cp is not None else SUB_PENDING)
+    if aid is not None:
+        _need(aid in g.attempts and g.attempts[aid].status == ATT_PENDING and g.attempts[aid].submit is None,
+              f"attempt {aid} is not a pending attempt")
+        g = replace(g, attempts=_put(g.attempts, aid, replace(g.attempts[aid], submit=sid)))
+    return _set_sub(g, s)
+
+
+_SUB_NEXT = {SUB_CHECKPOINTED: (SUB_REVIEWING, SUB_REJECTED), SUB_REVIEWING: (SUB_ACCEPTED, SUB_RETURNED),
+             SUB_PENDING: (SUB_REJECTED,)}
+
+
+def _submit_updated(g: Graph, e: Event) -> Graph:
+    sid = e.get("submit")
+    _need(sid in g.submits, f"unknown submit {sid}")
+    s = g.submits[sid]
+    st = e.get("status")
+    _need(st in _SUB_NEXT.get(s.status, ()), f"submit {sid}: {s.status} -> {st} is not allowed")
+    failing = {str(k): list(v)[:20] for k, v in dict(e.get("failing") or {}).items()}
+    s2 = replace(s, status=st, reason=str(e.get("reason") or s.reason),
+                 failing=failing or s.failing, open=tuple(e.get("open") or s.open),
+                 accepted_seq=e.seq if st == SUB_ACCEPTED else s.accepted_seq)
+    g = _set_sub(g, s2)
+    for rid, fails in failing.items():               # 证据失败：需求仍是 open，记下没过的检查
+        r = g.requirements.get(rid)
+        if r is not None and r.status == REQ_OPEN:
+            g = _set_req(g, replace(r, last_failure=tuple(fails)))
+    return g
 
 
 # ======================================================================== 执行状态
@@ -426,14 +412,6 @@ def _compacted(g: Graph, e: Event) -> Graph:
     return replace(g, compactions=g.compactions + (c,))
 
 
-def _note(g: Graph, e: Event) -> Graph:
-    w = e.get("worker")
-    session = g.workers[w].session if w in g.workers else None
-    session = e.get("session", session)
-    note = Note(e.seq, e.t, w, session, e.get("kind"), e.get("text"), e.get("task"))
-    return replace(g, notes=g.notes + (note,))
-
-
 def _snapshot_taken(g: Graph, e: Event) -> Graph:
     _running(g)
     n = int(e.get("snapshot"))
@@ -443,7 +421,7 @@ def _snapshot_taken(g: Graph, e: Event) -> Graph:
     snap = Snapshot(n=n, seq=e.seq, t=e.t, worker=w, tree=e.get("tree"), raw_tree=e.get("raw_tree"), epoch=g.epoch,
                     reason=e.get("reason"), testable=bool(e.get("testable")), commit=e.get("commit", ""), base=base,
                     files=tuple(tuple(f) for f in (e.get("files") or ())), dropped=tuple(e.get("dropped") or ()),
-                    held=tuple(e.get("held") or ()), step=e.get("step"), session=e.get("session"),
+                    todo=e.get("todo"), session=e.get("session"),
                     tool_seq=int(e.get("tool_seq") or 0), precheck=e.get("precheck", ""))
     prev = g.wips.get(w)
     wip = Wip(worker=w, base=base, tree=snap.tree, raw_tree=snap.raw_tree, files=snap.files, dropped=snap.dropped,
@@ -452,7 +430,7 @@ def _snapshot_taken(g: Graph, e: Event) -> Graph:
 
 
 def _stall_detected(g: Graph, e: Event) -> Graph:
-    s = Stall(e.seq, e.t, e.get("kind"), e.get("action"), e.get("worker"), e.get("task"), e.get("detail", ""))
+    s = Stall(e.seq, e.t, e.get("kind"), e.get("action"), e.get("worker"), e.get("detail", ""))
     return replace(g, stalls=g.stalls + (s,))
 
 
@@ -525,17 +503,11 @@ def _checkpoint_attempted(g: Graph, e: Event) -> Graph:
     _need(n in g.snapshots, f"attempt on unknown snapshot {n}")
     snap = g.snapshots[n]
     _need(snap.tree == e.get("tree"), "attempt tree differs from its snapshot")
-    tasks = tuple(e.get("tasks") or ())
-    for tid in tasks:
-        t = _task(g, tid)
-        _need(t.status == REVIEW and t.review_attempt is None and t.review_checkpoint is None,
-              f"attempt task {tid} is not awaiting review")
-        g = _set_task(g, replace(t, review_attempt=aid))
     sel = e.get("selection")
     a = Attempt(id=aid, worker=e.get("worker"), trigger=e.get("trigger"), tree=e.get("tree"), base=e.get("base"),
-                tier=e.get("tier"), selection=None if sel is None else tuple(sel), tasks=tasks,
-                summary=e.get("summary", ""), raw_tree=e.get("raw_tree", ""), created_seq=e.seq, snapshot=n,
-                epoch=snap.epoch, lane=lane, kind=e.get("kind") or KIND_MILESTONE)
+                tier=e.get("tier"), selection=None if sel is None else tuple(sel), summary=e.get("summary", ""),
+                raw_tree=e.get("raw_tree", ""), created_seq=e.seq, snapshot=n, epoch=snap.epoch, lane=lane,
+                kind=e.get("kind") or KIND_AUTO)
     return replace(g, attempts=_put(g.attempts, aid, a))
 
 
@@ -545,12 +517,14 @@ def _attempt_superseded(g: Graph, e: Event) -> Graph:
     a = g.attempts[aid]
     _need(a.status == ATT_PENDING, f"attempt {aid} is {a.status}, only pending attempts can be superseded")
     g = replace(g, attempts=_put(g.attempts, aid, replace(a, status=ATT_SUPERSEDED, reason=e.get("reason"))))
-    cp = e.get("review_checkpoint")
-    for tid in a.tasks:
-        t = g.tasks[tid]
-        if t.status == REVIEW and t.review_attempt == aid:
-            _need(cp is not None and cp == g.head, f"superseded review attempt {aid} must hand {tid} to the head")
-            g = _set_task(g, replace(t, review_checkpoint=cp))
+    cp = e.get("submit_checkpoint")
+    if a.submit is not None and g.submits[a.submit].status == SUB_PENDING:
+        s = g.submits[a.submit]
+        if cp is not None:                          # 链头已经包含提交的快照：提交转到链头上判定
+            _need(cp == g.head, f"superseded submit attempt {aid} must hand {s.id} to the head")
+            g = _set_sub(g, replace(s, checkpoint=cp, status=SUB_CHECKPOINTED))
+        else:
+            g = _set_sub(g, replace(s, status=SUB_REJECTED, reason=f"cancelled ({e.get('reason')})"))
     return g
 
 
@@ -585,24 +559,21 @@ def _checkpoint_created(g: Graph, e: Event) -> Graph:
     _need(a.parent_commit == g.head_cp.commit, "CAS: the parent commit is no longer the head")
     _need(e.get("tree") == a.tree, "checkpoint tree differs from the verified tree")
     _need(cid == max(g.checkpoints) + 1, f"checkpoint ids are sequential (got {cid})")
-    held = tuple(sorted({l.task for l in g.leases.values() if l.worker == a.worker} | set(a.tasks)))
     level = CONFIRMED if a.tier == "full" else PROVISIONAL
     cp = Checkpoint(cid, e.get("commit"), a.tree, g.head, e.seq, e.t, attempt=aid, tier=a.tier, trigger=a.trigger,
-                    files=files, tasks=held, snapshot=a.snapshot, epoch=a.epoch, kind=a.kind, level=level,
+                    files=files, snapshot=a.snapshot, epoch=a.epoch, kind=a.kind, level=level,
                     confirmed_seq=e.seq if level == CONFIRMED else None,
-                    label=(a.summary or "").strip().split("\n")[0][:300])      # 手动存档的 summary 就是里程碑标签
+                    label=(a.summary or "").strip().split("\n")[0][:300])      # todo 条目 / 提交摘要就是标签
     g = replace(g, checkpoints=_put(g.checkpoints, cid, cp), head=cid,
                 attempts=_put(g.attempts, aid, replace(a, status=ATT_CREATED, checkpoint=cid)))
     g = replace(g, confirmed=latest_confirmed_ancestor(g, cid))
-    for tid in a.tasks:
-        t = g.tasks[tid]
-        if t.status == REVIEW and t.review_attempt == aid:
-            g = _set_task(g, replace(t, review_checkpoint=cid))
+    if a.submit is not None and g.submits[a.submit].status == SUB_PENDING:
+        g = _set_sub(g, replace(g.submits[a.submit], checkpoint=cid, status=SUB_CHECKPOINTED))
     wip = g.wips.get(a.worker)
     if wip is not None and wip.tree == a.tree:      # 存进去的正是当前的 WIP：它相对新存档没有未验证的改动了
         g = replace(g, wips=_put(g.wips, a.worker, replace(wip, base=cid, files=(), last_rejection=None)))
-    if a.kind in PROGRESS_KINDS:                    # 交接存档不算进展（确认与否都一样）
-        g = _progress(g, e, a.worker)
+    # 存档本身不算进展（后台在持续存档：一个不断写出能过门的半成品的 worker 不能因此永远“有进展”）；
+    # 进展只来自需求验证通过、证据检查第一次通过、提交与受阻、todo 被锚定
     return _check_passes(g, e, a.tree)
 
 
@@ -614,8 +585,10 @@ def _checkpoint_rejected(g: Graph, e: Event) -> Graph:
     regs = tuple(e.get("regressions") or ())
     a2 = replace(a, status=ATT_REJECTED, regressions=regs, flaky=tuple(e.get("flaky") or ()), reason=e.get("reason"))
     g = replace(g, attempts=_put(g.attempts, aid, a2))
+    if a.submit is not None and g.submits[a.submit].status == SUB_PENDING:
+        g = _set_sub(g, replace(g.submits[a.submit], status=SUB_REJECTED, reason=str(e.get("reason") or "")))
     wip = g.wips.get(a.worker)
-    if wip is not None and a.lane == LANE_FG:      # 只记 worker 声明的存档被拒；步骤与交接是中间态，不推给 worker
+    if wip is not None and a.lane == LANE_FG:      # 只记 worker 的提交被拒；后台的中间态测不过是常态，不推给 worker
         rej = {"attempt": aid, "seq": e.seq, "reason": e.get("reason"), "regressions": list(regs[:50]),
                "n_regressions": len(regs), "flaky": list(a2.flaky[:20]), "detail": e.get("detail", ""),
                "snapshot": a.snapshot, "kind": a.kind}
@@ -630,10 +603,8 @@ def _checkpoint_confirmed(g: Graph, e: Event) -> Graph:
     _need(cp is not None and not cp.abandoned, f"checkpoint {cid} is not on the chain")
     _need(cp.level != CONFIRMED and not cp.demoted, f"checkpoint {cid} is already {cp.level}")
     g = _set_cp(g, replace(cp, level=CONFIRMED, confirmed_seq=e.seq))
-    g = replace(g, confirmed=latest_confirmed_ancestor(g, g.head))
-    # 确认点前移算进展，但只对 worker 声明过的单元（手动、步骤、review、收尾）：否则一个不断写出能过门的半成品、
-    # 却从不完成任何东西的 worker，会因为后台提升而永远“有进展”，基于进展的停滞检测就失效了
-    return _progress(g, e, None) if cp.kind in PROGRESS_KINDS else g
+    # 确认点前移不算进展：否则一个不断写出能过门的半成品的 worker 会因为后台提升而永远“有进展”
+    return replace(g, confirmed=latest_confirmed_ancestor(g, g.head))
 
 
 def _checkpoint_demoted(g: Graph, e: Event) -> Graph:
@@ -647,16 +618,16 @@ def _checkpoint_demoted(g: Graph, e: Event) -> Graph:
 
 
 def _checkpoint_marked(g: Graph, e: Event) -> Graph:
-    """worker 声明的单元（手动存档、步骤、review）落在一个已有的自动 / 交接存档上：把它升级为里程碑。"""
+    """worker 声明的单元（勾掉的 todo、提交）落在一个已有的自动 / 交接 / todo 存档上：把它升级为里程碑（带标签）。"""
     _running(g)
     cid = int(e.get("checkpoint"))
     cp = g.checkpoints.get(cid)
     kind = e.get("kind")
     _need(cp is not None and cp.id != 0 and not cp.abandoned, f"cannot mark checkpoint {cid}")
-    _need(cp.kind in ("auto", "handoff") and kind in PROGRESS_KINDS, f"cannot mark {cp.kind} checkpoint {cid} {kind}")
-    label = cp.label or str(e.get("label") or "").strip().split("\n")[0][:300]
-    g = _set_cp(g, replace(cp, kind=kind, label=label))
-    return _progress(g, e, e.get("worker"))
+    _need(kind in MARKABLE_KINDS and cp.kind in (KIND_AUTO, KIND_HANDOFF, KIND_TODO) and cp.kind != kind,
+          f"cannot mark {cp.kind} checkpoint {cid} {kind}")
+    label = str(e.get("label") or "").strip().split("\n")[0][:300] or cp.label
+    return _set_cp(g, replace(cp, kind=kind, label=label))
 
 
 def _rollback(g: Graph, e: Event) -> Graph:
@@ -675,14 +646,13 @@ def _rollback(g: Graph, e: Event) -> Graph:
     cps = dict(g.checkpoints)
     for cid in chain_ids:
         cps[cid] = replace(cps[cid], abandoned=True)
-    for t in g.tasks.values():
-        _need(not (t.status in FINISHED and t.done_checkpoint in chain_ids),
-              f"task {t.id} is done on abandoned checkpoint {t.done_checkpoint}; reopen it first")
-        _need(not (t.status == REVIEW and t.review_checkpoint in chain_ids),
-              f"task {t.id} is reviewed on abandoned checkpoint {t.review_checkpoint}; reopen it first")
-    for s in g.steps.values():
-        _need(not (s.status == STEP_ANCHORED and s.checkpoint in chain_ids),
-              f"step {s.id} is anchored on abandoned checkpoint {s.checkpoint}; invalidate it first")
+    for r in g.requirements.values():
+        _need(not (r.status in (REQ_VERIFIED, REQ_SUBMITTED) and r.checkpoint in chain_ids),
+              f"requirement {r.id} is {r.status} on abandoned checkpoint {r.checkpoint}; reopen it first")
+    for t in g.todos.values():
+        _need(not (t.status == TODO_ANCHORED and t.checkpoint in chain_ids),
+              f"todo {t.id} is anchored on abandoned checkpoint {t.checkpoint}; invalidate it first")
+    _need(not any(x.status in SUB_OPEN for x in g.submits.values()), "rollback while a submit is in progress")
     epoch = g.epoch + 1
     g = replace(g, checkpoints=cps, head=to, epoch=epoch, epoch_base=_put(g.epoch_base, epoch, to))
     return replace(g, confirmed=latest_confirmed_ancestor(g, to))
@@ -754,18 +724,35 @@ def _diagnosis_recorded(g: Graph, e: Event) -> Graph:
 
 def _review_started(g: Graph, e: Event) -> Graph:
     _running(g)
-    t = _task(g, e.get("task"))
-    _need(t.status in (DONE_UNVERIFIED, BLOCKED), f"cannot review {t.id} in status {t.status}")
-    _need(t.review != "running", f"{t.id} is already under review")
-    return _set_task(g, replace(t, review="running", review_missing=()))
+    vid = e.get("review")
+    _need(vid not in g.reviews, f"review {vid} exists")
+    phase = e.get("phase")
+    _need(phase in ("done", "blocked"), f"bad review phase {phase}")
+    rids = tuple(e.get("requirements"))
+    _need(bool(rids), "a review needs requirements")
+    for rid in rids:
+        r = _req(g, rid)
+        _need(r.status == (REQ_SUBMITTED if phase == "done" else REQ_BLOCKED),
+              f"cannot review {rid} ({phase}) in status {r.status}")
+        _need(r.review != "running", f"{rid} is already under review")
+        g = _set_req(g, replace(r, review="running", review_missing=()))
+    v = Review(vid, phase, rids, e.get("checkpoint"), e.get("submit"), e.seq)
+    return replace(g, reviews=_put(g.reviews, vid, v))
 
 
 def _review_recorded(g: Graph, e: Event) -> Graph:
-    t = _task(g, e.get("task"))
-    _need(t.review == "running", f"{t.id} has no review in progress")
-    impl = e.get("implemented")
-    _need(impl in ("yes", "partial", "no", "reading", "none", "failed"), f"bad review result {impl}")
-    return _set_task(g, replace(t, review=impl, review_missing=tuple(e.get("missing") or ())[:30]))
+    vid = e.get("review")
+    _need(vid in g.reviews and g.reviews[vid].status == "running", f"review {vid} is not running")
+    v = g.reviews[vid]
+    results = {str(k): dict(x) for k, x in dict(e.get("results") or {}).items()}
+    for rid in v.requirements:
+        r = g.requirements[rid]
+        res = results.get(rid) or {"implemented": "failed"}
+        impl = res.get("implemented")
+        _need(impl in ("yes", "partial", "no", "reading", "none", "failed"), f"bad review result {impl}")
+        if r.review == "running":
+            g = _set_req(g, replace(r, review=impl, review_missing=tuple(res.get("missing") or ())[:30]))
+    return replace(g, reviews=_put(g.reviews, vid, replace(v, status="recorded", results=results)))
 
 
 def _checkpoint_labeled(g: Graph, e: Event) -> Graph:
@@ -779,9 +766,11 @@ def _check_waived(g: Graph, e: Event) -> Graph:
     worker = actor_worker(e.actor)
     _need(worker is not None, "a waiver comes from a worker's request")
     out = dict(g.waived)
+    rid = e.get("requirement")
+    _need(rid is None or rid in g.requirements, f"unknown requirement {rid}")
     for test in e.get("tests"):
         _need(g.baseline.get(test) == "pass", f"{test} is not in the regression gate")
-        out[test] = Waiver(test, e.seq, e.t, e.get("task"), worker, str(e.get("quote")), str(e.get("reason")))
+        out[test] = Waiver(test, e.seq, e.t, rid, worker, str(e.get("quote")), str(e.get("reason")))
     return replace(g, waived=out)
 
 
@@ -789,14 +778,14 @@ HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
     "run_started": _run_started, "runtime_recovered": _runtime_recovered, "clock_started": _clock_started,
     "run_suspended": _run_suspended,
     "deadline_reserve": _deadline_reserve, "finalize_started": _finalize_started, "delivered": _delivered,
-    "plan_proposed": _plan_proposed, "requirement_frozen": _requirement_frozen, "task_added": _task_added,
-    "task_split": _task_split, "task_claimed": _task_claimed, "task_released": _task_released,
-    "review_requested": _review_requested, "task_done": _task_done, "task_blocked": _task_blocked,
-    "task_reopened": _task_reopened,
-    "steps_planned": _steps_planned, "step_started": _step_started, "step_done": _step_done,
-    "step_anchored": _step_anchored, "step_invalidated": _step_invalidated,
+    "plan_proposed": _plan_proposed, "requirement_frozen": _requirement_frozen,
+    "requirement_verified": _requirement_verified, "requirement_submitted": _requirement_submitted,
+    "requirement_blocked": _requirement_blocked, "requirement_reopened": _requirement_reopened,
+    "todos_updated": _todos_updated, "todo_completed": _todo_completed, "todo_anchored": _todo_anchored,
+    "todo_invalidated": _todo_invalidated,
+    "submit_requested": _submit_requested, "submit_updated": _submit_updated,
     "session_started": _session_started, "session_resumed": _session_resumed, "session_ended": _session_ended,
-    "compacted": _compacted, "note": _note, "snapshot_taken": _snapshot_taken, "stall_detected": _stall_detected,
+    "compacted": _compacted, "snapshot_taken": _snapshot_taken, "stall_detected": _stall_detected,
     "job_started": _job_started, "job_preempted": _job_preempted, "job_finished": _job_finished,
     "baseline_recorded": _baseline_recorded,
     "checkpoint_attempted": _checkpoint_attempted, "attempt_superseded": _attempt_superseded,

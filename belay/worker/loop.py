@@ -6,7 +6,7 @@
   - 上下文过长时不做原地摘要压缩，而是让模型写交接说明后重建上下文；
   - 每一步写入只追加的轨迹，被取消时不丢记录；
   - 同一个 Worker 类也用来跑只读的探索子 agent（role="explore"），由 explore 工具调起。
-Belay（M2 起）：run_check / submit 等工具经 ToolContext.runtime 把请求投递给 Orchestrator；循环本身不变，
+Belay 的工具（submit、board 等）经 ToolContext.runtime 把请求投递给 runtime；循环本身不变，
 只多两个可注入的钩子：runtime 的通知在每轮工具结果后以 <system-reminder> 注入（drain_notices），
 上下文重开时的任务说明由 task_refresh 从证据图重建。Test Author 复用本循环，并用 system_prompt 换掉系统提示。
 """

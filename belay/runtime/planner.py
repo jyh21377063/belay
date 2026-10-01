@@ -1,4 +1,4 @@
-"""规划器：开工时把任务原文拆成需求与初始任务；停滞时提议拆分一个任务。
+"""规划器：开工时把任务原文拆成需求清单（actionable / context，可带已有测试作为检查项）。
 
 LLM 的产出只是提议，每一轮都记一条 plan_proposed（含校验报告）；校验不通过就把问题交回去重做，
 几轮之后仍不通过则退回机械切分（每个实质行一条需求，覆盖由构造保证）。
@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 from belay.core.events import LLM, RULE
 from belay.core.plan import mechanical_plan, renumber, validate_plan
-from belay.runtime.prompts import PLANNER_RETRY, PLANNER_SYSTEM, SPLIT_SYSTEM
+from belay.runtime.prompts import PLANNER_RETRY, PLANNER_SYSTEM
 
 
 @dataclass
@@ -28,7 +28,6 @@ class PlanRound:
 class PlanOutcome:
     rounds: list[PlanRound]
     requirements: list[dict]
-    tasks: list[dict]
     source: str                      # llm | rule（机械切分）
 
 
@@ -80,8 +79,7 @@ async def plan(llm, task_text: str, known_checks: list[str], rounds: int = 3,
             history.append(PlanRound(proposal, rep.ok, rep.problems if proposal else ["reply is not a JSON object"],
                                      rep.warnings))
             if rep.ok:
-                reqs, tasks = renumber(rep)
-                return PlanOutcome(history, reqs, tasks, LLM)
+                return PlanOutcome(history, renumber(rep), LLM)
             messages += [{"role": "assistant", "content": resp.content or [{"type": "text", "text": resp.text}]},
                          {"role": "user", "content": PLANNER_RETRY.format(problems="\n".join(
                              f"- {p}" for p in history[-1].problems[:40]))}]
@@ -90,24 +88,14 @@ async def plan(llm, task_text: str, known_checks: list[str], rounds: int = 3,
     history.append(PlanRound(proposal, rep.ok, rep.problems, rep.warnings, RULE))
     if not rep.ok:                                        # 机械切分按构造覆盖；到这里说明原文本身异常
         log(f"mechanical plan problems: {rep.problems[:5]}")
-    reqs, tasks = renumber(rep) if rep.ok else (proposal["requirements"], proposal["tasks"])
-    return PlanOutcome(history, reqs, tasks, RULE)
+    reqs = renumber(rep) if rep.ok else proposal["requirements"]
+    return PlanOutcome(history, reqs, RULE)
 
 
 def _mentioned_checks(proposal: dict) -> list[str]:
     """基线还没有时暂时接受提议里的检查名（基线之后由 driver 再校验）。"""
     out = []
-    for t in proposal.get("tasks") or [] if isinstance(proposal, dict) else []:
-        if isinstance(t, dict):
-            out += [str(c) for c in (t.get("checks") or [])]
+    for r in proposal.get("requirements") or [] if isinstance(proposal, dict) else []:
+        if isinstance(r, dict):
+            out += [str(c) for c in (r.get("checks") or [])]
     return out
-
-
-async def propose_split(llm, task_text: str, task: dict, requirements: dict[str, str], failures: list[str]) -> list[dict]:
-    """停滞时提议拆分；返回子任务列表（由 rules.split_task 校验）。"""
-    body = {"task": task, "linked_requirements": requirements, "recent_failures": failures[:20]}
-    msg = f"<task_statement>\n{task_text.strip()[:20000]}\n</task_statement>\n\n{json.dumps(body, ensure_ascii=False)}"
-    resp = await llm.call(SPLIT_SYSTEM, [], [{"role": "user", "content": msg}])
-    data = extract_json(resp.text) or {}
-    children = data.get("children")
-    return children if isinstance(children, list) else []

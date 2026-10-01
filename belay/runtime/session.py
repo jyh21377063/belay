@@ -3,11 +3,15 @@
 与 B 组 worker（belay/worker/loop.py）共用工具实现、模型客户端和系统提示主体；差别是：
   - 会话由 runtime 开启和结束，开场上下文来自 build_context；
   - 分层压缩：L0 大输出落盘、L1 清理过期结果（先保留 read_file）、L2 用图替换旧对话、L3 模型只写图里没有的东西、
-    L4 交接；到软阈值时若有进行中的步骤，暂缓 L2，等下一次 step_done 再交接（交接落在步骤边界）；
-  - 工具边界上的钩子：模型跑测试前拍快照、写类工具之后按限流拍快照、todo 列表即步骤计划；
+    L4 交接；到软阈值时若有进行中的 todo，暂缓 L2，等下一个自然停顿点（勾掉一条 todo、模型要跑测试、拿到提交结果）
+    再交接；
+  - 工具边界上的钩子：模型跑测试前拍快照、写类工具之后拍快照、todo 列表镜像到图上；
+  - submit 被接受时会话结束；模型停下不调用工具时先追问一次，再次停下就当作提交（结果交还给它，会话继续）；
+  - todo 提醒（学 Claude Code）：第一次改文件时还没有 todo 提醒一次，之后长时间没更新再提醒，有上限；
   - 每条追加进对话的消息都写进轨迹（message 记录），整体替换时写 messages_checkpoint：runtime 崩溃后可以读盘重放；
   - 模型接口多次重试仍失败时抛 ModelCallFailed：驱动可以在内存里原样重试同一个会话。
-会话返回时给出结束原因：done（模型不再调用工具）| handoff（L4 / 步骤边界）| deadline（runtime 要求停止）| max_turns。
+会话返回时给出结束原因：submitted（提交被接受）| done（模型不再调用工具，隐式提交用完）| handoff（L4 / 自然停顿点）|
+deadline（runtime 要求停止）| max_turns。
 """
 from __future__ import annotations
 
@@ -21,11 +25,16 @@ from belay.core.compact import count_results, l0_shrink, l1_clear, l2_rebuild, m
 from belay.core.config import BelayConfig
 from belay.env import Env
 from belay.llm import Response, Usage
-from belay.runtime.prompts import FULL_SUMMARY_PROMPT, L3_PROMPT, STEP_HINT
+from belay.runtime.prompts import FULL_SUMMARY_PROMPT, L3_PROMPT
 from belay.tools import Policy, Tool, ToolContext, ToolError
 from belay.worker.transcript import Transcript
 
 WRITE_TOOLS = ("edit_file", "write_file", "bash")
+NUDGE = "If every requirement is done, call submit; otherwise continue working."
+TODO_FIRST = ("Keeping a todo list (todo_write) is how your progress survives a context reset; for a simple change "
+              "you can skip it.")
+TODO_STALE = ("The todo list has not been updated recently. If it no longer matches what you are doing, update it; "
+              "if it is not useful for this task, ignore this note.")
 
 
 class ModelCallFailed(RuntimeError):
@@ -50,8 +59,10 @@ class SessionHooks(Protocol):
     async def before_tool(self, tu: dict) -> None: ...
     async def after_tools(self, tool_uses: list[dict], results: list, todos: Optional[list[dict]]) -> None: ...
     def write_guard(self): ...                          # 降级模式下写类工具与切换工作区的验证互斥（异步上下文管理器）
-    def step_count(self) -> int: ...
-    def has_active_step(self) -> bool: ...
+    def boundary_count(self) -> int: ...               # 自然停顿点计数：勾掉 todo、模型要跑测试、拿到提交结果
+    def has_active_todo(self) -> bool: ...
+    def has_todos(self) -> bool: ...
+    async def implicit_submit(self, summary: str) -> tuple[str, bool]: ...   # 模型停下不调用工具时当作提交
 
 
 @dataclass
@@ -93,7 +104,11 @@ class BelaySession:
         self.modified: list[str] = []                 # 本会话改过的文件，最近的在后（L2 重读）
         self.final_text = ""
         self.started = False
-        self._soft_mark: Optional[int] = None          # 到软阈值时的步骤计数
+        self._soft_mark: Optional[int] = None          # 到软阈值时的停顿点计数
+        self._nudged = False                           # 模型停下后已经追问过一次
+        self.implicit_submits = 0
+        self._last_todo_turn = 0
+        self._todo_reminders = 0
 
     # ---------------------------------------------------------------- 主循环
     async def run(self) -> SessionOutcome:
@@ -153,7 +168,10 @@ class BelaySession:
             self._append({"role": "assistant", "content": resp.content or [{"type": "text", "text": "(empty)"}]})
             if not tool_uses:
                 self.final_text = resp.text
-                return "done"
+                stop = await self._on_stop(resp.text)
+                if stop is not None:
+                    return stop
+                continue
             todos_before = json.dumps(self.ctx.todos)
             results = await self._execute(tool_uses)
             todos = self.ctx.todos if json.dumps(self.ctx.todos) != todos_before else None
@@ -162,13 +180,62 @@ class BelaySession:
             for tu, (out, err) in zip(tool_uses, results):
                 content.append({"type": "tool_result", "tool_use_id": tu["id"], "content": self._l0(tu, out),
                                 "is_error": err})
-            notes = self.hooks.notices()
+            notes = self._todo_notes(tool_uses, results) + self.hooks.notices()
             if notes:
                 content.append({"type": "text", "text": "".join(f"<system-reminder>{n}</system-reminder>" for n in notes)})
             self._append({"role": "user", "content": content})
             self.transcript.write("tool_result", results=[{"id": tu["id"], "name": tu["name"], "error": err,
                                                            "output": out} for tu, (out, err) in zip(tool_uses, results)],
                                   notices=notes)
+            if self.ctx.submitted:
+                return "submitted"
+
+    async def _on_stop(self, text: str) -> Optional[str]:
+        """模型停下不调用工具：先追问一次；再次停下就当作提交，把结果交还给它（被接受时会话结束）。
+        返回 None 表示会话继续。"""
+        if not self.cfg.nudge_on_stop:
+            return "done"
+        if not self._nudged:
+            self._nudged = True
+            self._append({"role": "user", "content": [{"type": "text",
+                                                       "text": f"<system-reminder>{NUDGE}</system-reminder>"}]})
+            self.transcript.write("nudge")
+            return None
+        if self.implicit_submits >= self.cfg.max_implicit_submits:
+            return "done"
+        self.implicit_submits += 1
+        reply, accepted = await self.hooks.implicit_submit(text)
+        self.transcript.write("implicit_submit", accepted=accepted, n=self.implicit_submits)
+        if accepted:
+            self.ctx.submitted = True
+            return "submitted"
+        self._nudged = False
+        self._append({"role": "user", "content": [{"type": "text", "text": (
+            "<system-reminder>You stopped without calling a tool, so the harness treated that as a submit. Its "
+            f"result:\n{reply}</system-reminder>")}]})
+        return None
+
+    def _todo_notes(self, tool_uses: list[dict], results: list) -> list[str]:
+        """学 Claude Code 的 todo 提醒：第一次改文件时还没有 todo 提醒一次；之后长时间没更新再提醒；有上限。"""
+        if "todo_write" not in self.tools:
+            return []
+        if any(tu["name"] == "todo_write" for tu in tool_uses):
+            self._last_todo_turn = self.turns
+            return []
+        if self._todo_reminders >= self.cfg.todo_reminder_max:
+            return []
+        wrote = any(tu["name"] in ("edit_file", "write_file") and not err
+                    for tu, (_out, err) in zip(tool_uses, results))
+        if wrote and self._todo_reminders == 0 and not self.ctx.todos and not self.hooks.has_todos():
+            self._todo_reminders += 1
+            self._last_todo_turn = self.turns
+            return [TODO_FIRST]
+        if self.turns - self._last_todo_turn >= self.cfg.todo_reminder_turns and \
+                (self.ctx.todos or self.hooks.has_todos() or self._todo_reminders > 0):
+            self._todo_reminders += 1
+            self._last_todo_turn = self.turns
+            return [TODO_STALE]
+        return []
 
     async def _call(self, tool_choice: Optional[dict] = None, messages: Optional[list[dict]] = None,
                     purpose: str = "turn") -> Response:
@@ -252,7 +319,7 @@ class BelaySession:
             if summary:
                 await self.hooks.record_compaction(4, before, 0, summary)
         self.transcript.write("handoff", context=before, compactions=len(self.compactions),
-                              at_step_boundary=self._soft_mark is not None)
+                              at_boundary=self._soft_mark is not None)
         return True
 
     async def _manage_context(self) -> bool:
@@ -264,17 +331,15 @@ class BelaySession:
         big = [c for c in self.compactions if c[0] >= 2]
         need_l2 = before >= cfg.l2_tokens
         if before >= cfg.l4_tokens or (need_l2 and len(big) >= cfg.l4_max_compactions):
-            return await self._handoff(before)                  # 硬阈值：可能在步骤中间，由恢复点处理部分改动
-        if before >= cfg.soft_handoff_tokens and self.hooks.has_active_step():
+            return await self._handoff(before)                  # 硬阈值：可能在半路，由恢复点处理部分改动
+        if before >= cfg.soft_handoff_tokens and self.hooks.has_active_todo():
             if self._soft_mark is None:
-                self._soft_mark = self.hooks.step_count()
-                if cfg.step_done_hint:
-                    self._append({"role": "user", "content": [{"type": "text", "text": STEP_HINT}]})
-                self.transcript.write("soft_handoff", context=before, steps=self._soft_mark)
+                self._soft_mark = self.hooks.boundary_count()
+                self.transcript.write("soft_handoff", context=before, boundaries=self._soft_mark)
                 return False
-            if self.hooks.step_count() > self._soft_mark:     # 当前步骤刚完成：交接落在步骤边界上
+            if self.hooks.boundary_count() > self._soft_mark:  # 刚到一个自然停顿点：在这里交接
                 return await self._handoff(before)
-            return False                                        # 暂缓 L2，等 step_done
+            return False                                        # 暂缓 L2，等下一个停顿点
         if need_l2:
             await self._l2_l3(before)
             return False

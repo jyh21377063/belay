@@ -1,12 +1,15 @@
 """状态转换规则：输入（worker 请求、观察、时钟）→ 事件。全部是纯函数。
 
 每个规则函数的第一个参数是 Tx：规则在 Tx 上 emit 事件，Tx 立刻把事件应用到自己的图副本上，
-所以同一个规则里后面的判断看到的是前面事件之后的状态（例如“存档创建后立即判定待验证的任务”）。
+所以同一个规则里后面的判断看到的是前面事件之后的状态（例如“存档创建后立即判定提交”）。
 runtime 在锁里调用规则，成功后把 tx.events 原样追加到日志；规则抛出 Rejected 时整个 Tx 被丢弃。
 
-自述可以发起转换（认领、放弃、声明做完、报告受阻、声明步骤完成），但“完成”“存档”“提升”只能由观察到的证据完成：
-task_done 只由 evaluate_review 在存档那棵树的作业结果上判定，checkpoint_created / checkpoint_confirmed 只在观察之后写入。
-LLM（诊断者、复查者）只能解释、只能收紧（重开任务），不能放宽。
+v7：worker 只做自然的事（读、改、跑测试、可选的 todo），唯一要求它做的声明是 submit。其余状态都由图从观察推出：
+  - 后台空闲时验证最新的可测快照（新快照胜出），通过就成为暂存点；
+  - 需求的证据检查（原始代码上不通过的已有测试）在链上存档里全部通过 → requirement_verified（rule）；
+  - submit：前台存档 → 逐条判定需求（verified / submitted / blocked / 证据失败）→ 复查者批量收紧 → 接受或交还清单。
+“验证通过”“存档”“提升”只能由观察到的证据完成；submitted / blocked 是自述，账本如实区分；
+LLM（诊断者、复查者）只能解释、只能收紧（重开需求），不能放宽。
 """
 from __future__ import annotations
 
@@ -16,18 +19,19 @@ from typing import Iterable, Optional
 from belay.core.config import BelayConfig
 from belay.core.events import (COMPACTOR, DIAGNOSER, LLM, OBSERVED, PLANNER, REVIEWER, RULE, RUNTIME, SELF_REPORT,
                                VERIFIER, Event, worker_actor)
-from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_PENDING, ATT_REJECTED, BLOCKED, CONFIRMED, DONE,
-                              DONE_UNVERIFIED, JOB_CANCELLED, JOB_FINISHED, JOB_RUNNING, JOB_UNKNOWN, KIND_AUTO,
-                              KIND_FINAL, KIND_HANDOFF, KIND_MILESTONE, KIND_REVIEW, KIND_STEP, LANE_BG, LANE_FG,
-                              OPEN, PROVISIONAL, REVIEW, RUN_RUNNING, SPLIT, STEP_ACTIVE, STEP_ANCHORED,
-                              STEP_DECLARED, STEP_PLANNED, WHERE_LIVE, WHERE_SLOT, WHERE_WORKSPACE, Graph, Snapshot)
-from belay.core.plan import normalize_ws, quote_in_text, validate_split
-from belay.core.queries import (all_resolved, chain, chain_ids, consecutive_crashes, current_step, focus_task,
-                                held_tasks, is_ancestor, last_session, latest_milestone, latest_snapshot, next_id, num,
-                                open_attempt, remaining_sec, reserve_sec, sessions_without_progress,
-                                snapshot_contained, snapshots_in_epoch, steps_of, unfinished_deps)
+from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_PENDING, ATT_REJECTED, CONFIRMED, JOB_CANCELLED,
+                              JOB_FINISHED, JOB_RUNNING, JOB_UNKNOWN, KIND_AUTO, KIND_FINAL, KIND_HANDOFF,
+                              KIND_SUBMIT, KIND_TODO, LANE_BG, LANE_FG, PROVISIONAL, REQ_BLOCKED, REQ_OPEN,
+                              REQ_SUBMITTED, REQ_VERIFIED, RUN_RUNNING, SUB_CHECKPOINTED, SUB_OPEN, SUB_PENDING,
+                              SUB_REVIEWING, TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED, TODO_PENDING, WHERE_LIVE,
+                              WHERE_SLOT, WHERE_WORKSPACE, Graph, Snapshot)
+from belay.core.plan import normalize_ws, quote_in_text
+from belay.core.queries import (actionable, chain, chain_ids, consecutive_crashes, current_todo, evidence_checks,
+                                is_ancestor, last_session, latest_milestone, latest_snapshot, latest_submit,
+                                mentioned_requirements, next_id, num, open_attempt, open_requirements, open_submit,
+                                remaining_sec, reserve_sec, reviews_running, sessions_without_progress,
+                                snapshot_contained, snapshots_in_epoch, submit_accepted, todos_in_order)
 from belay.core.reduce import apply
-from belay.core.suggest import suggestion_rank
 from belay.core.verify import (PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED, check_unit,
                                classify_baseline, failure_signature, finished_covers, full_verified, jobs_by_tree,
                                active_guard, guard_in_selection, guard_set, is_cmd, is_test_path, job_key,
@@ -35,14 +39,13 @@ from belay.core.verify import (PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED
                                running_covers, suite_layout, test_files_of, units)
 
 BLOCK_KINDS = ("insufficient_info", "environment", "check_conflict")
-TRIGGER_KIND = {"worker": KIND_MILESTONE, "review": KIND_REVIEW, "auto": KIND_AUTO, "step": KIND_STEP,
-                "handoff": KIND_HANDOFF, "session_end": KIND_HANDOFF, "deadline": KIND_FINAL, "final": KIND_FINAL}
-# 后台验证只取这些语义节点拍下的快照；其余快照（写操作、模型跑测试、恢复、回退……）只存不验，供恢复与二分使用。
-# 为前台意图拍的快照（手动存档、review、按门自查、收尾）由发起者自己验证。
-PRIORITY_SNAPSHOT_REASONS = {"step_done": "step", "handoff": "handoff", "session_end": "session_end"}
+TRIGGER_KIND = {"auto": KIND_AUTO, "todo": KIND_TODO, "submit": KIND_SUBMIT, "handoff": KIND_HANDOFF,
+                "session_end": KIND_HANDOFF, "deadline": KIND_FINAL, "final": KIND_FINAL}
 HANDOFF_REASONS = ("handoff", "session_end")
+# 为前台意图拍的快照：由发起者自己验证，后台不取
+FOREGROUND_REASONS = ("submit", "final", "deadline")
 # worker 声明“做完了”的存档：只有它们被拒或被降级时才定位、诊断并通知 worker
-DECLARED_KINDS = (KIND_MILESTONE, KIND_REVIEW)
+DECLARED_KINDS = (KIND_SUBMIT,)
 
 
 class Rejected(Exception):
@@ -163,147 +166,13 @@ def propose_plan(tx: Tx, round_: int, proposal: dict, valid: bool, problems: lis
             warnings=list(warnings or [])[:50], proposal=proposal, purpose=purpose)
 
 
-def freeze_plan(tx: Tx, requirements: list[dict], tasks: list[dict], source: str = LLM) -> None:
-    """需求一次性冻结；初始任务按拓扑顺序加入（调用方已校验）。"""
+def freeze_plan(tx: Tx, requirements: list[dict], source: str = LLM) -> None:
+    """需求一次性冻结（调用方已校验）。"""
     tx.emit("requirement_frozen", PLANNER, RULE,
             requirements=[{**r, "origin": "llm" if source == LLM else "rule"} for r in requirements])
-    for t in tasks:
-        tx.emit("task_added", PLANNER, source, task=t["id"], title=t["title"], description=t.get("description", ""),
-                links=list(t["links"]), blocked_by=list(t.get("blocked_by") or []),
-                priority=int(t.get("priority") or 0), checks=list(t.get("checks") or []))
 
 
-# ======================================================================== worker 的请求：任务
-
-def _held_active(g: Graph, worker: str, task_id: str):
-    t = g.tasks.get(task_id)
-    if t is None:
-        raise Rejected(f"Unknown task {task_id}.")
-    lease = g.leases.get(task_id)
-    if lease is None or lease.worker != worker or t.status != ACTIVE:
-        state = f"held by {lease.worker}" if lease else t.status
-        raise Rejected(f"You do not hold {task_id} as an active task (it is {state}). Claim it first.")
-    return t
-
-
-def claim(tx: Tx, worker: str, task_id: str) -> str:
-    """认领 = 设为当前焦点。依赖只是排序提示：依赖未完成也可以认领，回复里会提示。"""
-    g, cfg = tx.g, tx.cfg
-    t = g.tasks.get(task_id)
-    if t is None:
-        raise Rejected(f"Unknown task {task_id}.")
-    lease = g.leases.get(task_id)
-    if lease is not None:
-        if lease.worker == worker:
-            return "already"
-        raise Rejected(f"{task_id} is held by {lease.worker}.")
-    if t.status == SPLIT:
-        raise Rejected(f"{task_id} was split into {', '.join(t.children)}; claim one of those.")
-    if t.status == DONE:
-        raise Rejected(f"{task_id} is done: its checks passed on checkpoint {t.done_checkpoint}.")
-    rank = suggestion_rank(g, worker, task_id, tx.now, cfg)
-    if t.status in (BLOCKED, DONE_UNVERIFIED):
-        tx.emit("task_reopened", worker_actor(worker), RULE, task=task_id, reason="reclaimed")
-    tx.emit("task_claimed", worker_actor(worker), RULE, task=task_id, worker=worker, head=tx.g.head,
-            suggested_rank=rank)
-    return "claimed"
-
-
-def claim_hint(g: Graph, task_id: str) -> str:
-    deps = unfinished_deps(g, g.tasks[task_id])
-    return f"Its dependencies {', '.join(deps)} are not finished yet." if deps else ""
-
-
-def release(tx: Tx, worker: str, task_id: str, note: str = "") -> None:
-    _held_active(tx.g, worker, task_id)
-    tx.emit("task_released", worker_actor(worker), RULE, task=task_id, worker=worker)
-    if note.strip():
-        tx.emit("note", worker_actor(worker), SELF_REPORT, worker=worker, kind="released", task=task_id,
-                text=f"[released {task_id}] {note.strip()}")
-
-
-def add_task(tx: Tx, worker: str, title: str, links: Iterable[str], description: str = "",
-             blocked_by: Iterable[str] = (), discovered_from: Optional[str] = None,
-             checks: Iterable[str] = ()) -> str:
-    g = tx.g
-    title = (title or "").strip()
-    if not title:
-        raise Rejected("A task needs a title.")
-    links = [str(x) for x in links]
-    if not links:
-        raise Rejected("Link the task to at least one requirement (e.g. links=[\"R2\"]).")
-    bad = [x for x in links if x not in g.requirements]
-    if bad:
-        raise Rejected(f"Unknown requirement(s) {bad}. Requirements: {', '.join(sorted(g.requirements, key=num))}.")
-    blocked_by = [str(x) for x in blocked_by]
-    bad = [x for x in blocked_by if x not in g.tasks]
-    if bad:
-        raise Rejected(f"Unknown task(s) in blocked_by: {bad}.")
-    checks = [str(c) for c in checks]
-    bad = [c for c in checks if c not in known_checks(g)]
-    if bad:
-        raise Rejected(f"Unknown check(s) {bad[:5]}: a task can only be verified by checks that exist on the "
-                       "original code (tests you write yourself are development signals, not verification).")
-    if discovered_from is None:
-        f = focus_task(g, worker)
-        discovered_from = f.id if f is not None and f.status == ACTIVE else None
-    elif discovered_from not in g.tasks:
-        raise Rejected(f"Unknown task {discovered_from}.")
-    tid = next_id("T", g.tasks)
-    tx.emit("task_added", worker_actor(worker), SELF_REPORT, task=tid, title=title[:200],
-            description=(description or "")[:2000], links=links, blocked_by=blocked_by,
-            discovered_from=discovered_from, checks=checks)
-    return tid
-
-
-def split_task(tx: Tx, task_id: str, children: list[dict], actor: str = PLANNER, source: str = LLM) -> list[str]:
-    g = tx.g
-    parent = g.tasks.get(task_id)
-    if parent is None or parent.status not in (OPEN, ACTIVE, BLOCKED):
-        raise Rejected(f"{task_id} cannot be split now.")
-    clean, problems = validate_split(parent.links, children, g.requirements, known_checks(g))
-    if problems:
-        raise Rejected("; ".join(problems))
-    start = num(next_id("T", g.tasks))
-    specs = []
-    for i, c in enumerate(clean):
-        specs.append({**c, "id": f"T{start + i}", "blocked_by": list(parent.blocked_by)})
-    tx.emit("task_split", actor, source, task=task_id, children=specs)
-    return [s["id"] for s in specs]
-
-
-def note(tx: Tx, worker: str, text: str, kind: str = "note") -> None:
-    text = (text or "").strip()
-    if not text:
-        raise Rejected("Empty note.")
-    f = focus_task(tx.g, worker)
-    tx.emit("note", worker_actor(worker), SELF_REPORT, worker=worker, kind=kind, text=text[:4000],
-            task=f.id if f is not None else None)
-
-
-def report_blocked(tx: Tx, worker: str, task_id: str, kind: str, reason: str, quote: Optional[str] = None) -> None:
-    g = tx.g
-    t = g.tasks.get(task_id)
-    if t is None:
-        raise Rejected(f"Unknown task {task_id}.")
-    if kind not in BLOCK_KINDS:
-        raise Rejected(f"kind must be one of {', '.join(BLOCK_KINDS)}.")
-    if not (reason or "").strip():
-        raise Rejected("Give a reason.")
-    lease = g.leases.get(task_id)
-    if lease is not None and lease.worker != worker:
-        raise Rejected(f"{task_id} is held by {lease.worker}.")
-    if t.status not in (OPEN, ACTIVE, REVIEW):
-        raise Rejected(f"{task_id} is {t.status}; only unfinished tasks can be reported blocked.")
-    if t.status == REVIEW and t.review_checkpoint is None and t.review_attempt is not None:
-        raise Rejected(f"{task_id} is being checked right now; wait for the result.")
-    if kind == "check_conflict":
-        if not quote or not quote_in_text(quote, g.run.task):
-            raise Rejected("A check_conflict report must quote the task text verbatim (quote=...). The conflict is "
-                           "recorded, not waived: the regression gate does not change.")
-    tx.emit("task_blocked", worker_actor(worker), SELF_REPORT, task=task_id, kind=kind, reason=reason.strip()[:2000],
-            quote=normalize_ws(quote)[:1000] if quote else None)
-
+# ======================================================================== 回归门豁免
 
 def _observed_failing(g: Graph, test: str) -> bool:
     """这个检查在 worker 的某个候选树上失败过：只看非 live 的作业（候选树已剔除测试改动，worker 改不了测试本身）。"""
@@ -312,19 +181,21 @@ def _observed_failing(g: Graph, test: str) -> bool:
     return any(tree != base and point_status(g, tree, test, index) == PT_FAIL for tree in index)
 
 
-def waive_checks(tx: Tx, worker: str, task_id: str, tests: Iterable[str], quote: str, reason: str) -> list[str]:
+def waive_checks(tx: Tx, worker: str, tests: Iterable[str], quote: str, reason: str,
+                 requirement: Optional[str] = None) -> list[str]:
     """worker 声明一些现有测试与任务原文明确要求的行为冲突：规则校验后把它们从回归门里去掉（check_waived）。
 
-    校验：worker 持有这个任务；引文逐字出现在任务原文里（至少三个词）；每个检查都在守护集合里、不是公开检查
-    （cmd:），并且确实在 worker 的某个候选树上失败过（不能预先豁免）；总数不超过 waive_max_tests。
-    豁免只改变门检查什么，不改变任务的检查项；每一条都写进账本。返回新豁免的检查。"""
+    校验：引文逐字出现在任务原文里（至少三个词）；每个检查都在守护集合里、不是公开检查（cmd:），并且确实在
+    worker 的某个候选树上失败过（不能预先豁免）；总数不超过 waive_max_tests。
+    豁免只改变门检查什么，不改变需求的检查项；每一条都写进账本。返回新豁免的检查。"""
     g, cfg = tx.g, tx.cfg
     if not cfg.waivers:
-        raise Rejected("Waivers are disabled for this run: keep the existing behaviour, or report the conflict with "
-                       "report_blocked(kind=\"check_conflict\").")
-    _held_active(g, worker, task_id)
+        raise Rejected("Waivers are disabled for this run: keep the existing behaviour, or report the conflict in "
+                       "submit(blocked=[{requirement, kind: \"check_conflict\", reason, quote}]).")
     if not g.baseline_ready:
         raise Rejected("The harness is still setting up; try again shortly.")
+    if requirement is not None and requirement not in g.requirements:
+        raise Rejected(f"Unknown requirement {requirement}.")
     if not (reason or "").strip():
         raise Rejected("Give a reason: what the task asks for and how the test contradicts it.")
     q = normalize_ws(quote or "")
@@ -344,168 +215,117 @@ def waive_checks(tx: Tx, worker: str, task_id: str, tests: Iterable[str], quote:
         elif t not in guard:
             problems.append(f"{t}: not in the regression gate")
         elif not _observed_failing(g, t):
-            problems.append(f"{t}: the harness has not seen it fail on your changes; checkpoint first, or run "
-                            "run_check(as_gate=true)")
+            problems.append(f"{t}: the harness has not seen it fail on your changes; call submit first so that "
+                            "the gate runs on them")
     if problems:
         raise Rejected("Nothing was waived:\n" + "\n".join(f"- {p}" for p in problems[:20]))
     if len(g.waived) + len(tests) > cfg.waive_max_tests:
         raise Rejected(f"At most {cfg.waive_max_tests} checks can be waived in a run ({len(g.waived)} already are). "
                        "If this many existing tests contradict the task, the change is probably broader than the "
                        "task asks for.")
-    tx.emit("check_waived", worker_actor(worker), RULE, task=task_id, tests=tests, quote=q[:1000],
+    tx.emit("check_waived", worker_actor(worker), RULE, requirement=requirement, tests=tests, quote=q[:1000],
             reason=reason.strip()[:2000])
     _cascade(tx)
     return tests
 
 
-# ======================================================================== 步骤（模块 H）
-
-_TODO_STATUS = {"pending": STEP_PLANNED, "in_progress": STEP_ACTIVE}
-
+# ======================================================================== todo（运行级步骤，模块 H）
 
 def _norm_title(s: str) -> str:
     return normalize_ws(s).lower()
 
 
-def plan_steps(tx: Tx, worker: str, todos: list[dict], snapshot: Optional[int] = None,
-               files: Iterable = ()) -> Optional[str]:
-    """todo 列表 = 焦点任务的步骤计划（每次调用立即写入）。未持有任务时写成普通笔记。
-
-    新标为 completed 的条目按 step_done 处理：锚点是调用方为它拍的快照（snapshot）。返回焦点任务 id。
-    """
+def update_todos(tx: Tx, worker: str, todos: list[dict], snapshot: Optional[int] = None) -> list[str]:
+    """todo_write 的列表镜像到图上（每次调用立即写入，按标题匹配保持 id 稳定）。新标为 completed 的条目记为
+    todo_completed，锚点是调用方为它强制拍下的快照（snapshot）。返回新完成的 todo id。"""
     g = tx.g
-    t = focus_task(g, worker)
-    if t is None or t.status != ACTIVE:
-        if todos:
-            mark = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
-            text = "\n".join(f"{mark.get(x.get('status'), '[ ]')} {x.get('content', '')}" for x in todos)
-            tx.emit("note", worker_actor(worker), SELF_REPORT, worker=worker, kind="todos", text=text[:4000])
-        return None
-    existing = steps_of(g, t.id)
-    by_title = {_norm_title(s.title): s for s in existing}
-    next_n = max([s.n for s in existing] + [0]) + 1
-    specs, completed = [], []
+    existing = todos_in_order(g)
+    by_title = {_norm_title(t.title): t for t in existing}
+    next_n = max([t.n for t in g.todos.values()] + [0]) + 1
+    specs, completed, seen = [], [], set()
     for order, item in enumerate(todos):
         title = str(item.get("content") or "").strip()[:300]
-        if not title:
+        key = _norm_title(title)
+        if not title or key in seen:
             continue
-        cur = by_title.get(_norm_title(title))
+        seen.add(key)
+        cur = by_title.get(key)
         status = item.get("status", "pending")
         if cur is None:
-            sid, n = f"{t.id}.{next_n}", next_n
+            tid, n = f"P{next_n}", next_n
             next_n += 1
         else:
-            sid, n = cur.id, cur.n
-        if cur is not None and cur.status in (STEP_DECLARED, STEP_ANCHORED):
+            tid, n = cur.id, cur.n
+        if cur is not None and cur.status in (TODO_COMPLETED, TODO_ANCHORED):
             st = cur.status
         elif status == "completed":
-            st = STEP_ACTIVE
-            completed.append(sid)
+            st = TODO_ACTIVE
+            completed.append(tid)
         else:
-            st = _TODO_STATUS.get(status, STEP_PLANNED)
-        specs.append({"id": sid, "n": n, "title": title, "status": st, "order": order})
-    old = {s.id: (s.title, s.status, s.order) for s in existing}
-    new = {x["id"]: (x["title"], x["status"], x["order"]) for x in specs}
-    dropped = [sid for sid, (_, st, _) in old.items() if sid not in new and st in (STEP_PLANNED, STEP_ACTIVE)]
-    if dropped or any(old.get(sid) != v for sid, v in new.items()):
-        tx.emit("steps_planned", worker_actor(worker), SELF_REPORT, worker=worker, task=t.id, steps=specs,
-                diff={"added": sorted(set(new) - set(old)), "dropped": dropped,
-                      "changed": sorted(sid for sid in new if sid in old and old[sid] != new[sid])})
-    for sid in completed:
-        if snapshot is not None:
-            _declare_step(tx, worker, sid, snapshot, "", files)
-    if completed:
+            st = TODO_ACTIVE if status == "in_progress" else TODO_PENDING
+        specs.append({"id": tid, "n": n, "title": title, "status": st, "order": order,
+                      "requirements": mentioned_requirements(g, title)})
+    old = {t.id: (t.title, t.status, t.order, t.requirements) for t in existing}
+    new = {x["id"]: (x["title"], x["status"], x["order"], tuple(x["requirements"])) for x in specs}
+    dropped = [tid for tid, (_, st, _, _) in old.items() if tid not in new and st in (TODO_PENDING, TODO_ACTIVE)]
+    if dropped or any(old.get(tid) != v for tid, v in new.items()):
+        tx.emit("todos_updated", worker_actor(worker), SELF_REPORT, worker=worker, todos=specs,
+                diff={"added": sorted(set(new) - set(old), key=num), "dropped": dropped,
+                      "changed": sorted((t for t in new if t in old and old[t] != new[t]), key=num)})
+    if completed and snapshot is not None:
+        for tid in completed:
+            _complete_todo(tx, worker, tid, snapshot)
         refresh_anchors(tx)
         schedule_background(tx)
-    return t.id
+    return completed if snapshot is not None else []
 
 
-def newly_completed(g: Graph, worker: str, todos: list[dict]) -> bool:
-    """这次 todo 更新里有没有新标为 completed、还没声明完成的步骤（调用方据此先拍锚点快照）。"""
-    t = focus_task(g, worker)
-    if t is None or t.status != ACTIVE:
-        return False
-    by_title = {_norm_title(s.title): s for s in steps_of(g, t.id)}
+def newly_completed(g: Graph, todos: list[dict]) -> bool:
+    """这次 todo 更新里有没有新标为 completed 的条目（调用方据此先拍锚点快照）。"""
+    by_title = {_norm_title(t.title): t for t in g.todos.values()}
     for item in todos:
         if item.get("status") == "completed":
             cur = by_title.get(_norm_title(str(item.get("content") or "")))
-            if cur is None or cur.status in (STEP_PLANNED, STEP_ACTIVE):
+            if cur is None or cur.status in (TODO_PENDING, TODO_ACTIVE):
                 return True
     return False
 
 
-def step_done(tx: Tx, worker: str, snapshot: int, summary: str = "", files: Iterable = ()) -> str:
-    """标记当前步骤完成：锚点是调用方刚强制拍下的快照；worker 不等待验证。返回步骤 id。"""
+def _complete_todo(tx: Tx, worker: str, tid: str, snapshot: int) -> None:
     g = tx.g
-    if snapshot is None or snapshot not in g.snapshots:
-        raise Rejected("The harness is still setting up; try again shortly.")
-    t = focus_task(g, worker)
-    if t is None or t.status != ACTIVE:
-        raise Rejected("step_done marks a step of the task you are working on; claim a task first.")
-    cur = current_step(g, t.id)
-    if cur is None:
-        n = max([s.n for s in steps_of(g, t.id)] + [0]) + 1
-        title = (summary or "").strip().split("\n")[0][:200] or f"step {n}"
-        specs = [{"id": s.id, "n": s.n, "title": s.title, "status": s.status, "order": s.order}
-                 for s in steps_of(g, t.id) if s.status in (STEP_PLANNED, STEP_ACTIVE)]
-        sid = f"{t.id}.{n}"
-        specs.append({"id": sid, "n": n, "title": title, "status": STEP_ACTIVE, "order": len(steps_of(g, t.id))})
-        tx.emit("steps_planned", worker_actor(worker), SELF_REPORT, worker=worker, task=t.id, steps=specs,
-                diff={"added": [sid]})
-    else:
-        sid = cur.id
-    _declare_step(tx, worker, sid, snapshot, summary, files)
-    refresh_anchors(tx)
-    schedule_background(tx)
-    return sid
-
-
-def start_step(tx: Tx, worker: str, step_id: str) -> None:
-    s = tx.g.steps.get(step_id)
-    if s is not None and s.status == STEP_PLANNED:
-        tx.emit("step_started", worker_actor(worker), SELF_REPORT, worker=worker, step=step_id)
-
-
-def _declare_step(tx: Tx, worker: str, sid: str, snapshot: int, summary: str, files: Iterable) -> None:
-    g = tx.g
-    s = g.steps[sid]
-    if s.status not in (STEP_PLANNED, STEP_ACTIVE):
+    t = g.todos[tid]
+    if t.status not in (TODO_PENDING, TODO_ACTIVE):
         return
     snap = g.snapshots.get(snapshot)
     head = g.head_cp
     anchor, epoch = snapshot, (snap.epoch if snap else g.epoch)
     if snap is not None and head is not None and snap.tree == head.tree:
         anchor, epoch = head.snapshot, head.epoch      # 状态已经在链头上：锚点就是链头的快照
-    tx.emit("step_done", worker_actor(worker), SELF_REPORT, worker=worker, step=sid, snapshot=anchor,
-            anchor_epoch=epoch, summary=(summary or "")[:1000], files=[list(f) for f in files][:100])
-
-
-def holder_of(g: Graph, task_id: str) -> Optional[str]:
-    lease = g.leases.get(task_id)
-    return lease.worker if lease else None
+    tx.emit("todo_completed", worker_actor(worker), SELF_REPORT, worker=worker, todo=tid, snapshot=anchor,
+            anchor_epoch=epoch)
 
 
 def _mark(tx: Tx, cid: int, kind: str, label: str = "", worker: Optional[str] = None) -> None:
     cp = tx.g.checkpoints.get(cid)
-    if cp is not None and cp.id != 0 and not cp.abandoned and cp.kind in (KIND_AUTO, KIND_HANDOFF) and \
-            kind in (KIND_MILESTONE, KIND_STEP, KIND_REVIEW, KIND_FINAL):
+    if cp is not None and cp.id != 0 and not cp.abandoned and cp.kind in (KIND_AUTO, KIND_HANDOFF, KIND_TODO) and \
+            kind in (KIND_TODO, KIND_SUBMIT) and cp.kind != kind:
         tx.emit("checkpoint_marked", RUNTIME, RULE, checkpoint=cid, kind=kind, label=(label or "")[:300],
                 worker=worker)
 
 
 def mark_head(tx: Tx, worker: str, kind: str, label: str = "") -> None:
-    """worker 要存的状态已经是链头（后台已经存过）：把链头升级为里程碑，回退的默认目标才会落在这里。"""
+    """worker 声明的单元已经是链头（后台已经存过）：把链头升级为里程碑并带上标签。"""
     _mark(tx, tx.g.head, kind, label, worker)
 
 
 def refresh_anchors(tx: Tx) -> None:
-    """已声明的步骤：锚点被链上某个同段存档包含时写 step_anchored。"""
-    for s in sorted(tx.g.steps.values(), key=lambda s: (s.task, s.n)):
-        if s.status == STEP_DECLARED:
-            cid = snapshot_contained(tx.g, s.anchor_snapshot, s.anchor_epoch)
+    """勾掉的 todo：锚点被链上某个同段存档包含时写 todo_anchored，并把那个存档标成 todo 存档（标签 = 条目）。"""
+    for t in sorted(tx.g.todos.values(), key=lambda t: t.n):
+        if t.status == TODO_COMPLETED:
+            cid = snapshot_contained(tx.g, t.anchor_snapshot, t.anchor_epoch)
             if cid is not None:
-                tx.emit("step_anchored", RUNTIME, RULE, step=s.id, checkpoint=cid)
-                _mark(tx, cid, KIND_STEP, s.summary or s.title, holder_of(tx.g, s.task))
+                tx.emit("todo_anchored", RUNTIME, RULE, todo=t.id, checkpoint=cid)
+                _mark(tx, cid, KIND_TODO, t.title)
 
 
 # ======================================================================== 快照（模块 B）
@@ -520,56 +340,59 @@ def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
     if same and not (reason in HANDOFF_REASONS and last.reason not in HANDOFF_REASONS):
         return last.n
     n = g.last_snapshot + 1
-    f = focus_task(g, worker)
-    cur = current_step(g, f.id) if f is not None else None
+    cur = current_todo(g)
     ws = g.workers.get(worker)
     tx.emit("snapshot_taken", RUNTIME, OBSERVED, snapshot=n, worker=worker, tree=obs.tree, raw_tree=obs.raw_tree,
             reason=reason, testable=bool(obs.testable), commit=obs.commit, base=g.head,
             files=[list(x) for x in obs.files][:500], dropped=list(obs.dropped)[:200],
-            held=[t.id for t in held_tasks(g, worker)], step=cur.id if cur else None,
-            session=obs.session or (ws.session if ws else None), tool_seq=obs.tool_seq, precheck=obs.precheck[:1000])
+            todo=cur.id if cur else None, session=obs.session or (ws.session if ws else None),
+            tool_seq=obs.tool_seq, precheck=obs.precheck[:1000])
     schedule_background(tx)
     return n
 
 
-def _priority_candidate(g: Graph, worker: str) -> Optional[tuple[Snapshot, str, str]]:
-    """后台线要验证的快照：还没被包含的步骤锚点、比链头新的交接快照（最早的先）。返回（快照, 触发, 标签）。"""
+def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Snapshot, str, str]]:
+    """后台要验证的快照：这个 worker 同一段里最新的可测快照（比链头新、它的树在这一段还没尝试过）。
+    mode=handoff 或降级模式（验证要切换工作区）只验证交接 / 会话结束的快照。返回（快照, 触发, 标签）。"""
     head = g.head_cp
-    attempted = {a.snapshot for a in g.attempts.values()}
-    out: list[tuple[int, Snapshot, str, str]] = []
-    if not g.degraded:
-        for s in g.steps.values():
-            if s.status != STEP_DECLARED or s.anchor_snapshot not in g.snapshots:
-                continue
-            snap = g.snapshots[s.anchor_snapshot]
-            if snap.worker == worker and snap.testable and snap.epoch == g.epoch and snap.n not in attempted \
-                    and snap.tree != head.tree and not snap.lost:
-                out.append((snap.n, snap, "step", s.summary or s.title))
-    for snap in g.snapshots.values():
-        if snap.worker == worker and snap.reason in HANDOFF_REASONS and snap.epoch == g.epoch and \
-                snap.n not in attempted and snap.testable and snap.tree != head.tree and not snap.lost and \
-                not (head.epoch == snap.epoch and head.snapshot >= snap.n):
-            out.append((snap.n, snap, PRIORITY_SNAPSHOT_REASONS[snap.reason], ""))
-    out = [x for x in out if not (head.epoch == x[1].epoch and head.snapshot >= x[0])]
-    if not out:
-        return None
-    _, snap, trig, label = min(out, key=lambda x: x[0])
-    return snap, trig, label
+    only_handoff = g.degraded or mode == "handoff"
+    tried = {a.tree for a in g.attempts.values() if a.epoch == g.epoch}
+    for n in sorted(g.snapshots, reverse=True):
+        snap = g.snapshots[n]
+        if snap.worker != worker or snap.epoch != g.epoch or snap.lost:
+            continue
+        if head.epoch == snap.epoch and head.snapshot >= snap.n:
+            return None                             # 更旧的快照已经被链头覆盖
+        if snap.reason in FOREGROUND_REASONS:
+            return None                             # 提交 / 收尾拍的快照由发起者在前台验证
+        if only_handoff and snap.reason not in HANDOFF_REASONS:
+            continue
+        if snap.tree == head.tree or snap.tree in tried:
+            return None                             # 最新的状态已经验证过（或正是链头）：等新的改动
+        if not snap.testable:
+            continue                                # 预检不过：往前找最近的可测快照
+        trig = "handoff" if snap.reason in HANDOFF_REASONS else "auto"
+        done = [t for t in g.todos.values() if t.status == TODO_COMPLETED and t.anchor_snapshot == snap.n]
+        if done and trig == "auto":
+            return snap, "todo", done[0].title
+        return snap, trig, ""
+    return None
 
 
 def schedule_background(tx: Tx) -> None:
-    """后台验证线：只验证语义节点（步骤锚点、交接、会话结束）的快照，同一时刻每个 worker 最多一个后台尝试。
-    没有基于时间或写操作次数的自动存档：普通快照只存不验。后台尝试被拒时链头不动，也不通知 worker、不定位。"""
+    """后台验证线：同一时刻每个 worker 最多一个后台尝试；空闲时验证最新的可测快照（新快照胜出）。
+    没有基于时间的存档。后台尝试被拒时链头不动，也不通知 worker、不定位：中间态测不过是常态。"""
     g = tx.g
-    if not _running_run(g) or g.run.finalizing or g.run.reserve or not g.baseline_ready or g.head_cp is None:
+    if not _running_run(g) or g.run.finalizing or g.run.reserve or not g.baseline_ready or g.head_cp is None or \
+            tx.cfg.background == "off":
         return
     for w in sorted(g.workers):
         g = tx.g
         if open_attempt(g, w, LANE_BG) is not None:
             continue
-        prio = _priority_candidate(g, w)
-        if prio is not None:
-            snap, trig, label = prio
+        cand = _background_candidate(g, w, tx.cfg.background)
+        if cand is not None:
+            snap, trig, label = cand
             request_checkpoint(tx, w, snap.n, trig, lane=LANE_BG, summary=label)
 
 
@@ -587,9 +410,15 @@ def _selection(g: Graph, cfg: BelayConfig, tier: str, files: Iterable[str], extr
     return "full", None
 
 
+def _evidence_of_open(g: Graph) -> list[str]:
+    """还没完成的需求的证据检查：随每次存档尝试一起跑，需求验证通过不需要任何人声明。"""
+    return [c for r in open_requirements(g) for c in evidence_checks(g, r)]
+
+
 def request_checkpoint(tx: Tx, worker: str, snapshot: int, trigger: str, lane: str = LANE_FG,
-                       tasks: Iterable[str] = (), tier: Optional[str] = None, summary: str = "") -> Optional[str]:
-    """对一张快照发起存档尝试；它与链头相同时返回 None（没有要存的东西）。"""
+                       tier: Optional[str] = None, summary: str = "", submit: Optional[dict] = None) -> Optional[str]:
+    """对一张快照发起存档尝试；它与链头相同时返回 None（没有要存的东西）。
+    submit：随这次尝试判定的提交（submit_requested 的 payload），在尝试有结果之前写入。"""
     g = tx.g
     if not g.baseline_ready or g.head is None:
         raise Rejected("The harness is still setting up; try again shortly.")
@@ -600,22 +429,22 @@ def request_checkpoint(tx: Tx, worker: str, snapshot: int, trigger: str, lane: s
     snap = g.snapshots.get(snapshot)
     if snap is None:
         raise Rejected(f"Unknown snapshot {snapshot}.")
+    kind = TRIGGER_KIND.get(trigger, KIND_AUTO)
     if snap.tree == g.head_cp.tree:
-        mark_head(tx, worker, TRIGGER_KIND.get(trigger, KIND_MILESTONE), summary)
+        mark_head(tx, worker, kind, summary)
         return None
-    tasks = tuple(tasks)
-    extra = [c for tid in tasks for c in g.tasks[tid].checks]
-    tier, selection = _selection(g, tx.cfg, tier or tx.cfg.checkpoint_tier, [f[0] for f in snap.files], extra)
+    tier, selection = _selection(g, tx.cfg, tier or tx.cfg.checkpoint_tier, [f[0] for f in snap.files],
+                                 _evidence_of_open(g))
     aid = next_id("A", g.attempts)
-    kind = TRIGGER_KIND.get(trigger, KIND_MILESTONE)
-    tx.emit("checkpoint_attempted", worker_actor(worker) if trigger in ("worker", "review") else RUNTIME, RULE,
+    tx.emit("checkpoint_attempted", worker_actor(worker) if trigger == "submit" else RUNTIME, RULE,
             attempt=aid, worker=worker, trigger=trigger, tree=snap.tree, raw_tree=snap.raw_tree, base=g.head,
-            tier=tier, selection=None if selection is None else list(selection), tasks=list(tasks),
+            tier=tier, selection=None if selection is None else list(selection),
             summary=(summary or "")[:2000], snapshot=snap.n, lane=lane, kind=kind)
+    if submit is not None:
+        tx.emit("submit_requested", worker_actor(worker), RULE, **submit, attempt=aid)
     if not snap.testable:
         tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=aid, regressions=[], reason="precheck",
                 detail=snap.precheck[:1000] or "the changed files do not compile")
-        _reopen_attempt_tasks(tx, aid, "checkpoint_rejected", [f"precheck: {snap.precheck[:200]}"])
         schedule_background(tx)
         return aid
     advance_attempt(tx, aid)
@@ -680,8 +509,7 @@ def _decide(tx: Tx, aid: str, regs: tuple, flaky: tuple) -> None:
         errors = sorted({j.error[:300] for j in g.jobs.values() if j.tree == a.tree and j.error and not j.live})
         tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=aid, regressions=list(regs), flaky=list(flaky),
                 reason="regression", detail="; ".join(errors)[:1000])
-        _reopen_attempt_tasks(tx, aid, "checkpoint_rejected", regs)
-        if a.lane == LANE_FG:                       # 只有 worker 声明的存档被拒才定位与诊断；后台的只是链头不动
+        if a.lane == LANE_FG:                       # 只有 worker 的提交被拒才定位与诊断；后台的只是链头不动
             loc = start_locate(tx, regression_ids(regs), {"tree": a.tree, "snapshot": a.snapshot}, "rejected",
                                ref=aid)
             if loc is None:
@@ -695,29 +523,18 @@ def _decide(tx: Tx, aid: str, regs: tuple, flaky: tuple) -> None:
 
 
 def supersede_attempt(tx: Tx, aid: str, reason: str) -> None:
-    """取代一个还在等结果的尝试。它带着的待验证任务：链头已经包含它的快照时转到链头上判定，否则重开。"""
+    """取代一个还在等结果的尝试。它带着的提交：链头已经包含它的快照时转到链头上判定，否则记为被拒（取消）。"""
     g = tx.g
     a = g.attempts[aid]
     if a.status != ATT_PENDING:
         return
-    review_tasks = [tid for tid in a.tasks if g.tasks[tid].status == REVIEW and g.tasks[tid].review_attempt == aid]
     contained = _older_than_head(g, a) or a.tree == g.head_cp.tree
-    if review_tasks and not contained:
-        _reopen_attempt_tasks(tx, aid, "checkpoint_rejected", [f"checkpoint attempt {aid} was cancelled ({reason})"])
-        review_tasks = []
+    sub = a.submit if a.submit is not None and g.submits[a.submit].status == SUB_PENDING else None
     tx.emit("attempt_superseded", RUNTIME, RULE, attempt=aid, reason=reason,
-            review_checkpoint=tx.g.head if review_tasks else None)
-    for tid in review_tasks:
-        evaluate_review(tx, tid)
-
-
-def _reopen_attempt_tasks(tx: Tx, aid: str, reason: str, failures: Iterable[str]) -> None:
-    a = tx.g.attempts[aid]
-    for tid in a.tasks:
-        t = tx.g.tasks[tid]
-        if t.status == REVIEW and t.review_attempt == aid:
-            tx.emit("task_reopened", RUNTIME, RULE, task=tid, reason=reason, failures=list(failures)[:50],
-                    attempt=aid)
+            submit_checkpoint=tx.g.head if sub is not None and contained else None)
+    if sub is not None and contained:
+        mark_head(tx, a.worker, KIND_SUBMIT, a.summary)
+        evaluate_submit(tx, sub)
 
 
 def ref_advanced(tx: Tx, aid: str, ok: bool, commit: str = "", files: Iterable = (), detail: str = "") -> None:
@@ -729,29 +546,26 @@ def ref_advanced(tx: Tx, aid: str, ok: bool, commit: str = "", files: Iterable =
         cid = max(tx.g.checkpoints) + 1
         tx.emit("checkpoint_created", RUNTIME, OBSERVED, checkpoint=cid, attempt=aid, commit=commit, tree=a.tree,
                 files=[list(f) for f in files])
-        for tid in a.tasks:
-            evaluate_review(tx, tid)
         for other in list(tx.g.attempts.values()):             # 新快照胜出：更旧的尝试不再进链
             if other.status == ATT_PENDING:
                 advance_attempt(tx, other.id)
         refresh_anchors(tx)
-        for t in list(tx.g.tasks.values()):
-            if t.status == REVIEW and t.review_checkpoint is not None:
-                evaluate_review(tx, t.id)
+        auto_verify(tx)
+        for s in list(tx.g.submits.values()):
+            if s.status == SUB_CHECKPOINTED:
+                evaluate_submit(tx, s.id)
     else:
         tx.emit("checkpoint_rejected", RUNTIME, OBSERVED, attempt=aid, regressions=[], reason="cas_conflict",
                 detail=detail[:1000])
-        _reopen_attempt_tasks(tx, aid, "checkpoint_rejected", [f"cas_conflict: {detail[:200]}"])
     schedule_promotion(tx)
     schedule_background(tx)
 
 
 def abort_attempts(tx: Tx, reason: str, lane: Optional[str] = None) -> None:
-    """收尾时仍在验证的尝试：拒绝（链不动）。正在 CAS 的尝试不能中止，由外壳做完。"""
+    """收尾时仍在验证的尝试：拒绝（链不动；带着的提交也记为被拒）。正在 CAS 的尝试不能中止，由外壳做完。"""
     for a in list(tx.g.attempts.values()):
         if a.status == ATT_PENDING and (lane is None or a.lane == lane):
             tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=a.id, regressions=[], reason=reason)
-            _reopen_attempt_tasks(tx, a.id, "checkpoint_rejected", [reason])
 
 
 # ======================================================================== 两级存档链：提升与降级（模块 C）
@@ -815,7 +629,7 @@ def evaluate_promotion(tx: Tx, cid: int) -> None:
     tx.emit("checkpoint_demoted", RUNTIME, RULE, checkpoint=cid, regressions=list(regs)[:200],
             n_regressions=len(regs))
     if not _background_ok(tx.g) or cp.kind not in DECLARED_KINDS:
-        schedule_promotion(tx)                      # 步骤、交接等中间节点：只降级（不再交付），不追查、不通知
+        schedule_promotion(tx)                      # 后台、todo、交接等中间节点：只降级（不再交付），不追查、不通知
         return
     # 问题是否还在：对最新的可测快照只跑这几个失败的测试
     ids = regression_ids(regs)
@@ -961,7 +775,7 @@ def advance_locate(tx: Tx, lid: str) -> None:
 def _attribution(g: Graph, p: dict) -> dict:
     if p.get("kind") == "snapshot" and p.get("id") in g.snapshots:
         s = g.snapshots[p["id"]]
-        return {"snapshot": s.n, "held": list(s.held), "step": s.step, "session": s.session}
+        return {"snapshot": s.n, "todo": s.todo, "session": s.session}
     return {"checkpoint": p.get("id")}
 
 
@@ -1001,7 +815,7 @@ def record_located(tx: Tx, lid: str, group: int, files: Iterable, diff: Optional
         if pairs:
             tx.emit("relation_learned", RUNTIME, RULE, pairs=[list(p) for p in pairs][:100], locate=lid)
     if _running_run(tx.g) and not tx.g.run.finalizing:
-        maybe_diagnose(tx, loc.trigger if loc.trigger != "step" else "rejected", grp["tests"], lid, group)
+        maybe_diagnose(tx, loc.trigger, grp["tests"], lid, group)
 
 
 # ======================================================================== 诊断者（模块 E）
@@ -1035,7 +849,7 @@ def _repeated_diagnosis(tx: Tx, aid: str) -> None:
     a = g.attempts[aid]
     sig = failure_signature(regression_ids(a.regressions))
     same = [x for x in g.attempts.values() if x.status == ATT_REJECTED and x.regressions and
-            (x.lane == LANE_FG or x.kind == KIND_STEP) and failure_signature(regression_ids(x.regressions)) == sig]
+            x.lane == LANE_FG and failure_signature(regression_ids(x.regressions)) == sig]
     if len(same) != 2:
         return
     prev = [d for d in g.diagnoses.values() if d.status == "recorded" and
@@ -1059,148 +873,194 @@ def record_diagnosis(tx: Tx, did: str, result: dict, failed: bool = False) -> No
     tx.emit("diagnosis_recorded", DIAGNOSER, LLM, diagnosis=did, result=result, failed=failed)
 
 
-# ======================================================================== 待验证 → 完成；复查（模块 F）
+# ======================================================================== 需求的自动验证
 
-def request_review(tx: Tx, worker: str, task_id: str, snapshot: int, summary: str = "") -> Optional[str]:
+def auto_verify(tx: Tx) -> None:
+    """还没完成的需求：证据检查在链上最新的、有结果的存档里全部通过 → requirement_verified（不需要任何人声明）。"""
     g = tx.g
-    _held_active(g, worker, task_id)
-    if not g.baseline_ready or g.head is None:
-        raise Rejected("The harness is still setting up; try again shortly.")
-    if open_attempt(g, worker, LANE_FG) is not None:
-        raise Rejected("A checkpoint of your work is already in progress.")
-    snap = g.snapshots.get(snapshot)
-    if snap is None or snap.tree == g.head_cp.tree:
-        mark_head(tx, worker, KIND_REVIEW, summary or f"{task_id} finished")
-        tx.emit("review_requested", worker_actor(worker), RULE, task=task_id, worker=worker, checkpoint=tx.g.head)
-        evaluate_review(tx, task_id)
-        return None
-    tx.emit("review_requested", worker_actor(worker), RULE, task=task_id, worker=worker)
-    return request_checkpoint(tx, worker, snapshot, "review", tasks=(task_id,), summary=summary)
-
-
-def evaluate_review(tx: Tx, task_id: str) -> None:
-    """在任务的存档那棵树上看它的检查：全部 PASSED → done；失败 → 重开；缺结果 → 起 evidence 作业。"""
-    g = tx.g
-    t = g.tasks.get(task_id)
-    if t is None or t.status != REVIEW or t.review_checkpoint is None:
+    if not _running_run(g):
         return
-    cp = g.checkpoints[t.review_checkpoint]
-    if not t.checks:
-        tx.emit("task_done", RUNTIME, RULE, task=task_id, checkpoint=cp.id, verified=False)
-        maybe_review(tx, task_id, "done")
-        return
-    res = results_for_tree(g, cp.tree)
-    missing = [c for c in t.checks if c not in res]
-    need = list(units(missing))
-    if missing and not finished_covers(g, cp.tree, need):
-        if not running_covers(g, cp.tree, need):
-            ensure_job(tx, cp.tree, need, "evidence")
-        return
-    failing = [f"{c} ({res.get(c, 'MISSING')})" for c in t.checks if res.get(c) != PASSED]
-    if failing:
-        tx.emit("task_reopened", RUNTIME, RULE, task=task_id, reason="evidence_failed", failures=failing[:50],
-                checkpoint=cp.id)
-    else:
-        tx.emit("task_done", RUNTIME, RULE, task=task_id, checkpoint=cp.id, verified=True,
-                evidence={c: res[c] for c in t.checks})
+    on_chain = chain(g)
+    for r in open_requirements(g):
+        ev = evidence_checks(g, r)
+        if not ev:
+            continue
+        for cp in on_chain:
+            if cp.id == 0:
+                break
+            res = results_for_tree(g, cp.tree)
+            if all(res.get(c) == PASSED for c in ev):
+                tx.emit("requirement_verified", RUNTIME, RULE, requirement=r.id, checkpoint=cp.id,
+                        evidence={c: res[c] for c in ev})
+                break
+            if all(c in res for c in ev):
+                break                               # 最新的有结果的存档上没过：不往回找（那是被后来的改动弄坏的）
 
 
-def _review_eligible(g: Graph, cfg: BelayConfig, task_id: str, phase: str) -> bool:
-    t = g.tasks[task_id]
-    if not cfg.reviewer or t.review is not None or t.review_reopens >= cfg.review_max_reopens:
-        return False
-    if phase == "done":
-        return t.status == DONE_UNVERIFIED
-    return t.status == BLOCKED and t.blocked_kind == "insufficient_info"
+# ======================================================================== 提交（唯一的完成声明）与复查（模块 F）
 
-
-def maybe_review(tx: Tx, task_id: str, phase: str) -> bool:
-    g = tx.g
-    if not _running_run(g) or not _review_eligible(g, tx.cfg, task_id, phase):
-        return False
-    tx.emit("review_started", RUNTIME, RULE, task=task_id, phase=phase)
-    return True
-
-
-def reviews_needed(g: Graph, cfg: BelayConfig) -> list[tuple[str, str]]:
-    """收尾前还没复查过的 done_unverified，以及以 insufficient_info 受阻的任务。"""
-    out = []
-    for t in sorted(g.tasks.values(), key=lambda t: num(t.id)):
-        for phase in ("done", "blocked"):
-            if _review_eligible(g, cfg, t.id, phase):
-                out.append((t.id, phase))
+def _check_blocked(g: Graph, blocked: Iterable[dict]) -> list[dict]:
+    out, problems = [], []
+    for b in blocked or ():
+        if not isinstance(b, dict):
+            problems.append("each blocked entry is an object {requirement, kind, reason, quote}")
+            continue
+        rid = str(b.get("requirement") or "").strip()
+        kind = str(b.get("kind") or "").strip()
+        reason = str(b.get("reason") or "").strip()
+        quote = b.get("quote")
+        r = g.requirements.get(rid)
+        if r is None or r.kind != ACTIONABLE:
+            problems.append(f"{rid or '(no id)'}: not a requirement on the checklist")
+        elif kind not in BLOCK_KINDS:
+            problems.append(f"{rid}: kind must be one of {', '.join(BLOCK_KINDS)}")
+        elif not reason:
+            problems.append(f"{rid}: give a reason")
+        elif kind == "check_conflict" and (not quote or not quote_in_text(str(quote), g.run.task)):
+            problems.append(f"{rid}: a check_conflict must quote the task text verbatim (quote=...); for specific "
+                            "gate tests that fail on your change, use waive_check instead")
+        else:
+            out.append({"requirement": rid, "kind": kind, "reason": reason[:2000],
+                        "quote": normalize_ws(str(quote))[:1000] if quote else None})
+    if problems:
+        raise Rejected("Nothing was submitted:\n" + "\n".join(f"- {p}" for p in problems[:20]))
     return out
 
 
-def request_final_reviews(tx: Tx) -> int:
-    n = 0
-    for tid, phase in reviews_needed(tx.g, tx.cfg):
-        n += maybe_review(tx, tid, phase)
-    return n
-
-
-def record_review(tx: Tx, task_id: str, phase: str, result: dict) -> None:
-    """复查者（llm）只能收紧：no / partial → 重开；yes → 什么都不做（永远不能把任务提升为 done）。"""
+def request_submit(tx: Tx, worker: str, snapshot: int, summary: str = "", blocked: Iterable[dict] = (),
+                   implicit: bool = False) -> str:
+    """worker 声明做完了：对调用方刚强制拍下的快照发起前台存档；存档有了就逐条判定需求、请复查者收紧。"""
     g = tx.g
-    t = g.tasks.get(task_id)
-    if t is None or t.review != "running" or not _running_run(g):
-        return
-    result = dict(result or {})
-    impl = result.get("implemented")
-    if phase == "blocked":
-        impl = "reading" if result.get("reading") else "none"
-    if impl not in ("yes", "partial", "no", "reading", "none", "failed"):
-        impl = "failed"
-    missing = [str(x)[:300] for x in (result.get("missing") or [])][:20]
-    tx.emit("review_recorded", REVIEWER, LLM, task=task_id, phase=phase, implemented=impl, missing=missing,
-            evidence=[str(x)[:300] for x in (result.get("evidence") or [])][:20],
-            reading=str(result.get("reading") or "")[:1500] or None)
-    t = tx.g.tasks[task_id]
-    if tx.g.run.reserve or tx.g.run.finalizing:
-        return                                     # 截止收尾时已经没有时间再做：只进账本
-    if phase == "done" and impl in ("no", "partial") and t.status == DONE_UNVERIFIED:
-        tx.emit("task_reopened", RUNTIME, RULE, task=task_id, reason="review_missing",
-                failures=missing or [f"review: implemented={impl}"])
-    elif phase == "blocked" and impl == "reading" and t.status == BLOCKED:
-        tx.emit("task_reopened", RUNTIME, RULE, task=task_id, reason="review_reading",
-                failures=[f"a reasonable reading: {result.get('reading')}"[:1500]])
-
-
-# ======================================================================== 作业
-
-def run_check(tx: Tx, worker: str, raw_tree: str, tests: Iterable[str] = (), full: bool = False,
-              changed: Iterable[str] = ()) -> str:
-    """worker 的开发检查：在活的工作区上跑（结果只是开发信号），同一 (树, 选择) 复用结果。"""
-    g = tx.g
-    tests = [str(x) for x in tests]
-    if full:
-        sel = None
-    elif tests:
-        sel = tuple(sorted(set(tests)))          # 开发检查可以直接给 node id
-    else:
-        sel, _ = related_units(list(changed), test_files_of(g.baseline), g.relations)
-        if sel == ():
-            raise Rejected("No test is related to your changes; pass tests=[...] or full=true.")
-    return ensure_job(tx, raw_tree, sel, "dev", actor=worker_actor(worker), live=True, tag="dev")
-
-
-def gate_check(tx: Tx, worker: str, snapshot: int, tests: Iterable[str] = (), full: bool = False) -> str:
-    """按门的口径自查：对当前工作区拍快照、剔除测试改动，在验证槽位里运行（第 2 档优先级）。"""
-    g = tx.g
+    if not g.baseline_ready or g.head is None or not g.frozen:
+        raise Rejected("The harness is still setting up; try again shortly.")
+    if open_submit(g, worker) is not None:
+        raise Rejected("Your previous submit is still being checked; wait for its result.")
+    if open_attempt(g, worker, LANE_FG) is not None:
+        raise Rejected("A checkpoint of your work is already in progress.")
     snap = g.snapshots.get(snapshot)
     if snap is None:
         raise Rejected("No snapshot of your working tree yet.")
-    tests = [str(x) for x in tests]
-    if full:
-        sel = None
-    elif tests:
-        sel = tuple(sorted(set(tests)))
+    clean = _check_blocked(g, blocked)
+    sid = next_id("U", g.submits)
+    payload = dict(submit=sid, worker=worker, snapshot=snap.n, summary=(summary or "")[:4000], blocked=clean,
+                   implicit=implicit)
+    if snap.tree == g.head_cp.tree:                  # 后台已经存过这棵树：直接在链头上判定
+        mark_head(tx, worker, KIND_SUBMIT, summary)
+        tx.emit("submit_requested", worker_actor(worker), RULE, **payload, checkpoint=tx.g.head)
     else:
-        sel, _ = related_units([f[0] for f in snap.files], test_files_of(g.baseline), g.relations)
-        if not sel:
-            sel = None
-    return ensure_job(tx, snap.tree, sel, "gate", actor=worker_actor(worker), tag="gate")
+        request_checkpoint(tx, worker, snap.n, "submit", summary=(summary or "").strip().split("\n")[0][:300],
+                           submit=payload)
+    evaluate_submit(tx, sid)
+    return sid
 
+
+def evaluate_submit(tx: Tx, sid: str) -> None:
+    """提交的存档有了：先等证据检查的结果，再逐条判定 actionable 需求，然后请复查者批量收紧。"""
+    g = tx.g
+    s = g.submits.get(sid)
+    if s is None or s.status != SUB_CHECKPOINTED or not _running_run(g):
+        return
+    cp = g.checkpoints[s.checkpoint]
+    opens = open_requirements(g)
+    need = sorted({c for r in opens for c in evidence_checks(g, r)})
+    res = results_for_tree(g, cp.tree)
+    missing = [c for c in need if c not in res]
+    if missing:
+        u = list(units(missing))
+        if not finished_covers(g, cp.tree, u):
+            if not running_covers(g, cp.tree, u):
+                ensure_job(tx, cp.tree, u, "evidence")
+            return
+    auto_verify(tx)
+    blocked = {b["requirement"]: b for b in s.blocked}
+    failing: dict[str, list[str]] = {}
+    for r in open_requirements(tx.g):
+        ev = evidence_checks(tx.g, r)
+        if r.id in blocked:
+            b = blocked[r.id]
+            tx.emit("requirement_blocked", worker_actor(s.worker), SELF_REPORT, requirement=r.id, kind=b["kind"],
+                    reason=b["reason"], quote=b.get("quote"), submit=sid)
+        elif ev:
+            failing[r.id] = [f"{c} ({res.get(c, 'MISSING')})" for c in ev if res.get(c) != PASSED]
+        else:
+            tx.emit("requirement_submitted", worker_actor(s.worker), SELF_REPORT, requirement=r.id,
+                    checkpoint=cp.id, submit=sid)
+    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status=SUB_REVIEWING, failing=failing)
+    _start_reviews(tx, sid)
+    finish_submit(tx, sid)
+
+
+def _review_eligible(g: Graph, cfg: BelayConfig, rid: str, phase: str) -> bool:
+    r = g.requirements[rid]
+    if not cfg.reviewer or r.review is not None or r.review_reopens >= cfg.review_max_reopens:
+        return False
+    if phase == "done":
+        return r.status == REQ_SUBMITTED
+    return r.status == REQ_BLOCKED and r.blocked_kind == "insufficient_info"
+
+
+def _start_reviews(tx: Tx, sid: Optional[str]) -> int:
+    """还没复查过的已提交需求、以 insufficient_info 受阻的需求：分批复查（每批 review_batch 条）。"""
+    g, cfg = tx.g, tx.cfg
+    s = g.submits.get(sid) if sid else None
+    n = 0
+    for phase in ("done", "blocked"):
+        rids = [r.id for r in actionable(tx.g) if _review_eligible(tx.g, cfg, r.id, phase)]
+        for i in range(0, len(rids), max(1, cfg.review_batch)):
+            vid = next_id("V", tx.g.reviews)
+            tx.emit("review_started", RUNTIME, RULE, review=vid, phase=phase,
+                    requirements=rids[i:i + max(1, cfg.review_batch)],
+                    checkpoint=s.checkpoint if s is not None else tx.g.head, submit=sid)
+            n += 1
+    return n
+
+
+def finish_submit(tx: Tx, sid: str) -> None:
+    """复查都结束了：还有没完成的 actionable 需求 → 交还清单（returned）；没有 → 接受（运行可以收尾）。"""
+    g = tx.g
+    s = g.submits.get(sid)
+    if s is None or s.status != SUB_REVIEWING:
+        return
+    if any(v.submit == sid and v.status == "running" for v in g.reviews.values()):
+        return
+    left = [r.id for r in open_requirements(g)]
+    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned" if left else "accepted", open=left)
+
+
+def record_review(tx: Tx, vid: str, results: dict) -> None:
+    """复查者（llm）只能收紧：no / partial → 重开；受阻的需求给出合理读法 → 重开；yes 什么都不做。"""
+    g = tx.g
+    v = g.reviews.get(vid)
+    if v is None or v.status != "running" or not _running_run(g):
+        return
+    clean: dict[str, dict] = {}
+    for rid in v.requirements:
+        r = dict((results or {}).get(rid) or {})
+        if v.phase == "blocked":
+            impl = "reading" if str(r.get("reading") or "").strip() else ("none" if r else "failed")
+        else:
+            impl = r.get("implemented")
+            if impl not in ("yes", "partial", "no"):
+                impl = "failed"
+        clean[rid] = {"implemented": impl, "missing": [str(x)[:300] for x in (r.get("missing") or [])][:20],
+                      "evidence": [str(x)[:300] for x in (r.get("evidence") or [])][:20],
+                      "reading": str(r.get("reading") or "")[:1500] or None}
+    tx.emit("review_recorded", REVIEWER, LLM, review=vid, results=clean)
+    if tx.g.run.reserve or tx.g.run.finalizing:
+        return                                     # 截止收尾时已经没有时间再做：只进账本
+    for rid, res in clean.items():
+        r = tx.g.requirements[rid]
+        if v.phase == "done" and res["implemented"] in ("no", "partial") and r.status == REQ_SUBMITTED:
+            tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_missing",
+                    failures=res["missing"] or [f"review: implemented={res['implemented']}"])
+        elif v.phase == "blocked" and res["implemented"] == "reading" and r.status == REQ_BLOCKED:
+            tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_reading",
+                    failures=[f"a reasonable reading: {res['reading']}"[:1500]])
+    if v.submit is not None:
+        finish_submit(tx, v.submit)
+
+
+# ======================================================================== 作业
 
 def job_preempted(tx: Tx, job_id: str) -> None:
     j = tx.g.jobs.get(job_id)
@@ -1225,7 +1085,6 @@ def job_finished(tx: Tx, job_id: str, state: str, results: dict, sec: float = 0.
             for a in list(tx.g.attempts.values()):  # 收尾时取消的作业：依赖它的尝试直接拒绝（链不动）
                 if a.status == ATT_PENDING and job_id in a.jobs:
                     tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=a.id, regressions=[], reason="cancelled")
-                    _reopen_attempt_tasks(tx, a.id, "checkpoint_rejected", ["verification cancelled"])
             return
     elif state == JOB_UNKNOWN and not job.live:
         att = job.attempt if job.attempt and tx.g.attempts[job.attempt].status == ATT_PENDING else None
@@ -1238,9 +1097,6 @@ def _cascade(tx: Tx, job_id: Optional[str] = None) -> None:
     for a in list(tx.g.attempts.values()):
         if a.status == ATT_PENDING:
             advance_attempt(tx, a.id)
-    for t in list(tx.g.tasks.values()):
-        if t.status == REVIEW and t.review_checkpoint is not None:
-            evaluate_review(tx, t.id)
     job = tx.g.jobs.get(job_id) if job_id else None
     if job is not None and job.state == JOB_FINISHED and not job.live:
         for cp in chain(tx.g):
@@ -1248,6 +1104,10 @@ def _cascade(tx: Tx, job_id: Optional[str] = None) -> None:
                 evaluate_promotion(tx, cp.id)
         if job.tag.startswith("recheck:"):
             _evaluate_recheck(tx, job_id)
+        auto_verify(tx)
+    for s in list(tx.g.submits.values()):
+        if s.status == SUB_CHECKPOINTED:
+            evaluate_submit(tx, s.id)
     for lid in [l.id for l in tx.g.locates.values() if l.status == "running"]:
         advance_locate(tx, lid)
     schedule_promotion(tx)
@@ -1257,7 +1117,8 @@ def _cascade(tx: Tx, job_id: Optional[str] = None) -> None:
 # ======================================================================== 回退
 
 def rollback(tx: Tx, worker: str, to: Optional[int] = None) -> int:
-    """回退：默认退到最近的里程碑。先取消后台尝试；有前台尝试或有尝试正在推进时拒绝。"""
+    """回退（只由恢复流程使用：容器重建后丢了链上的存档）：默认退到最近的里程碑。先取消后台尝试；
+    有前台尝试、有尝试正在推进或有提交在判定时拒绝。"""
     g = tx.g
     to = latest_milestone(g) if to is None else int(to)
     ids = chain_ids(g)
@@ -1265,23 +1126,24 @@ def rollback(tx: Tx, worker: str, to: Optional[int] = None) -> int:
         raise Rejected(f"Checkpoint {to} is not on the checkpoint chain ({', '.join(map(str, ids))}).")
     if open_attempt(g, None, LANE_FG) is not None or any(a.status == ATT_ADVANCING for a in g.attempts.values()):
         raise Rejected("A checkpoint is in progress; roll back after it finishes.")
+    if open_submit(g) is not None:
+        raise Rejected("A submit is being checked; roll back after it finishes.")
     for a in list(g.attempts.values()):
         if a.status == ATT_PENDING and a.lane == LANE_BG:
             supersede_attempt(tx, a.id, "rollback")
     g = tx.g
     abandoned = ids[:ids.index(to)]
-    for t in list(g.tasks.values()):
-        if (t.status in (DONE, DONE_UNVERIFIED) and t.done_checkpoint in abandoned) or \
-                (t.status == REVIEW and t.review_checkpoint in abandoned):
-            tx.emit("task_reopened", worker_actor(worker), RULE, task=t.id, reason="rolled_back",
-                    failures=[f"checkpoint {t.done_checkpoint or t.review_checkpoint} was rolled back"])
+    for r in actionable(g):
+        if r.status in (REQ_VERIFIED, REQ_SUBMITTED) and r.checkpoint in abandoned:
+            tx.emit("requirement_reopened", worker_actor(worker), RULE, requirement=r.id, reason="rolled_back",
+                    failures=[f"checkpoint {r.checkpoint} was rolled back"])
     keep = [c for c in chain(tx.g) if c.id not in abandoned]
-    for s in sorted(tx.g.steps.values(), key=lambda s: s.id):
-        if s.status not in (STEP_DECLARED, STEP_ANCHORED):
+    for t in sorted(tx.g.todos.values(), key=lambda t: t.n):
+        if t.status not in (TODO_COMPLETED, TODO_ANCHORED):
             continue
-        ok = any(c.epoch == s.anchor_epoch and c.snapshot >= (s.anchor_snapshot or 0) for c in keep)
+        ok = any(c.epoch == t.anchor_epoch and c.snapshot >= (t.anchor_snapshot or 0) for c in keep)
         if not ok:
-            tx.emit("step_invalidated", worker_actor(worker), RULE, step=s.id, reason="rolled_back")
+            tx.emit("todo_invalidated", worker_actor(worker), RULE, todo=t.id, reason="rolled_back")
     cp = tx.g.checkpoints[to]
     tx.emit("rollback", worker_actor(worker), RULE, worker=worker, to=to, abandoned=abandoned, tree=cp.tree,
             commit=cp.commit)
@@ -1308,12 +1170,9 @@ def detect_stalls(tx: Tx) -> None:
     for w, ws in sorted(g.workers.items()):
         if ws.session is None:
             continue
-        f = focus_task(g, w)
-        task = f.id if f is not None and f.status == ACTIVE else None
-        action = "replan" if (since and task) else "hint"
         idle_since = g.last_progress_t
         if tx.now - idle_since > cfg.stall_no_progress_sec and not any(x.kind == "no_progress" for x in since):
-            tx.emit("stall_detected", RUNTIME, RULE, kind="no_progress", action=action, worker=w, task=task,
+            tx.emit("stall_detected", RUNTIME, RULE, kind="no_progress", action="hint", worker=w,
                     detail=f"no progress for {int((tx.now - idle_since) / 60)} min")
             return
         mine = sorted((a for a in g.attempts.values() if a.worker == w and a.status in (ATT_REJECTED, "created")
@@ -1324,9 +1183,9 @@ def detect_stalls(tx: Tx) -> None:
             if len(sigs) == 1:
                 sig = sigs.pop()
                 if not any(x.kind == "repeated_failure" and sig in x.detail for x in since):
-                    tx.emit("stall_detected", RUNTIME, RULE, kind="repeated_failure", action=action, worker=w,
-                            task=task, detail=f"signature {sig}: the same {len(mine[-1].regressions)} regression(s) "
-                                              f"rejected {len(mine)} checkpoints in a row")
+                    tx.emit("stall_detected", RUNTIME, RULE, kind="repeated_failure", action="hint", worker=w,
+                            detail=f"signature {sig}: the same {len(mine[-1].regressions)} regression(s) "
+                                   f"rejected {len(mine)} submits in a row")
                     return
 
 
@@ -1352,13 +1211,11 @@ def session_resumed(tx: Tx, session: str, mode: str, detail: str = "") -> None:
 
 
 def end_session(tx: Tx, worker: str, reason: str, peak_context: int = 0, turns: int = 0,
-                error: Optional[str] = None, todos: Optional[list[dict]] = None) -> Optional[str]:
+                error: Optional[str] = None) -> Optional[str]:
     ws = tx.g.workers.get(worker)
     if ws is None or ws.session is None:
         return None
     sid = ws.session
-    if todos and focus_task(tx.g, worker) is None:
-        plan_steps(tx, worker, todos)
     tx.emit("session_ended", RUNTIME, OBSERVED, session=sid, worker=worker, reason=reason,
             peak_context=int(peak_context), turns=int(turns), error=(error or None) and error[:2000])
     return sid
@@ -1392,7 +1249,8 @@ def label_checkpoint(tx: Tx, cid: int, label: str) -> None:
 # ======================================================================== 运行的结束
 
 def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str, str]:
-    """会话结束不等于运行结束。返回 (动作, 理由)：stop | finalize | start_session | resume_session | review | wait。"""
+    """会话结束不等于运行结束。返回 (动作, 理由)：stop | finalize | start_session | resume_session | wait。
+    运行在提交被接受（没有未完成的 actionable 需求）时收尾；会话结束了但没有提交，就开新会话接着做。"""
     if g.run is None or g.run.status != RUN_RUNNING:
         return "stop", "delivered"
     if g.run.finalizing:
@@ -1408,16 +1266,12 @@ def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str,
         return "wait", "checkpoint in progress"
     if g.degraded and open_attempt(g, None, LANE_BG) is not None:
         return "wait", "checkpoint in progress"     # 降级模式：切换工作区的验证结束前不能开会话
-    if any(t.status == REVIEW for t in g.tasks.values()):
-        return "wait", "evidence in progress"
+    if open_submit(g, worker) is not None:
+        return "wait", "submit in progress"
+    if submit_accepted(g, worker):
+        return "finalize", "complete"
     if consecutive_crashes(g, worker) >= cfg.max_crash_restarts:
         return "finalize", "crashes"
-    if all_resolved(g):
-        if reviews_needed(g, cfg):
-            return "review", "final"
-        if any(t.review == "running" for t in g.tasks.values()):
-            return "wait", "review in progress"
-        return "finalize", "complete"
     if sessions_without_progress(g, worker) >= cfg.max_idle_sessions:
         return "finalize", "no_progress"
     return "start_session", session_reason(g, worker)

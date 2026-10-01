@@ -1,42 +1,48 @@
-"""给 worker 和人看的文字（纯函数）：board、任务详情、存档结果、作业结果、定位与诊断、需求账本。"""
+"""给 worker 和人看的文字（纯函数）：board、需求详情、提交结果、存档结果、定位与诊断、需求账本。"""
 from __future__ import annotations
 
 from typing import Optional
 
 from belay.core.config import BelayConfig
-from belay.core.model import (ACTIVE, ATT_CREATED, ATT_REJECTED, ATT_SUPERSEDED, BLOCKED, CONFIRMED, DONE,
-                              DONE_UNVERIFIED, JOB_FINISHED, OPEN, REVIEW, SPLIT, STEP_ANCHORED, STEP_DECLARED, Graph)
-from belay.core.queries import (chain, done_not_delivered, holder, id_ranges, is_ancestor, notes_of_task, num,
-                                requirement_status, status_reasons, steps_of, suspect, task_files, unfinished_deps,
-                                workable)
-from belay.core.suggest import suggest
+from belay.core.model import (ACTIONABLE, ATT_CREATED, ATT_REJECTED, ATT_SUPERSEDED, CONFIRMED, JOB_FINISHED,
+                              REQ_BLOCKED, REQ_FINISHED, REQ_OPEN, REQ_SUBMITTED, REQ_VERIFIED, SUB_ACCEPTED,
+                              SUB_REJECTED, SUB_RETURNED, TODO_ANCHORED, TODO_COMPLETED, Graph, Requirement)
+from belay.core.queries import (actionable, chain, done_not_delivered, evidence_checks, id_ranges, is_ancestor,
+                                latest_submit, num, open_requirements, status_reasons, suspect, todos_in_order)
 from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, active_guard, checkpoint_full_ok, full_verified,
-                               reasons_for_tree, regression_ids, tree_regressions)
+                               reasons_for_tree, regression_ids, results_for_tree, tree_regressions)
 
 PAGE = 50
-STATUS_FILTERS = ("open", "active", "review", "done", "done_unverified", "blocked", "split", "unfinished")
+STATUS_FILTERS = ("open", "verified", "submitted", "blocked", "unfinished", "done")
+REOPEN_TEXT = {"review_missing": "the reviewer found parts missing", "review_reading": "the reviewer found a "
+               "reasonable reading", "rolled_back": "its checkpoint was rolled back"}
 
 
-def task_line(g: Graph, tid: str) -> str:
-    t = g.tasks[tid]
+def requirement_state(r: Requirement) -> str:
+    """一个词的状态（给 worker 看）：verified / submitted（reviewed）/ blocked / open（reopened）。"""
+    if r.status == REQ_SUBMITTED:
+        return {"yes": "submitted, reviewed", "running": "submitted, under review"}.get(r.review or "",
+                                                                                       "submitted")
+    if r.status == REQ_OPEN and r.reopen_count:
+        return "open, reopened"
+    return r.status
+
+
+def requirement_line(g: Graph, rid: str, width: int = 120) -> str:
+    r = g.requirements[rid]
+    line = f"{r.id} [{requirement_state(r)}] {(r.summary or r.quote)[:width]}"
     extra = []
-    h = holder(g, tid)
-    if h:
-        extra.append(f"held by {h}")
-    deps = unfinished_deps(g, t)
-    if t.status == OPEN and deps:
-        extra.append("after " + ", ".join(deps))
-    if t.checks:
-        extra.append(f"{len(t.checks)} check(s)")
-    if t.status in (DONE, DONE_UNVERIFIED):
-        extra.append(f"checkpoint {t.done_checkpoint}")
-        if t.review in ("yes", "partial", "no"):
-            extra.append(f"review: {t.review}")
-    if t.status == BLOCKED:
-        extra.append(f"{t.blocked_kind}: {(t.blocked_reason or '')[:80]}")
-    if t.status == SPLIT:
-        extra.append("split into " + ", ".join(t.children))
-    return f"{t.id} [{t.status}] {t.title} -> {', '.join(t.links)}" + (f" ({'; '.join(extra)})" if extra else "")
+    ev = evidence_checks(g, r)
+    if ev:
+        extra.append(f"{len(ev)} check(s)")
+    if r.status in REQ_FINISHED and r.checkpoint is not None:
+        extra.append(f"checkpoint {r.checkpoint}")
+    if r.status == REQ_BLOCKED:
+        extra.append(f"{r.blocked_kind}: {(r.blocked_reason or '')[:80]}")
+    if r.status == REQ_OPEN and r.last_failure:
+        why = REOPEN_TEXT.get(r.reopen_reason or "", "")
+        extra.append((why + ": " if why else "") + "; ".join(r.last_failure[:3])[:300])
+    return line + (f" ({'; '.join(extra)})" if extra else "")
 
 
 def checkpoint_line(g: Graph, cid: int) -> str:
@@ -64,19 +70,16 @@ def _paginate(lines: list[str], page: int, hint: str) -> list[str]:
 
 
 def render_board(g: Graph, worker: str, now: float, cfg: BelayConfig, status: Optional[str] = None,
-                 requirement: Optional[str] = None, task: Optional[str] = None, view: Optional[str] = None,
-                 page: int = 1) -> str:
-    """默认只给摘要与计数；status / requirement / task / view 过滤，page 分页。"""
-    if task:
-        return render_task(g, task)
+                 requirement: Optional[str] = None, view: Optional[str] = None, page: int = 1) -> str:
+    """默认只给摘要与清单；requirement / status / view 过滤，page 分页。"""
     if requirement:
-        return _render_requirement(g, requirement)
+        return render_requirement(g, requirement)
     if view == "failures":
         return _render_failures(g, page)
     if view == "checkpoints":
         return render_history(g)
-    if status or view == "tasks":
-        return _render_tasks(g, status, page)
+    if status or view == "requirements":
+        return _render_requirements(g, status, page)
     out = []
     cp = g.head_cp
     if cp is not None:
@@ -85,61 +88,68 @@ def render_board(g: Graph, worker: str, now: float, cfg: BelayConfig, status: Op
         if conf is not None and conf != cp.id:
             out.append(f"Latest confirmed checkpoint (the deliverable): {conf}")
     w = g.wips.get(worker)
-    if w and w.base == g.head:
-        out.append(f"Your unverified changes: {len(w.files)} file(s)" +
-                   (f"; last rejection: {w.last_rejection['reason']} "
-                    f"({w.last_rejection.get('n_regressions', 0)} regression(s))" if w.last_rejection else ""))
-    ss = suggest(g, worker, now, cfg)
-    if ss:
-        out.append("\nSuggested next:")
-        for s in ss:
-            out.append(f"  {s.rank}. " + (f"{s.task}: {s.reason}" if s.task else s.reason))
+    if w and w.base == g.head and (w.files or w.dropped):
+        out.append(f"Changes not in a checkpoint yet: {len(w.files)} file(s) (the harness verifies them in the "
+                   "background)")
+    sub = latest_submit(g, worker)
+    if sub is not None:
+        out.append(f"Last submit {sub.id}: {sub.status}" + (f" ({sub.reason})" if sub.reason else "")
+                   + (f"; still open: {id_ranges(sub.open)}" if sub.open else ""))
+    reqs = actionable(g)
     counts: dict[str, int] = {}
-    for rid in g.requirements:
-        st = requirement_status(g, rid)
-        counts[st] = counts.get(st, 0) + 1
+    for r in reqs:
+        counts[r.status] = counts.get(r.status, 0) + 1
     out.append("\nRequirements: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
-    tcounts: dict[str, int] = {}
-    for t in g.tasks.values():
-        tcounts[t.status] = tcounts.get(t.status, 0) + 1
-    out.append("Tasks: " + ", ".join(f"{k} {v}" for k, v in sorted(tcounts.items())))
-    unfinished = [t for t in sorted(g.tasks.values(), key=lambda t: num(t.id)) if t.status in (OPEN, ACTIVE, REVIEW,
-                                                                                              BLOCKED)]
+    unfinished = [r for r in reqs if r.status in (REQ_OPEN, REQ_BLOCKED)]
     if unfinished:
-        out.append("\nUnfinished and blocked tasks:")
-        out.extend(_paginate(["  " + task_line(g, t.id) for t in unfinished], 1, 'board(status="unfinished", '
-                                                                              'page={page})'))
-    done = [t.id for t in g.tasks.values() if t.status in (DONE, DONE_UNVERIFIED)]
+        out.append("Open and blocked:")
+        out.extend(_paginate(["  " + requirement_line(g, r.id) for r in unfinished], 1,
+                             'board(status="unfinished", page={page})'))
+    done = [r.id for r in reqs if r.status in REQ_FINISHED]
     if done:
-        out.append(f"\nFinished: {id_ranges(done)} (board(status=\"done\") for details)")
-    out.append("\nMore: board(requirement=\"R3\"), board(task=\"T7\") or task(id=\"T7\"), board(status=...), "
-               "board(view=\"checkpoints\"), board(view=\"failures\").")
+        out.append(f"Finished: {id_ranges(done)} (board(status=\"done\") for details)")
+    out.append("\nMore: board(requirement=\"R3\"), board(status=...), board(view=\"checkpoints\"), "
+               "board(view=\"failures\").")
     return "\n".join(out)
 
 
-def _render_tasks(g: Graph, status: Optional[str], page: int) -> str:
-    ts = sorted(g.tasks.values(), key=lambda t: num(t.id))
+def _render_requirements(g: Graph, status: Optional[str], page: int) -> str:
+    rs = actionable(g)
     if status == "unfinished":
-        ts = [t for t in ts if t.status in (OPEN, ACTIVE, REVIEW)]
+        rs = [r for r in rs if r.status in (REQ_OPEN, REQ_BLOCKED)]
     elif status == "done":
-        ts = [t for t in ts if t.status in (DONE, DONE_UNVERIFIED)]
+        rs = [r for r in rs if r.status in REQ_FINISHED]
     elif status:
-        ts = [t for t in ts if t.status == status]
-    else:
-        ts = [t for t in ts if t.status != SPLIT]
-    if not ts:
-        return f"No tasks with status {status}."
-    hint = f'board(status="{status}", page={{page}})' if status else 'board(view="tasks", page={page})'
-    return "\n".join([f"Tasks ({status or 'all'}, {len(ts)}):"] + _paginate(["  " + task_line(g, t.id) for t in ts],
-                                                                           page, hint))
+        rs = [r for r in rs if r.status == status]
+    if not rs:
+        return f"No requirements with status {status}."
+    hint = f'board(status="{status}", page={{page}})' if status else 'board(view="requirements", page={page})'
+    return "\n".join([f"Requirements ({status or 'all'}, {len(rs)}):"] +
+                     _paginate(["  " + requirement_line(g, r.id) for r in rs], page, hint))
 
 
-def _render_requirement(g: Graph, rid: str) -> str:
+def render_requirement(g: Graph, rid: str) -> str:
+    """一条需求的全部信息：原文、检查项与它们在链头上的结果、状态历史、被重开的原因、复查结论、关联的 todo。"""
     r = g.requirements.get(rid)
     if r is None:
         return f"Unknown requirement {rid}."
-    out = [f"{rid} [{requirement_status(g, rid)}] {r.summary}", f"Task text: \"{r.quote}\"", "Tasks:"]
-    out += ["  " + task_line(g, t.id) for t in sorted(g.tasks.values(), key=lambda t: num(t.id)) if rid in t.links]
+    if r.kind != ACTIONABLE:
+        return f"{rid} (context, not on the checklist): \"{r.quote}\""
+    out = [requirement_line(g, rid), f"Task text: \"{r.quote}\""]
+    ev = evidence_checks(g, r)
+    if ev:
+        res = results_for_tree(g, g.head_cp.tree) if g.head_cp is not None else {}
+        out.append("Checks (fail on the original code; they decide when it is verified): "
+                   + ", ".join(f"{c} ({res.get(c, 'not run on the latest checkpoint')})" for c in ev[:20]))
+    if r.history:
+        out.append("History: " + "; ".join(f"#{seq} {st} ({why})" for seq, st, why in r.history[-12:]))
+    if r.last_failure:
+        out.append("Last failure: " + "; ".join(r.last_failure[:10]))
+    if r.review_missing:
+        out.append("Reviewer found missing: " + "; ".join(r.review_missing[:10]))
+    todos = [t for t in todos_in_order(g) if rid in t.requirements]
+    if todos:
+        out.append("Your todo items for it: " + "; ".join(f"[{t.status}] {t.title}" for t in todos[:10]))
     return "\n".join(out)
 
 
@@ -159,47 +169,7 @@ def render_history(g: Graph) -> str:
         out.append("  " + checkpoint_line(g, cp.id))
     gone = [c.id for c in g.checkpoints.values() if c.abandoned]
     if gone:
-        out.append(f"Abandoned by rollbacks: {id_ranges([str(x) for x in gone])}")
-    out.append("history(a=..., b=...) shows the diff between two checkpoints.")
-    return "\n".join(out)
-
-
-def render_task(g: Graph, tid: str) -> str:
-    """任务的完整信息：状态变化历史、被拒与重开的原因、全部笔记与步骤、改过的文件。"""
-    t = g.tasks.get(tid)
-    if t is None:
-        return f"Unknown task {tid}."
-    out = [task_line(g, tid)]
-    if t.description:
-        out.append(t.description.strip())
-    for rid in t.links:
-        r = g.requirements.get(rid)
-        if r:
-            out.append(f"- {rid} (task text): \"{r.quote}\"")
-    if t.checks:
-        out.append("- checks: " + ", ".join(t.checks[:30]))
-    if t.blocked_by:
-        out.append("- ordering hint: after " + ", ".join(t.blocked_by))
-    if t.history:
-        out.append("- history: " + "; ".join(f"#{seq} {st} ({why})" for seq, st, why in t.history[-15:]))
-    if t.last_failure:
-        out.append("- last failure: " + "; ".join(t.last_failure[:10]))
-    if t.review_missing:
-        out.append("- reviewer found missing: " + "; ".join(t.review_missing[:10]))
-    steps = steps_of(g, tid)
-    if steps:
-        out.append("- steps:")
-        for s in steps:
-            extra = f" — {s.summary}" if s.summary else ""
-            anchor = f" (checkpoint {s.checkpoint})" if s.checkpoint is not None else ""
-            out.append(f"  {s.id} [{s.status}] {s.title}{anchor}{extra}")
-    files = task_files(g, tid)
-    if files:
-        out.append("- files changed in checkpoints: " + ", ".join(f"{p} (+{a} -{d})" for p, a, d in files[:40]))
-    notes = notes_of_task(g, tid)
-    if notes:
-        out.append("- notes (self-reported):")
-        out.extend(f"  [{n.session or '-'}] {n.text}" for n in notes[-30:])
+        out.append(f"Abandoned by rollbacks: {', '.join(str(x) for x in sorted(gone))}")
     return "\n".join(out)
 
 
@@ -213,66 +183,80 @@ def _reason_lines(g: Graph, tree: str, regs, limit: int = 30) -> list[str]:
     return out
 
 
-def render_attempt(g: Graph, aid: Optional[str], task_id: Optional[str] = None) -> str:
-    """checkpoint / ready_for_review 的回复。"""
+def _rejection_lines(g: Graph, aid: str) -> list[str]:
+    a = g.attempts[aid]
     out = []
-    if aid is None:
-        cp = g.head_cp
-        out.append(f"Nothing new to checkpoint: the working tree (without test-path changes) equals checkpoint {cp.id}.")
-    else:
-        a = g.attempts[aid]
-        sel = "full suite" if a.selection is None else f"{len(a.selection)} related unit(s)"
-        if a.status == ATT_CREATED:
-            cp = g.checkpoints[a.checkpoint]
-            level = ("confirmed by the full suite" if cp.level == CONFIRMED else
-                     "provisional: related tests pass; the full suite runs in the background")
-            out.append(f"Checkpoint {a.checkpoint} created (attempt {aid}, tier {a.tier}, {sel}; {level}).")
-            if a.flaky:
-                out.append(f"Flaky (failed once, passed on rerun; not counted): {', '.join(a.flaky[:10])}")
-        elif a.status == ATT_SUPERSEDED:
-            out.append(f"Your working tree is already covered by checkpoint {g.head} (attempt {aid} was superseded "
-                       "by a newer checkpoint of the same work).")
-        elif a.status == ATT_REJECTED:
-            out.append(f"Checkpoint rejected (attempt {aid}, {a.reason}). The checkpoint chain did not move; your "
-                       "working tree is unchanged.")
-            if a.regressions:
-                out.append(f"{len(a.regressions)} check(s) that passed on the original code do not pass now "
-                           "(failure reason from the test output under each):")
-                out.extend(_reason_lines(g, a.tree, a.regressions))
-                if len(a.regressions) > 30:
-                    out.append(f"  ... and {len(a.regressions) - 30} more")
-                out.append("Use failure_log(test=...) for the full traceback, run_check(tests=[...], as_gate=true) "
-                           "to reproduce exactly as the gate runs it.")
-            if a.flaky:
-                out.append(f"Flaky (not counted): {', '.join(a.flaky[:10])}")
-            w = g.wips.get(a.worker)
-            detail = (w.last_rejection or {}).get("detail") if w else ""
-            if detail:
-                out.append(f"Runner notes: {detail[:600]}")
-            snap = g.snapshots.get(a.snapshot)
-            if snap is not None and a.regressions:
-                reg_files = {regression_ids([r])[0].split("::")[0] for r in a.regressions}
-                overlap = sorted(reg_files & set(snap.dropped))
-                if overlap:
-                    out.append("These tests ran in their original version: your changes to "
-                               + ", ".join(overlap[:10]) + " were not used.")
-        else:
-            out.append(f"Attempt {aid} is {a.status}.")
-        snap = g.snapshots.get(g.attempts[aid].snapshot)
-        if snap is not None and snap.dropped and g.attempts[aid].status != ATT_REJECTED:
+    if a.regressions:
+        out.append(f"{len(a.regressions)} check(s) that passed on the original code do not pass now "
+                   "(failure reason from the test output under each):")
+        out.extend(_reason_lines(g, a.tree, a.regressions))
+        if len(a.regressions) > 30:
+            out.append(f"  ... and {len(a.regressions) - 30} more")
+        out.append("failure_log(test=...) shows the full traceback.")
+    if a.flaky:
+        out.append(f"Flaky (not counted): {', '.join(a.flaky[:10])}")
+    w = g.wips.get(a.worker)
+    detail = (w.last_rejection or {}).get("detail") if w else ""
+    if a.reason == "precheck":
+        snap = g.snapshots.get(a.snapshot)
+        out.append("The changed files do not compile: " + ((snap.precheck if snap else "") or detail or "")[:600])
+    elif detail:
+        out.append(f"Runner notes: {detail[:600]}")
+    snap = g.snapshots.get(a.snapshot)
+    if snap is not None and a.regressions:
+        reg_files = {regression_ids([r])[0].split("::")[0] for r in a.regressions}
+        overlap = sorted(reg_files & set(snap.dropped))
+        if overlap:
+            out.append("These tests ran in their original version: your changes to "
+                       + ", ".join(overlap[:10]) + " were not used.")
+    return out
+
+
+def render_submit(g: Graph, sid: str) -> str:
+    """submit 的回复：被拒（回归）/ 交还清单（还有没完成的需求）/ 接受。"""
+    s = g.submits[sid]
+    out = []
+    if s.status == SUB_REJECTED:
+        a = g.attempts.get(s.attempt) if s.attempt else None
+        out.append(f"Submit {sid} was not accepted: your working tree did not pass the regression gate "
+                   f"({s.reason or (a.reason if a else 'rejected')}). Nothing was recorded; your working tree is "
+                   "unchanged.")
+        if a is not None:
+            out.extend(_rejection_lines(g, a.id))
+        out.append("Fix this and call submit again.")
+        return "\n".join(out)
+    cp = g.checkpoints.get(s.checkpoint) if s.checkpoint is not None else None
+    if cp is not None:
+        level = ("confirmed by the full suite" if cp.level == CONFIRMED else
+                 "related tests pass; the full suite runs in the background")
+        out.append(f"Your work is in checkpoint {cp.id} ({level}).")
+        snap = g.snapshots.get(s.snapshot)
+        if snap is not None and snap.dropped:
             out.append("Not included (test paths are restored to the original): " + ", ".join(snap.dropped[:10]))
-    if task_id:
-        t = g.tasks[task_id]
-        if t.status == DONE:
-            out.append(f"{task_id} is DONE: all its checks passed on checkpoint {t.done_checkpoint}.")
-        elif t.status == DONE_UNVERIFIED:
-            out.append(f"{task_id} is done_unverified: it has no checks; its work is in checkpoint "
-                       f"{t.done_checkpoint}.")
-        elif t.status == ACTIVE and t.reopen_reason:
-            out.append(f"{task_id} was reopened ({t.reopen_reason}); you still hold it."
-                       + (f" Failing: {'; '.join(t.last_failure[:10])}" if t.last_failure else ""))
-        else:
-            out.append(f"{task_id} is {t.status}.")
+    if s.status == SUB_ACCEPTED:
+        reqs = actionable(g)
+        ver = [r.id for r in reqs if r.status == REQ_VERIFIED]
+        sub = [r.id for r in reqs if r.status == REQ_SUBMITTED]
+        blk = [r.id for r in reqs if r.status == REQ_BLOCKED]
+        out.append(f"Submit {sid} accepted: no requirement on the checklist is left open.")
+        if ver:
+            out.append(f"Verified by their checks: {id_ranges(ver)}")
+        if sub:
+            out.append(f"Submitted (self-reported; the reviewer did not find anything missing): {id_ranges(sub)}")
+        if blk:
+            out.append(f"Reported blocked: {id_ranges(blk)}")
+        out.append("The harness now finalizes the run; you can stop.")
+        return "\n".join(out)
+    if s.status == SUB_RETURNED:
+        out.append(f"Submit {sid} is not accepted yet: {len(s.open)} requirement(s) are still open. Keep working on "
+                   "them and call submit again:")
+        for rid in s.open[:40]:
+            out.append("  - " + requirement_line(g, rid, 100))
+        if len(s.open) > 40:
+            out.append(f"  ... {len(s.open) - 40} more: board(status=\"open\")")
+        out.append("If one of them cannot be done here, say so in submit(blocked=[{requirement, kind, reason}]).")
+        return "\n".join(out)
+    out.append(f"Submit {sid} is still being checked ({s.status}); keep working, the result will be reported.")
     return "\n".join(out)
 
 
@@ -290,10 +274,8 @@ def render_located(g: Graph, lid: str, group: Optional[int] = None) -> str:
         where = []
         if att.get("session"):
             where.append(f"session {att['session']}")
-        if att.get("held"):
-            where.append("task " + ", ".join(att["held"][:3]))
-        if att.get("step"):
-            where.append(f"step {att['step']}")
+        if att.get("todo") and att["todo"] in g.todos:
+            where.append(f"while working on \"{g.todos[att['todo']].title[:80]}\"")
         tests = ", ".join(rec.get("tests", [])[:5])
         gl = f"s{good.get('id')}" if good.get("kind") == "snapshot" else f"checkpoint {good.get('id')}"
         bl = f"s{bad.get('id')}" if bad.get("kind") == "snapshot" else f"checkpoint {bad.get('id')}"
@@ -304,8 +286,8 @@ def render_located(g: Graph, lid: str, group: Optional[int] = None) -> str:
         chg = ", ".join(f"{p} (+{a} -{d})" for p, a, d in files[:8]) + (" ..." if len(files) > 8 else "")
         out.append(f"{head}. {gl} -> {bl} changed {chg or 'nothing outside test paths'}"
                    + (f"; diff: {rec['diff']}" if rec.get("diff") else "") + ".")
-        out.append(f"First choice: revert_change(located=\"{lid}#{rec.get('group', 0)}\") undoes only that change in "
-                   "your working tree (nothing is changed if it conflicts). rollback is the alternative.")
+        out.append(f"revert_change(located=\"{lid}#{rec.get('group', 0)}\") undoes only that change in your working "
+                   "tree (nothing is changed if it conflicts).")
     return "\n".join(out)
 
 
@@ -365,16 +347,16 @@ def render_job(g: Graph, jid: str, max_lines: int = 40) -> str:
 
 # ======================================================================== 账本
 
-def task_category(g: Graph, t, delivered: Optional[int]) -> str:
+def requirement_category(g: Graph, r: Requirement, delivered: Optional[int]) -> str:
     """verified / reviewed / self-reported / done-not-delivered / blocked / open。"""
-    if t.status in (DONE, DONE_UNVERIFIED) and delivered is not None and \
-            not is_ancestor(g, t.done_checkpoint, delivered):
+    if r.status in REQ_FINISHED and delivered is not None and r.checkpoint is not None and \
+            not is_ancestor(g, r.checkpoint, delivered):
         return "done-not-delivered"
-    if t.status == DONE:
+    if r.status == REQ_VERIFIED:
         return "verified"
-    if t.status == DONE_UNVERIFIED:
-        return "reviewed" if t.review == "yes" else "self-reported"
-    if t.status == BLOCKED:
+    if r.status == REQ_SUBMITTED:
+        return "reviewed" if r.review == "yes" else "self-reported"
+    if r.status == REQ_BLOCKED:
         return "blocked"
     return "open"
 
@@ -385,15 +367,10 @@ CATEGORIES = ("verified", "reviewed", "self-reported", "done-not-delivered", "bl
 def ledger(g: Graph) -> dict:
     """结构化账本：运行结束时写入报告，也用于实验指标。"""
     delivered = g.run.delivered if g.run and g.run.delivered is not None else g.confirmed
-    reqs = []
-    for rid in sorted(g.requirements, key=num):
-        r = g.requirements[rid]
-        reqs.append({"id": rid, "status": requirement_status(g, rid), "summary": r.summary, "quote": r.quote,
-                     "tasks": [t.id for t in g.tasks.values() if rid in t.links]})
-    tasks = [t for t in sorted(g.tasks.values(), key=lambda t: num(t.id)) if t.status != SPLIT]
+    reqs = actionable(g)
     cats = {c: [] for c in CATEGORIES}
-    for t in tasks:
-        cats[task_category(g, t, delivered)].append(t.id)
+    for r in reqs:
+        cats[requirement_category(g, r, delivered)].append(r.id)
     cp = g.head_cp
     dcp = g.checkpoints.get(delivered) if delivered is not None else None
     return {
@@ -411,19 +388,25 @@ def ledger(g: Graph) -> dict:
         "head_full_verified": bool(cp and full_verified(g, cp.tree)),
         "head_regressions": list(tree_regressions(g, cp.tree)) if cp and full_verified(g, cp.tree) else [],
         "guard_checks": len(active_guard(g)),
-        "waived": [{"test": w.test, "task": w.task, "quote": w.quote, "reason": w.reason}
+        "waived": [{"test": w.test, "requirement": w.requirement, "quote": w.quote, "reason": w.reason}
                    for w in sorted(g.waived.values(), key=lambda w: (w.seq, w.test))],
         "categories": {c: len(v) for c, v in cats.items()},
-        "category_tasks": cats,
-        "requirements": reqs,
-        "tasks": [{"id": t.id, "title": t.title, "status": t.status, "category": task_category(g, t, delivered),
-                   "links": list(t.links), "checks": len(t.checks), "origin": t.origin,
-                   "done_checkpoint": t.done_checkpoint, "reopened": t.reopen_count, "review": t.review,
-                   "steps": len(steps_of(g, t.id)),
-                   "blocked": {"kind": t.blocked_kind, "reason": t.blocked_reason, "quote": t.blocked_quote}
-                   if t.status == BLOCKED else None} for t in tasks],
-        "not_delivered": [t.id for t in done_not_delivered(g, delivered)],
-        "unfinished": [t.id for t in workable(g)],
+        "category_requirements": cats,
+        "requirements": [{"id": r.id, "kind": r.kind, "status": r.status,
+                          "category": requirement_category(g, r, delivered) if r.kind == ACTIONABLE else "context",
+                          "summary": r.summary, "quote": r.quote, "checks": len(r.checks),
+                          "evidence_checks": len(evidence_checks(g, r)), "checkpoint": r.checkpoint,
+                          "reopened": r.reopen_count, "review": r.review,
+                          "blocked": {"kind": r.blocked_kind, "reason": r.blocked_reason, "quote": r.blocked_quote}
+                          if r.status == REQ_BLOCKED else None}
+                         for r in sorted(g.requirements.values(), key=lambda r: num(r.id))],
+        "not_delivered": [r.id for r in done_not_delivered(g, delivered)],
+        "unfinished": [r.id for r in open_requirements(g)],
+        "submits": [{"id": s.id, "status": s.status, "implicit": s.implicit, "checkpoint": s.checkpoint,
+                     "open": list(s.open), "reason": s.reason} for s in sorted(g.submits.values(), key=lambda s: s.seq)],
+        "reviews": [{"id": v.id, "phase": v.phase, "requirements": list(v.requirements), "status": v.status,
+                     "results": {k: x.get("implemented") for k, x in v.results.items()}}
+                    for v in sorted(g.reviews.values(), key=lambda v: v.seq)],
         "checkpoints": [{"id": c.id, "parent": c.parent, "trigger": c.trigger, "kind": c.kind, "level": c.level,
                          "tier": c.tier, "files": len(c.files), "demoted": c.demoted, "abandoned": c.abandoned,
                          "snapshot": c.snapshot, "label": c.label}
@@ -432,8 +415,8 @@ def ledger(g: Graph) -> dict:
                      "superseded": sum(a.status == ATT_SUPERSEDED for a in g.attempts.values()),
                      "background": sum(a.lane == "bg" for a in g.attempts.values())},
         "snapshots": len(g.snapshots),
-        "steps": {"total": len(g.steps), "anchored": sum(s.status == STEP_ANCHORED for s in g.steps.values()),
-                  "declared": sum(s.status == STEP_DECLARED for s in g.steps.values())},
+        "todos": {"total": len(g.todos), "anchored": sum(t.status == TODO_ANCHORED for t in g.todos.values()),
+                  "completed": sum(t.status == TODO_COMPLETED for t in g.todos.values())},
         "locates": [{"id": l.id, "trigger": l.trigger, "tests": list(l.tests)[:10], "status": l.status,
                      "results": [{"good": r.get("good", {}).get("id"), "bad": r.get("bad", {}).get("id"),
                                   "exact": r.get("exact")} for r in l.results]} for l in g.locates.values()],
@@ -443,7 +426,7 @@ def ledger(g: Graph) -> dict:
         "sessions": [{"id": s.id, "reason": s.reason, "end": s.end_reason, "turns": s.turns, "progress": s.progress,
                       "compactions": len(s.compactions), "resumes": list(s.resumes)}
                      for s in sorted(g.sessions.values(), key=lambda s: num(s.id))],
-        "stalls": [{"kind": s.kind, "action": s.action, "task": s.task} for s in g.stalls],
+        "stalls": [{"kind": s.kind, "action": s.action} for s in g.stalls],
         "recoveries": g.run.recoveries if g.run else 0,
         "rebuilds": g.run.rebuilds if g.run else 0,
     }
@@ -460,26 +443,28 @@ def ledger_markdown(g: Graph) -> str:
            + (" — delivery falls behind the head" if L["delivered_checkpoint"] not in (None, L["head"]) else ""),
            f"- regression gate: {L['guard_checks']} checks"
            + (f", {len(L['waived'])} waived (see below)" if L["waived"] else "")
-           + (" (degraded mode: verification switched the working tree; no background verification)"
+           + (" (degraded mode: verification switched the working tree; background verification only at handoffs)"
               if L["degraded"] else ""),
-           "- tasks: " + ", ".join(f"{k} {v}" for k, v in c.items()), "", "## Requirements", ""]
+           "- requirements: " + ", ".join(f"{k} {v}" for k, v in c.items()),
+           f"- submits: {len(L['submits'])}"
+           + (f" (last: {L['submits'][-1]['status']})" if L["submits"] else ""), "", "## Requirements", ""]
     for r in L["requirements"]:
-        out.append(f"- {r['id']} [{r['status']}] {r['summary'] or r['quote'][:120]} (tasks: {', '.join(r['tasks'])})")
-    out += ["", "## Tasks", ""]
-    for t in L["tasks"]:
-        line = f"- {t['id']} [{t['category']}] {t['title']}"
-        if t["blocked"]:
-            line += f" — blocked ({t['blocked']['kind']}): {t['blocked']['reason']}"
+        if r["kind"] != "actionable":
+            continue
+        line = f"- {r['id']} [{r['category']}] {r['summary'] or r['quote'][:120]}"
+        if r["blocked"]:
+            line += f" — blocked ({r['blocked']['kind']}): {r['blocked']['reason']}"
         out.append(line)
+    ctx = [r["id"] for r in L["requirements"] if r["kind"] != "actionable"]
+    if ctx:
+        out += ["", f"Context (not on the checklist): {id_ranges(ctx)}"]
     if L["not_delivered"]:
         out += ["", f"Finished but not in the deliverable (finished after the delivered checkpoint): "
                     f"{', '.join(L['not_delivered'])}"]
-    if L["unfinished"]:
-        out += ["", f"Unfinished: {', '.join(L['unfinished'])}"]
     if L["waived"]:
         out += ["", "## Waived regression checks", "",
                 "Existing tests taken out of the regression gate because the worker quoted task text asking for "
                 "behaviour they contradict (the tests had failed on its changes):", ""]
         for w in L["waived"]:
-            out.append(f"- {w['test']} ({w['task']}): \"{w['quote'][:200]}\" — {w['reason'][:300]}")
+            out.append(f"- {w['test']} ({w['requirement'] or '-'}): \"{w['quote'][:200]}\" — {w['reason'][:300]}")
     return "\n".join(out) + "\n"

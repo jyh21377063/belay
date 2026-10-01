@@ -1,7 +1,8 @@
-"""Belay worker 的系统提示、规划器与压缩器的提示词。
+"""Belay worker 的系统提示、规划器、复查者与压缩器的提示词。
 
-系统提示的主体与 B 组（belay/worker/prompts.py）相同（通用的好做法）；差别只在“环境”与“收尾”两节：
-Belay 的运行何时结束由 runtime 的图决定，交付的是最近的存档。这里不规定工作流程，只说明 runtime 提供了什么。
+系统提示的主体与 B 组（belay/worker/prompts.py）相同（通用的好做法）；差别只在“环境”“harness”与“收尾”三节。
+v7：只讲 worker 需要知道的三件事（后台在存档和测试、todo 是重置后能拿回的进度、做完了调 submit）；
+revert_change、waive_check 等反应式工具的用法写在触发它们的消息里，不放进系统提示。
 """
 from __future__ import annotations
 
@@ -21,34 +22,14 @@ packages from the internet.
 - Tool results may include notes from the system in <system-reminder> tags.
 
 # The harness
-A runtime ("the harness") keeps a task graph for this run so that no progress is lost when a session ends, the \
-context is compacted, or something crashes:
-- Requirements were extracted verbatim from the task statement and are frozen; tasks are the work, linked to \
-requirements. `board` shows a summary (with filters), `task` shows everything about one task. Claim a task to make \
-it your current focus and call `ready_for_review` when it is finished; add tasks you discover with `add_task`; \
-report tasks you cannot finish with `report_blocked`. Dependencies between tasks are ordering hints only.
-- Your plan for the current task is its list of steps: `todo_write` records it with the harness, and `step_done` \
-marks the current step finished (marking a todo completed does the same). After an interruption the harness hands \
-the plan back to you with your progress, so keep it up to date.
-- The harness snapshots your working tree as you work, so nothing is lost, but it does not test those snapshots: \
-work in progress is allowed to break tests. Your work becomes a checkpoint (verified: no test that passed on the \
-original code fails, errors, is skipped or goes missing) when you finish a step (`step_done`, verified in the \
-background), call `checkpoint` (verified right away and labelled) or `ready_for_review`, and once more at the end. \
-So finish steps when a coherent piece of work is complete. Changes under test paths are never delivered: the \
-existing tests are the acceptance baseline. When the task text explicitly asks for behaviour that an existing test \
-contradicts, `waive_check` (quoting that task text) takes the test out of the gate; every waiver is reported.
-- A task counts as done only when the harness observes its checks passing on a checkpoint; a task without checks \
-becomes done_unverified and may be reviewed and reopened. Your own statements are recorded as notes, not as \
-evidence.
-- When a checkpoint is rejected you get the failing tests with their failure reasons; `failure_log` shows a full \
-traceback, `run_check` with as_gate=true reproduces a check exactly as the gate runs it, and when the harness has \
-located the change that broke a test, `revert_change` undoes just that change. `history` shows the checkpoints.
-- The harness manages your context automatically: when the conversation grows long it is compacted, or the work \
-continues in a fresh session that starts from the task graph (the same happens after a crash). The length of the \
-conversation does not limit how much work you can do. Use `note` for decisions, dead ends and next steps that a \
-fresh session would need.
-- `run_check` + `wait` run long test commands as background jobs; use them instead of sleeping.
-How you do the work — what to read, in which order, which tools to use — is entirely up to you.
+- The harness snapshots and tests your work in the background; you do not need to do anything for that. Changes \
+to test files are never delivered, and existing tests that passed must keep passing.
+- It keeps a checklist of the requirements in the task (`board` shows it with each requirement's status) and \
+restores your context if the session is reset, so the length of the conversation does not limit how much work you \
+can do.
+- For multi-step work keep a todo list with todo_write: it is what you get back after a reset.
+- When you believe every requirement is done, call submit: the harness tests your work, checks each requirement \
+and tells you what is still missing.
 
 # Doing the task
 - Read the whole task statement. The requested scope is the deliverable; do not quietly narrow it. When something \
@@ -70,8 +51,7 @@ lists the known failures).
 # When you are stuck
 - Read the full error, check your assumptions, try a focused fix. Do not retry the identical action.
 - If repeated attempts fail, step back: list several possible causes and test them in order of likelihood. Do not \
-abandon a viable approach after a single failure either. If a task is too large to finish in one piece, split it \
-with `add_task`; use `report_blocked` only when the task genuinely cannot be done here.
+abandon a viable approach after a single failure either.
 
 # Using your tools
 - Use the dedicated tools instead of bash for file operations: read_file, edit_file, write_file, list_files, \
@@ -80,14 +60,14 @@ grep_search. Reserve bash for running programs, tests and builds. Use non-intera
 - Long outputs are truncated; the full text is saved to a file whose path is shown.
 {explore_hint}
 # Finishing
-When every task you can do is done or reported blocked, end your turn with a short factual summary and no tool \
-call. The harness then checks the task graph: if work remains, a new session \
-continues it. Report what actually happened; a claim that something works must rest on a result you \
-observed.
+Before you call submit, go back to the task statement and check every requirement against what you actually did, \
+run the relevant tests, and review `git status` and `git diff`. In the summary, report what actually happened; a \
+claim that something works must rest on a result you observed. If a requirement cannot be done here, say so in \
+submit's blocked list instead of skipping it silently.
 """
 
 L3_PROMPT = """The harness is about to compact this conversation. It already keeps, outside your context, the task \
-text, the requirements and task statuses, which files changed, test results, checkpoint rejections and your notes; \
+text, the requirements and their status, your todo list, which files changed, test results and rejected submits; \
 those will be shown to you again. Write ONLY what it cannot know:
 
 1. Key decisions and the reasons for them.
@@ -104,41 +84,33 @@ After that you will see only the task statement and this summary. Write these se
 fixes; 5. Problem solving; 6. All user messages; 7. Pending tasks; 8. Current work; 9. Next step.
 Output only the summary. Do not call any tools."""
 
-PLANNER_SYSTEM = """You split a software task statement into requirements and an initial task list for an \
-autonomous coding agent. You do not solve the task.
+PLANNER_SYSTEM = """You turn a software task statement into a checklist of requirements for an autonomous coding \
+agent. You do not solve the task.
 
 Rules:
 - A requirement is a verbatim quote from the task statement plus a one-sentence summary. Copy the quote exactly \
-(whitespace may differ). Together the quotes must cover every substantive line of the statement; headings and \
-boilerplate need not be quoted. Group closely related lines into one requirement when natural; very long statements \
-(release notes) may have many requirements.
-- Tasks are units of work. Every requirement must be linked by at least one task; a task may link several \
-requirements. Use blocked_by only for real ordering constraints; no cycles.
-- checks: only list test node ids that appear in the provided list of existing tests and that directly verify the \
-task. Leave it empty when unsure. Tests that do not exist yet cannot be listed.
-- priority: an integer hint (higher first) used only to break ties.
+(whitespace may differ). Together the quotes must cover every substantive line of the statement.
+- kind: "actionable" for a change the code must get (one item of release notes, one behaviour to add or fix); \
+"context" for lines that only frame the task: headings, dates, version banners, "the code is at /testbed", markers \
+such as "begin/end of the release notes", or a sentence that only says "implement everything below". Context lines \
+are covered but are not on the checklist. There must be at least one actionable requirement.
+- Make one actionable requirement per independent change; group lines only when they describe the same change. \
+Very long statements (release notes) may have many requirements.
+- checks: only for actionable requirements, only test node ids that appear in the provided list of existing tests \
+and that directly verify the requirement. Leave it empty when unsure. Tests that do not exist yet cannot be listed.
 
 Reply with a single JSON object and nothing else:
-{"requirements": [{"id": "R1", "quote": "...", "summary": "..."}],
- "tasks": [{"id": "T1", "title": "...", "description": "...", "links": ["R1"], "blocked_by": [], "priority": 0,
-            "checks": []}]}"""
+{"requirements": [{"id": "R1", "kind": "actionable", "quote": "...", "summary": "...", "checks": []}]}"""
 
 PLANNER_RETRY = """Your proposal was rejected by the validator:
 {problems}
 
 Fix these problems and reply with the complete corrected JSON object only."""
 
-SPLIT_SYSTEM = """A coding agent is stuck on one task. Propose a split of that task into 2-4 smaller tasks that \
-together cover all of its linked requirements. Reply with a single JSON object and nothing else:
-{"children": [{"title": "...", "description": "...", "links": ["R1"], "checks": []}]}"""
-
-
 def system_prompt(workdir: str, platform: str, has_explore: bool = True) -> str:
     return SYSTEM_PROMPT.format(workdir=workdir, platform=platform or "Linux",
                                 explore_hint=EXPLORE_HINT if has_explore else "")
 
-
-STEP_HINT = "When the current step is finished, call step_done."
 
 DIAGNOSE_SYSTEM = """You explain why a regression happened in a codebase that an autonomous coding agent is changing. \
 The harness has already located, from test runs on snapshots, the change after which the test started failing. You \
@@ -150,16 +122,20 @@ only explain; you cannot change code or the rules. Reply with a single JSON obje
 Set intentional.likely=true only if the change looks deliberately made for a requirement; then quote the task text \
 verbatim in intentional.quote. Keep the whole reply under 300 words."""
 
-REVIEW_SYSTEM = """You review whether a task in a software project was actually implemented. You can only find \
-problems: you cannot mark anything as done. Compare the requirement text with the diff. Reply with a single JSON \
-object and nothing else:
-{"implemented": "yes" | "partial" | "no", "missing": ["what is missing, concretely"], "evidence": ["path:line ..."]}
-Answer "yes" when the diff plausibly implements every part of the requirement."""
+REVIEW_SYSTEM = """You review whether requirements of a software task were actually implemented. An autonomous \
+coding agent says it finished them. You can only find problems: you cannot mark anything as done. For each \
+requirement, compare its text with the changes (the parts of the diff that look related are shown first; the list \
+of all changed files is given too). Reply with a single JSON object and nothing else:
+{"requirements": [{"id": "R3", "implemented": "yes" | "partial" | "no", "missing": ["what is missing, concretely"], \
+"evidence": ["path:line ..."]}]}
+Answer "yes" when the changes plausibly implement every part of the requirement. Answer for every requirement \
+listed."""
 
-REVIEW_BLOCKED_SYSTEM = """An autonomous coding agent reported that a task cannot be done because the task text \
-does not give enough information. Decide whether there is a reasonable reading of the task text that an engineer \
-would act on. Reply with a single JSON object and nothing else:
-{"reading": "the reasonable reading, in one or two sentences, or an empty string if there is none"}"""
+REVIEW_BLOCKED_SYSTEM = """An autonomous coding agent reported that some requirements of a task cannot be done \
+because the task text does not give enough information. For each, decide whether there is a reasonable reading of \
+the task text that an engineer would act on. Reply with a single JSON object and nothing else:
+{"requirements": [{"id": "R3", "reading": "the reasonable reading, in one or two sentences, or an empty string if \
+there is none"}]}"""
 
 LABEL_SYSTEM = """Summarise in one line (at most 25 words) what the agent did in the conversation excerpt below, as \
 a label for a saved state of the code. Output only the line."""

@@ -148,9 +148,8 @@ class Sim:
         self.do(R.record_baseline, j1, j2, isolation=isolation or {"valid": True})
         rep = validate_plan(task, plan, R.known_checks(self.g))
         assert rep.ok, rep.problems
-        reqs, tasks = renumber(rep)
         self.do(R.propose_plan, 1, plan, True, [])
-        self.do(R.freeze_plan, reqs, tasks)
+        self.do(R.freeze_plan, renumber(rep))
 
     def snap(self, tree: str, files=(("pkg/mod.py", 1, 1),), dropped=(), raw: Optional[str] = None,
              testable: bool = True, reason: str = "writes", worker: str = "w1") -> int:
@@ -158,14 +157,17 @@ class Sim:
                       commit="s" + h(tree))
         return self.do(R.record_snapshot, worker, obs, reason)
 
-    def checkpoint(self, tree: str, files=(("pkg/mod.py", 1, 1),), **kw):
-        """手动存档：强制拍快照再发起前台尝试（与 WorkerPort 相同）。"""
-        n = self.snap(tree, files, reason="checkpoint", **kw)
-        return self.do(R.request_checkpoint, "w1", n, "worker")
+    def submit(self, tree: str, files=(("pkg/mod.py", 1, 1),), summary: str = "done", blocked=(), **kw) -> str:
+        """提交：强制拍快照再发起提交（与 WorkerPort 相同）。返回提交 id。"""
+        n = self.snap(tree, files, reason="submit", **kw)
+        return self.do(R.request_submit, "w1", n, summary, list(blocked))
 
-    def review(self, task: str, tree: str, files=(("pkg/mod.py", 1, 1),), **kw):
-        n = self.snap(tree, files, reason="review", **kw)
-        return self.do(R.request_review, "w1", task, n)
+    def review(self, vid: str, results: dict) -> None:
+        """复查者的结论（llm）：results = {需求: {implemented, missing} 或 {reading}}。"""
+        self.do(R.record_review, vid, results)
+
+    def running_reviews(self) -> list[str]:
+        return [v.id for v in self.g.reviews.values() if v.status == "running"]
 
     def advance(self, sec: float) -> None:
         self.now += sec
