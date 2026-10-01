@@ -117,6 +117,8 @@ def agent_phase(plan: RunPlan, step: Step, t: TaskRef, d: Path) -> dict:
     mode = trial_grade_mode(plan, step, t)
     verify_inline = plan.inline_verify or mode == "inline"
     extra = {}
+    if "budget_min" in (step.agent.get("kwargs") or {}):   # 自研 agent 的内部预算跟随 --timeout-min，两者不会错开
+        extra["budget_min"] = plan.timeout_min
     if step.agent.get("gate"):              # A-gate：每题的门禁配置由转换器生成（task_dir/gate.json，不进容器）
         gate_file = plan.task_dir(t) / "gate.json"
         if gate_file.exists():

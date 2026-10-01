@@ -858,7 +858,10 @@ class BelayRun:
             full = len(bundles) >= max(2, self.cfg.mirror_consolidate)
             new_cps = cps if full else [c for c in cps if c.id not in done_cps]
             new_snap = latest is not None and (full or latest.n > int(meta.get("snap") or 0))
-            tips = [f"{SNAP_REF}{latest.n}"] if new_snap else []
+            tips = []
+            if new_snap:                      # 树没变时快照沿用上一张的提交，不会写自己的 ref：这里补上
+                await self.repo.update_ref(f"{SNAP_REF}{latest.n}", latest.commit)
+                tips.append(f"{SNAP_REF}{latest.n}")
             for c in new_cps:                                          # bundle 记录的是引用名，不能只给提交哈希
                 await self.repo.set_cp_ref(c.id, c.commit)
                 tips.append(f"{CP_REF}{c.id}")
