@@ -102,6 +102,14 @@ class Harness:
         return Path(self.settings.run_dir)
 
 
+def assert_t2_blocked(run: BelayRun, res) -> None:
+    """脚本里 T2 以 insufficient_info 受阻、其余都做完时：运行如实记为 INCOMPLETE，原因只有这一条，交付的是确认点。"""
+    g = run.rt.graph
+    assert res.status == "INCOMPLETE", res.status
+    assert g.run.status_reasons == ("R2 is blocked (T2: insufficient_info)",), g.run.status_reasons
+    assert g.run.delivered_level == "confirmed"
+
+
 def results(llm: ScriptedLLM) -> list[str]:
     out = []
     for r in llm.requests:
@@ -138,7 +146,8 @@ def test_happy_path_done(tmp_path):
     assert "done_unverified" in out[6]
     patch = (h.run_dir() / "deliverable.diff").read_text()
     assert "+    return a + b" in patch and "+def sub(a, b):" in patch
-    assert (h.run_dir() / "checkpoints/1.diff").exists() and (h.run_dir() / "ledger.md").exists()
+    assert (h.run_dir() / "checkpoints/2.diff").exists() and (h.run_dir() / "ledger.md").exists()
+    assert not (h.run_dir() / "checkpoints/1.diff").exists()                # 自动存档不写补丁镜像
     events = h.verify_log(run)
     assert [e.type for e in events].count("checkpoint_created") == 3        # 0、1（自动）、2（review）
     assert events[-1].type == "delivered" and events[-1].get("status") == "DONE"
@@ -166,7 +175,7 @@ def test_regression_rejected_and_test_changes_are_not_delivered(tmp_path):
     rejected = next(o for o in out if "Checkpoint rejected" in o)
     assert MUL in rejected and "reopened (checkpoint_rejected)" in rejected
     assert "tests/test_mod.py" in rejected                          # 说明测试改动没有进入候选
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     patch = (h.run_dir() / "deliverable.diff").read_text()
     assert "tests/test_mod.py" not in patch and "+    return a + b" in patch
     assert "tests/test_mod.py" in (h.run_dir() / "worktree.diff").read_text()
@@ -185,7 +194,7 @@ def test_session_end_is_not_run_end(tmp_path):
                        call(tu("2", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     g = run.rt.graph
     assert [s.end_reason for s in g.sessions.values()] == ["done", "done"]
     assert g.sessions["S2"].reason == "restart"
@@ -220,7 +229,7 @@ def test_l2_compaction_replaces_old_conversation_with_graph(tmp_path):
     llm = ScriptedLLM(script, context_tokens=[1000, 1000, 6000, 1000, 1000, 1000])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     req = llm.requests[3]                                                   # 压缩之后的第一次调用
     first = first_message(req)
     assert "earlier conversation in this session was replaced" in first
@@ -258,7 +267,7 @@ def test_l4_handoff_keeps_lease_notes_and_summary(tmp_path):
     llm = ScriptedLLM(script, context_tokens=[1000, 1000, 1000, 6000, 1000, 1000, 1000, 1000])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     g = run.rt.graph
     assert g.sessions["S1"].end_reason == "handoff" and g.sessions["S2"].reason == "handoff"
     claims = [e for e in h.verify_log(run) if e.type == "task_claimed"]
@@ -291,7 +300,7 @@ def test_model_failure_is_retried_in_memory(tmp_path):
                        call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")], crash_at=4)
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     g = run.rt.graph
     assert len(g.sessions) == 1 and g.sessions["S1"].resumes == ("memory",)
     retried = llm.requests[3]["messages"]
@@ -315,7 +324,7 @@ def test_context_problem_starts_a_new_session(tmp_path):
                            call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")], crash_at=4)
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     g = run.rt.graph
     assert g.sessions["S1"].end_reason == "crash" and "context window" in g.sessions["S1"].error
     assert g.sessions["S2"].reason == "crash" and not g.sessions["S1"].resumes
@@ -374,7 +383,8 @@ def test_runtime_crash_around_cas_is_reconciled(tmp_path, cas_first):
     s1 = [PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD)]
     s2 = [call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")]
     run, res, llm2 = _crash_then_resume(h, CrashBeforeCAS, s1, s2, cas_first=cas_first)
-    assert res.status == "DONE" and res.checkpoint == 1
+    assert_t2_blocked(run, res)
+    assert res.checkpoint == 1
     events = h.verify_log(run)
     types = [e.type for e in events]
     assert types.count("checkpoint_advancing") == 1 and types.count("checkpoint_created") == 2     # 0 与 1，只创建一次
@@ -399,7 +409,8 @@ def test_runtime_crash_with_a_lost_job(tmp_path):
     s1 = [PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD)]
     s2 = [call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")]
     run, res, _ = _crash_then_resume(h, LoseJobs, s1, s2)
-    assert res.status == "DONE" and res.checkpoint == 1
+    assert_t2_blocked(run, res)
+    assert res.checkpoint == 1
     events = h.verify_log(run)
     lost = [e for e in events if e.type == "job_finished" and e.get("state") == "unknown"]
     assert len(lost) == 1
@@ -447,7 +458,7 @@ def test_run_check_wait_and_rollback(tmp_path):
     assert "REGRESSIONS" in out[4] and MUL in out[4]
     assert "restored to checkpoint 0" in out[5]
     assert "return a * b" in out[6] and "return a - b" in out[6]            # 回退后文件回到原样
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     h.verify_log(run)
 
 
@@ -474,7 +485,7 @@ def test_stuck_worker_is_restarted_but_long_tool_calls_are_not_stuck(tmp_path):
                       call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")], hang_at=4)
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     g = run.rt.graph
     assert g.sessions["S1"].end_reason == "stuck" and g.sessions["S1"].turns == 2
     assert g.sessions["S2"].reason == "restart"
@@ -503,7 +514,7 @@ def test_stall_escalates_to_replan_and_split(tmp_path):
     kinds = [(s.kind, s.action) for s in g.stalls]
     assert ("no_progress", "hint") in kinds and ("repeated_failure", "replan") in kinds
     assert g.tasks["T1"].status == "split" and g.tasks["T1"].children == ("T3", "T4")
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     notices = " ".join(json.dumps(r["messages"][-1]["content"]) for r in worker.requests)
     assert "rejected for the same reason" in notices and "was split into T3, T4" in notices
     assert not re.search(r"\d+ min\b|minutes|time budget|[Tt]ime left", notices)   # 时间不进给模型的文字

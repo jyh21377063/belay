@@ -113,8 +113,8 @@ python -m belay.cli flat --workdir /path/to/repo --task-file task.md    # B 组
 
 运行目录：`events.sqlite`（事件与视图快照，唯一真相）、`events.jsonl`（同内容，便于阅读）、`sessions/S*.jsonl`
 （每个会话的完整对话与消息轨迹，用于审计与读盘重放）、`git/<m>.bundle`（影子仓库的增量镜像，用于重建）、`blobs/`
-（大工具输出、diff、压缩后的消息）、`checkpoints/<k>.diff`（每个存档的补丁镜像，给人看）、`deliverable.diff`
-（交付物 = 最新的确认点）、`worktree.diff`（结束时工作区的完整改动）、`ledger.json` / `ledger.md`（六类口径）。
+（大工具输出、diff、压缩后的消息）、`checkpoints/<k>.diff`（里程碑存档的补丁镜像，给人看）、`deliverable.diff`
+（交付物 = 最新的确认点）、`worktree.diff`（结束时工作区的完整改动）、`ledger.json` / `ledger.md`（六类口径，以及不是 DONE 的原因）。
 
 > eval 适配（`eval/agents/belay_agent.py`）仍指向 v4 的旧 runtime，接评测时按 `belay.runtime.driver.BelayRun` 重写。
 

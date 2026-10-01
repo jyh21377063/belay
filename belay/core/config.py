@@ -67,6 +67,7 @@ class BelayConfig:
     resume_max_downtime_sec: float = 1800   # runtime 崩溃后停机超过该时长就不再原样接上对话
     resume_max_failures: int = 2            # 同一会话连续恢复失败这么多次 → 开新会话
     mirror_every: int = 10                  # 每这么多张快照导出一次 git bundle
+    mirror_consolidate: int = 32            # 增量 bundle 累积到这么多份时合并成一份完整的
     # ---- 步骤与交接时机（模块 H）
     handoff_soft_tokens: int = 0            # 0 = 等于 l2_tokens
     step_done_hint: bool = False            # 软阈值后是否提示“当前步骤完成后请调用 step_done”

@@ -7,7 +7,8 @@ from belay.core.config import BelayConfig
 from belay.core.model import (ACTIVE, ATT_CREATED, ATT_REJECTED, ATT_SUPERSEDED, BLOCKED, CONFIRMED, DONE,
                               DONE_UNVERIFIED, JOB_FINISHED, OPEN, REVIEW, SPLIT, STEP_ANCHORED, STEP_DECLARED, Graph)
 from belay.core.queries import (chain, done_not_delivered, holder, id_ranges, is_ancestor, notes_of_task, num,
-                                requirement_status, steps_of, suspect, task_files, unfinished_deps, workable)
+                                requirement_status, status_reasons, steps_of, suspect, task_files, unfinished_deps,
+                                workable)
 from belay.core.suggest import suggest
 from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, checkpoint_full_ok, full_verified, guard_set,
                                reasons_for_tree, regression_ids, tree_regressions)
@@ -396,6 +397,8 @@ def ledger(g: Graph) -> dict:
     dcp = g.checkpoints.get(delivered) if delivered is not None else None
     return {
         "status": g.run.status if g.run else None,
+        "status_reasons": list(g.run.status_reasons) if g.run and g.run.delivered is not None
+        else status_reasons(g, delivered),
         "delivered_checkpoint": g.run.delivered if g.run else None,
         "delivered_level": dcp.level if dcp else None,
         "delivered_full_ok": checkpoint_full_ok(g, delivered),
@@ -448,6 +451,7 @@ def ledger_markdown(g: Graph) -> str:
     c = L["categories"]
     out = ["# Belay ledger", "",
            f"- status: **{L['status']}**, delivered checkpoint {L['delivered_checkpoint']} ({L['delivered_level']})",
+           *[f"  - not DONE because {r}" for r in L["status_reasons"]],
            f"- deliver_unconfirmed={L['deliver_unconfirmed']}; chain head {L['head']}, latest confirmed "
            f"{L['confirmed']}"
            + (" — delivery falls behind the head" if L["delivered_checkpoint"] not in (None, L["head"]) else ""),

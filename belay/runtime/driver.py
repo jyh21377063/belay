@@ -791,43 +791,58 @@ class BelayRun:
 
     # ================================================================ 镜像（G3）
     async def mirror(self, reason: str) -> None:
-        """把影子仓库新增的对象导出为增量 git bundle，写到宿主机 run_dir/git/<m>.bundle。"""
+        """把影子仓库新增的对象导出为增量 git bundle，写到宿主机 run_dir/git/<n>.bundle。
+
+        快照提交是一条链（父提交是上一张快照），所以最新快照的 ref 覆盖全部快照；存档 ref 只多出提交对象。
+        增量 bundle 累积到 mirror_consolidate 份时合并成一份完整的（以 0 号基线为前提），旧文件删掉：
+        一天的运行不会在宿主机上留下成千上万个小文件，重建时也不用逐个 unbundle。"""
         async with self._mirror_lock:
             g = self.rt.graph
             meta = dict(self.store.get_meta("mirror", {}) or {})
+            bundles = list(meta.get("bundles") or [])
+            seq = int(meta.get("seq") or len(bundles)) + 1
             snaps = [s for s in g.snapshots.values() if s.commit and not s.lost]
             latest = max(snaps, key=lambda s: s.n) if snaps else None
             done_cps = set(meta.get("cps") or [])
-            new_cps = [c for c in g.checkpoints.values() if c.id > 0 and c.id not in done_cps]
-            tips = ([f"{SNAP_REF}{latest.n}"] if latest and latest.n > int(meta.get("snap") or 0) else [])
+            cps = [c for c in g.checkpoints.values() if c.id > 0]
+            full = len(bundles) >= max(2, self.cfg.mirror_consolidate)
+            new_cps = cps if full else [c for c in cps if c.id not in done_cps]
+            new_snap = latest is not None and (full or latest.n > int(meta.get("snap") or 0))
+            tips = [f"{SNAP_REF}{latest.n}"] if new_snap else []
             for c in new_cps:                                          # bundle 记录的是引用名，不能只给提交哈希
                 await self.repo.set_cp_ref(c.id, c.commit)
                 tips.append(f"{CP_REF}{c.id}")
             if not tips:
                 return
-            exclude = [g.checkpoints[0].commit] + ([meta["snap_commit"]] if meta.get("snap_commit") else []) + \
-                [g.checkpoints[c].commit for c in done_cps if c in g.checkpoints]
-            m = len(meta.get("bundles") or []) + 1
-            remote = f"{self.s.git_dir}.bundles/{m}.bundle"
+            exclude = [g.checkpoints[0].commit]
+            if not full:
+                exclude += ([meta["snap_commit"]] if meta.get("snap_commit") else []) + \
+                    [g.checkpoints[c].commit for c in done_cps if c in g.checkpoints]
+            name = f"{seq}-full.bundle" if full else f"{seq}.bundle"
+            remote = f"{self.s.git_dir}.bundles/{name}"
+            d = Path(self.s.run_dir) / "git"
             try:
                 await self.env.run(f"mkdir -p {shlex.quote(self.s.git_dir)}.bundles", timeout=30, cwd="/")
                 if not await self.repo.bundle_create(remote, tips, exclude):
                     return
                 data = await self.env.read_bytes(remote)
-                d = Path(self.s.run_dir) / "git"
                 d.mkdir(exist_ok=True)
-                tmp = d / f"{m}.bundle.tmp"
+                tmp = d / f"{name}.tmp"
                 tmp.write_bytes(data)
-                tmp.replace(d / f"{m}.bundle")
+                tmp.replace(d / name)
                 await self.env.run(f"rm -f {shlex.quote(remote)}", timeout=30, cwd="/")
             except Exception as e:
                 self.log(f"mirror ({reason}) failed: {type(e).__name__}: {e}")
                 return
-            meta["bundles"] = list(meta.get("bundles") or []) + [f"{m}.bundle"]
+            meta["bundles"] = [name] if full else bundles + [name]
+            meta["seq"] = seq
             if latest is not None:
                 meta["snap"], meta["snap_commit"] = max(latest.n, int(meta.get("snap") or 0)), latest.commit
             meta["cps"] = sorted(done_cps | {c.id for c in new_cps})
-            self.store.set_meta("mirror", meta)
+            self.store.set_meta("mirror", meta)              # 先记下新的列表，再删旧文件（中途崩溃只会多留几个文件）
+            if full:
+                for old in bundles:
+                    (d / old).unlink(missing_ok=True)
 
     # ================================================================ 副作用
     async def _effect(self, eff: Effect) -> None:
@@ -873,14 +888,18 @@ class BelayRun:
         await self.rt.submit(R.ref_advanced, attempt, ok, commit, files, detail)
 
     async def _eff_mirror_checkpoint(self, checkpoint: int) -> None:
+        """存档 ref 每个都设（便宜）；补丁镜像与 bundle 只在里程碑上做。自动存档的提交是确定的，
+        它的树就是某张快照的候选树：只要快照已导出，重建时可以原样重做（recovery.rebuild_container）。"""
         g = self.rt.graph
         cp = g.checkpoints[checkpoint]
         await self.repo.set_cp_ref(checkpoint, cp.commit)
+        if cp.kind not in MILESTONE_KINDS:
+            return
         patch = await self.repo.diff(g.checkpoints[0].tree, cp.tree, binary=True)
         d = Path(self.s.run_dir) / "checkpoints"
         d.mkdir(exist_ok=True)
         (d / f"{checkpoint}.diff").write_text(patch, encoding="utf-8", errors="surrogateescape")
-        await self.mirror("checkpoint")
+        await self.mirror("milestone")
 
     async def _eff_label_checkpoint(self, checkpoint: int) -> None:
         """没有步骤时的兜底：里程碑存档（以及每 label_every 个自动存档）生成一行“这段做了什么”（llm）。"""

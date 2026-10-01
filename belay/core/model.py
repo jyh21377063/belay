@@ -367,6 +367,7 @@ class Run:
     delivered: Optional[int] = None
     delivered_level: Optional[str] = None
     deliver_unconfirmed: Optional[bool] = None   # 交付时用的 deliver_unconfirmed 取值（账本写明）
+    status_reasons: tuple[str, ...] = ()         # rule：为什么不是 DONE
     recoveries: int = 0
     rebuilds: int = 0
     downtime_sec: float = 0.0

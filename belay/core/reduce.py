@@ -11,16 +11,16 @@ from typing import Callable, Iterable, Optional
 
 from belay.core.events import Event, actor_worker, validate
 from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, ATT_REJECTED, ATT_SUPERSEDED, BLOCKED,
-                              CONFIRMED, DONE, DONE_UNVERIFIED, FINISHED, JOB_FINISHED, JOB_RUNNING, KIND_MILESTONE,
-                              KIND_REVIEW, KIND_STEP, LANE_BG, LANE_FG, OPEN, PROVISIONAL, REVIEW, RUN_DONE,
-                              RUN_INCOMPLETE, RUN_RUNNING, SPLIT, STEP_ACTIVE, STEP_ANCHORED, STEP_DECLARED,
+                              CONFIRMED, DONE, DONE_UNVERIFIED, FINISHED, JOB_FINISHED, JOB_RUNNING, KIND_FINAL,
+                              KIND_MILESTONE, KIND_REVIEW, KIND_STEP, LANE_BG, LANE_FG, OPEN, PROVISIONAL, REVIEW,
+                              RUN_DONE, RUN_INCOMPLETE, RUN_RUNNING, SPLIT, STEP_ACTIVE, STEP_ANCHORED, STEP_DECLARED,
                               STEP_PLANNED, WHERE_LIVE, WHERE_SLOT, Attempt, Checkpoint, Compaction, Diagnosis, Graph,
                               Job, Lease, Locate, Note, Persistent, Requirement, Run, Session, Snapshot, Stall, Step,
                               Task, Wip, WorkerState)
 from belay.core.queries import has_cycle, is_ancestor, last_session, latest_confirmed_ancestor
 from belay.core.verify import PASSED, results_for_tree
 
-PROGRESS_KINDS = (KIND_MILESTONE, KIND_STEP, KIND_REVIEW)     # 自动存档与交接存档不算进展
+PROGRESS_KINDS = (KIND_MILESTONE, KIND_STEP, KIND_REVIEW, KIND_FINAL)   # 自动存档与交接存档不算进展
 
 
 class IllegalEvent(ValueError):
@@ -148,7 +148,8 @@ def _delivered(g: Graph, e: Event) -> Graph:
     _need(status in ("DONE", "INCOMPLETE"), f"bad delivered status {status}")
     cp = g.checkpoints[cid]
     run = replace(g.run, status=RUN_DONE if status == "DONE" else RUN_INCOMPLETE, delivered=cid,
-                  delivered_level=cp.level, deliver_unconfirmed=e.get("unconfirmed_policy"))
+                  delivered_level=cp.level, deliver_unconfirmed=e.get("unconfirmed_policy"),
+                  status_reasons=tuple(e.get("status_reasons") or ()))
     return replace(g, run=run)
 
 
@@ -593,7 +594,7 @@ def _checkpoint_created(g: Graph, e: Event) -> Graph:
     wip = g.wips.get(a.worker)
     if wip is not None and wip.tree == a.tree:      # 存进去的正是当前的 WIP：它相对新存档没有未验证的改动了
         g = replace(g, wips=_put(g.wips, a.worker, replace(wip, base=cid, files=(), last_rejection=None)))
-    if a.kind in PROGRESS_KINDS or level == CONFIRMED:
+    if a.kind in PROGRESS_KINDS:                    # 自动存档与交接存档不算进展（确认与否都一样）
         g = _progress(g, e, a.worker)
     return _check_passes(g, e, a.tree)
 
@@ -623,7 +624,9 @@ def _checkpoint_confirmed(g: Graph, e: Event) -> Graph:
     _need(cp.level != CONFIRMED and not cp.demoted, f"checkpoint {cid} is already {cp.level}")
     g = _set_cp(g, replace(cp, level=CONFIRMED, confirmed_seq=e.seq))
     g = replace(g, confirmed=latest_confirmed_ancestor(g, g.head))
-    return _progress(g, e, None)
+    # 确认点前移算进展，但只对 worker 声明过的单元（手动、步骤、review、收尾）：否则一个不断写出能过门的半成品、
+    # 却从不完成任何东西的 worker，会因为后台提升而永远“有进展”，基于进展的停滞检测就失效了
+    return _progress(g, e, None) if cp.kind in PROGRESS_KINDS else g
 
 
 def _checkpoint_demoted(g: Graph, e: Event) -> Graph:
@@ -634,6 +637,19 @@ def _checkpoint_demoted(g: Graph, e: Event) -> Graph:
     _need(cp.level == PROVISIONAL and not cp.demoted, f"checkpoint {cid} cannot be demoted")
     g = _set_cp(g, replace(cp, demoted=True, demote_regressions=tuple(e.get("regressions") or ())))
     return replace(g, confirmed=latest_confirmed_ancestor(g, g.head))
+
+
+def _checkpoint_marked(g: Graph, e: Event) -> Graph:
+    """worker 声明的单元（手动存档、步骤、review）落在一个已有的自动 / 交接存档上：把它升级为里程碑。"""
+    _running(g)
+    cid = int(e.get("checkpoint"))
+    cp = g.checkpoints.get(cid)
+    kind = e.get("kind")
+    _need(cp is not None and cp.id != 0 and not cp.abandoned, f"cannot mark checkpoint {cid}")
+    _need(cp.kind in ("auto", "handoff") and kind in PROGRESS_KINDS, f"cannot mark {cp.kind} checkpoint {cid} {kind}")
+    label = cp.label or str(e.get("label") or "").strip().split("\n")[0][:300]
+    g = _set_cp(g, replace(cp, kind=kind, label=label))
+    return _progress(g, e, e.get("worker"))
 
 
 def _rollback(g: Graph, e: Event) -> Graph:
@@ -772,7 +788,7 @@ HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
     "checkpoint_attempted": _checkpoint_attempted, "attempt_superseded": _attempt_superseded,
     "checkpoint_advancing": _checkpoint_advancing, "checkpoint_created": _checkpoint_created,
     "checkpoint_rejected": _checkpoint_rejected, "checkpoint_confirmed": _checkpoint_confirmed,
-    "checkpoint_demoted": _checkpoint_demoted, "rollback": _rollback,
+    "checkpoint_demoted": _checkpoint_demoted, "checkpoint_marked": _checkpoint_marked, "rollback": _rollback,
     "persistent_regression": _persistent_regression, "locate_started": _locate_started,
     "locate_concluded": _locate_concluded, "regression_located": _regression_located,
     "relation_learned": _relation_learned, "diagnosis_requested": _diagnosis_requested,

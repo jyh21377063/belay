@@ -28,6 +28,8 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
         elif e.type == "checkpoint_created" and int(e.get("checkpoint")) > 0:
             out.append(Effect("mirror_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
             out.append(Effect("label_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
+        elif e.type == "checkpoint_marked":
+            out.append(Effect("mirror_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
         elif e.type == "rollback":
             out.append(Effect("restore_workspace", {"worker": e.get("worker"), "checkpoint": int(e.get("to")),
                                                     "reset_ref": bool(e.get("abandoned"))}))

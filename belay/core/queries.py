@@ -426,3 +426,39 @@ def open_persistent(g: Graph, test: str) -> bool:
         if point_status(g, s.tree, test, index) == PT_PASS:
             return False
     return True
+
+
+def status_reasons(g: Graph, delivered: Optional[int]) -> list[str]:
+    """运行为什么不是 DONE（空列表 = DONE）。DONE 要求：
+      - 没有未解决的任务（open / active / review）；
+      - 每条需求都被满足：链接它的任务全部完成（done 或 done_unverified），没有受阻的；
+      - 复查者没有认定哪个 done_unverified 的任务没做完（截止收尾时复查结果只进账本，这里据此判定）；
+      - 没有“完成但未交付”的任务；
+      - 交付的是确认点（没有被降级）。
+    全部任务受阻、或某条需求只完成了一部分，都如实记为 INCOMPLETE。"""
+    out: list[str] = []
+    open_ = [t.id for t in workable(g)]
+    if open_:
+        out.append(f"unfinished: {id_ranges(open_)}")
+    for rid in sorted(g.requirements, key=num):
+        ts = linked_tasks(g, rid)
+        if not ts:
+            out.append(f"{rid} has no task")
+            continue
+        blocked = [t for t in ts if t.status == BLOCKED]
+        if blocked and not any(t.status in (OPEN, ACTIVE, REVIEW) for t in ts):
+            out.append(f"{rid} is blocked (" + ", ".join(f"{t.id}: {t.blocked_kind}" for t in blocked) + ")")
+    weak = [t.id for t in g.tasks.values() if t.status == DONE_UNVERIFIED and t.review in ("no", "partial")]
+    if weak:
+        out.append(f"the reviewer found {id_ranges(weak)} incomplete")
+    nd = [t.id for t in done_not_delivered(g, delivered)]
+    if nd:
+        out.append(f"finished after the delivered checkpoint (not in the deliverable): {id_ranges(nd)}")
+    cp = g.checkpoints.get(delivered) if delivered is not None else None
+    if cp is None:
+        out.append("nothing was delivered")
+    elif cp.demoted or cp.level != CONFIRMED:
+        out.append(f"the delivered checkpoint {cp.id} is not confirmed by the full test suite")
+    elif cp.id == 0 and g.tasks and any(t.status in FINISHED for t in g.tasks.values()):
+        out.append("only the original code is delivered")
+    return out

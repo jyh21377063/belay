@@ -53,6 +53,7 @@
 | 存档 | `checkpoint_attempted`（带 `snapshot`、`lane`、`kind`）/ `attempt_superseded` | rule | 前台 / 后台尝试；更旧的尝试被新存档取代 |
 | | `checkpoint_advancing` / `checkpoint_created` / `checkpoint_rejected` | rule / observed | 父节点在推进时确定；新存档为暂存（related）或确认（full） |
 | | `checkpoint_confirmed` / `checkpoint_demoted` | observed / rule | 全量通过 → 确认点前移；确认过的回归 → 降级 |
+| | `checkpoint_marked` | rule | worker 声明的单元落在已有的自动 / 交接存档上：升级为里程碑 |
 | | `rollback` | rule | 段号 +1；确认点退回链上最近的确认祖先 |
 | 定位 | `persistent_regression` / `locate_started` / `locate_concluded` / `regression_located` / `relation_learned` | rule / rule / rule / observed / rule | 见 §3.4 |
 | LLM | `diagnosis_requested` / `diagnosis_recorded` | rule / llm | 诊断者（只解释） |
@@ -117,8 +118,13 @@
 - 新快照胜出：前台、后台尝试各至多一个；链头的快照序号不小于尝试的快照序号（同段）时，尝试被 `attempt_superseded`
   取代（它带着的 review 任务转到链头上判定）；父节点在 `checkpoint_advancing` 时才确定，CAS 用它校验。同一批级联里两个
   尝试同时完成时，第二个等第一个落地后再推进（多半随即被取代）。
-- 进展（`reduce._progress`）只来自：任务完成、确认点前移、某个任务的检查项第一次在存档上通过、步骤锚定、手动 / 步骤 /
-  review 存档。自动存档与交接存档不算。
+- 进展（`reduce._progress`）只来自：任务完成、某个任务的检查项第一次在存档上通过、步骤锚定、worker 声明的单元
+  （手动 / 步骤 / review / 收尾存档，包括 `checkpoint_marked`）的创建与确认。自动存档与交接存档不算，被后台提升为确认点
+  也不算：否则一个不断写出能过门的半成品、却从不完成任何东西的 worker 会永远“有进展”，停滞检测与“连续几个会话没有
+  进展就停”都失效。
+- 里程碑标记（`checkpoint_marked`）：手动存档、`step_done`、`ready_for_review` 要存的树已经被后台存过时（链头就是它），
+  或者步骤的锚点落在一个自动存档上，就把那个自动 / 交接存档升级为对应的里程碑（带标签）。否则回退的默认目标
+  （最近的里程碑）会越过 worker 明确声明过的完整单元。
 
 ### 3.3 两级存档链（模块 C）
 
@@ -130,8 +136,14 @@
   worker + 定位 + 诊断；已通过 → 只记录。
 - 收尾（`driver._finalize`）：`finalize_started` 取消后台尝试 → 对当前 WIP 做一次 full 前台尝试 → 链头仍是暂存点且还有
   时间就提升它 → 取消剩下的作业 → 交付最新的确认点（`delivered` 带 `level`、`lag`、`not_delivered`）。
-- 交付一致性：`done_checkpoint` 不在交付点祖先链上的任务记为“完成但未交付”，DONE 要求没有这类任务、没有未解决的任务，
-  并且交付的是确认点（`rules.final_status`）。
+- 交付一致性：`done_checkpoint` 不在交付点祖先链上的任务记为“完成但未交付”。
+- DONE 的条件（`queries.status_reasons`，空列表 = DONE，否则逐条写进 `delivered.status_reasons` 与账本）：
+  1. 没有未解决的任务（open / active / review）；
+  2. 每条需求都被满足：链接它的任务全部完成，没有受阻的（全部受阻、或一条需求只完成了一部分，都是 INCOMPLETE）；
+  3. 复查者没有认定哪个 done_unverified 的任务没做完（截止收尾时复查只进账本，这里据此判定）；
+  4. 没有“完成但未交付”的任务；
+  5. 交付的是确认点（没有被降级）。
+  受阻仍然是诚实、正确的结束方式（收尾照常进行），只是不再计为 DONE。
 
 ### 3.4 被拒信息与规则定位（模块 D）
 
@@ -213,9 +225,11 @@
 | runtime 进程崩溃，容器仍在 | `reconcile`：CAS 对账；有完成标记的作业补收结果，进程组还活着的重新接上（G5），其余记 unknown 重跑；停机不超过 `resume_max_downtime_sec` 且轨迹读得出来就读盘重放（`session_resumed(replay)`），否则开新会话 |
 | 容器 / 工作区 / 影子仓库丢失 | `resume(rebuild=True)`：从原始代码重建 0 号存档（树与提交必须一致）→ 按顺序 unbundle → 最后一次导出之后的快照记为 lost；丢了提交的存档按确定的提交重做，连树都没有就截链 → 恢复引用 → 工作区检出为最新一张已导出快照的原样树 → 重跑破坏探针 → `runtime_recovered(rebuilt=true)` |
 
-- 镜像（G3）：每张快照、每个存档都有 ref；`driver.mirror` 按节奏（每 `mirror_every` 张快照、每个存档、会话结束、交付、
-  挂起）导出增量 bundle（`git bundle create <新 ref> ^<上次已导出的提交>`，第一份以 0 号基线提交为前提），经 base64 分段
-  传回宿主机 `run_dir/git/<m>.bundle`；已导出的 ref 记在事件库的 meta 里。
+- 镜像（G3）：每张快照、每个存档都有 ref；`driver.mirror` 按节奏（每 `mirror_every` 张快照、每个里程碑存档、会话结束、
+  交付、挂起）导出增量 bundle（`git bundle create <新 ref> ^<上次已导出的提交>`，以 0 号基线提交为前提），经 base64 分段
+  传回宿主机 `run_dir/git/<n>.bundle`；已导出的 ref 记在事件库的 meta 里。增量 bundle 累积到 `mirror_consolidate` 份时
+  合并成一份完整的 `<n>-full.bundle`，旧文件删除。自动存档不单独触发导出：它的树就是某张快照的候选树，提交是确定的，
+  重建时按原来的父提交与日期原样重做。补丁镜像 `checkpoints/<k>.diff` 也只写里程碑。
 - 恢复的第一步是补拍一张 `recover` 快照（G7）；离开期间的变化（G1）进入开场。
 - 外层调度：`BelayRun.suspend()` = 强制快照 → 导出 bundle → 会话以 suspended 结束 → `run_suspended`。
 
@@ -236,11 +250,13 @@
 
 - 手动 `checkpoint(summary)` 的 summary 直接作为里程碑标签；标签模型只给没有标签、没有步骤的存档补一行。
 - todo 列表里新标为 completed 的条目等同于 `step_done`（计划只写了 `step_done` 工具）；两者都保留。
-- 每个存档创建时都会导出 bundle（计划写的是“每个里程碑”）：链上存档的提交丢失会导致链断，bundle 很小，所以不区分。
-- DONE 的条件按计划 F2：没有 open、没有 done-not-delivered、交付的是确认点；全部任务受阻时仍可能是 DONE（账本会写明
-  blocked 的数量；以 insufficient_info 受阻的任务会先被复查）。
+- 按计划只在里程碑上导出 bundle；自动存档靠“快照已导出 + 提交确定”保证可重做，另加了合并（见 §6）。
+- DONE 的条件在 F2 的基础上加了“每条需求都被满足”和“复查者没有认定没做完”（§3.3），修正了 0-4 指出的“全部受阻 +
+  链头全量通过仍记为 DONE”。
 - 降级模式下也不做规则定位与持续性检测（二分作业会切换工作区）；诊断仍会以“相对最新确认点的 diff”为输入进行。
-- 构建缓存种子额外复制了项目自己的 `.git`（有些测试会调用 git，例如 setuptools_scm）。
+- 构建缓存种子之外，槽位里还建一个轻量的 `.git`（有些测试会调用 git，例如 setuptools_scm、`git describe`）：对象经
+  alternates 借用工作区的 `.git/objects`，只复制 HEAD 与引用，索引按 HEAD 生成。不整份复制，大仓库不会多占几 GB；
+  槽位里的 git 写操作只落在这个轻量仓库里。
 - 分片轮转的全量、竞争式分支、运行级 supervisor 都没有做（计划里是扩展点）。
 - `eval/` 本轮没有改：`eval/agents/belay_agent.py` 仍需按 `BelayRun` 重写（0-1）。
 

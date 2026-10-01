@@ -419,6 +419,24 @@ def _declare_step(tx: Tx, worker: str, sid: str, snapshot: int, summary: str, fi
             anchor_epoch=epoch, summary=(summary or "")[:1000], files=[list(f) for f in files][:100])
 
 
+def holder_of(g: Graph, task_id: str) -> Optional[str]:
+    lease = g.leases.get(task_id)
+    return lease.worker if lease else None
+
+
+def _mark(tx: Tx, cid: int, kind: str, label: str = "", worker: Optional[str] = None) -> None:
+    cp = tx.g.checkpoints.get(cid)
+    if cp is not None and cp.id != 0 and not cp.abandoned and cp.kind in (KIND_AUTO, KIND_HANDOFF) and \
+            kind in (KIND_MILESTONE, KIND_STEP, KIND_REVIEW, KIND_FINAL):
+        tx.emit("checkpoint_marked", RUNTIME, RULE, checkpoint=cid, kind=kind, label=(label or "")[:300],
+                worker=worker)
+
+
+def mark_head(tx: Tx, worker: str, kind: str, label: str = "") -> None:
+    """worker 要存的状态已经是链头（后台已经存过）：把链头升级为里程碑，回退的默认目标才会落在这里。"""
+    _mark(tx, tx.g.head, kind, label, worker)
+
+
 def refresh_anchors(tx: Tx) -> None:
     """已声明的步骤：锚点被链上某个同段存档包含时写 step_anchored。"""
     for s in sorted(tx.g.steps.values(), key=lambda s: (s.task, s.n)):
@@ -426,6 +444,7 @@ def refresh_anchors(tx: Tx) -> None:
             cid = snapshot_contained(tx.g, s.anchor_snapshot, s.anchor_epoch)
             if cid is not None:
                 tx.emit("step_anchored", RUNTIME, RULE, step=s.id, checkpoint=cid)
+                _mark(tx, cid, KIND_STEP, s.summary or s.title, holder_of(tx.g, s.task))
 
 
 # ======================================================================== 快照（模块 B）
@@ -547,6 +566,7 @@ def request_checkpoint(tx: Tx, worker: str, snapshot: int, trigger: str, lane: s
     if snap is None:
         raise Rejected(f"Unknown snapshot {snapshot}.")
     if snap.tree == g.head_cp.tree:
+        mark_head(tx, worker, TRIGGER_KIND.get(trigger, KIND_MILESTONE), summary)
         return None
     tasks = tuple(tasks)
     extra = [c for tid in tasks for c in g.tasks[tid].checks]
@@ -1080,6 +1100,7 @@ def request_review(tx: Tx, worker: str, task_id: str, snapshot: int, summary: st
         raise Rejected("A checkpoint of your work is already in progress.")
     snap = g.snapshots.get(snapshot)
     if snap is None or snap.tree == g.head_cp.tree:
+        mark_head(tx, worker, KIND_REVIEW, summary or f"{task_id} finished")
         tx.emit("review_requested", worker_actor(worker), RULE, task=task_id, worker=worker, checkpoint=tx.g.head)
         evaluate_review(tx, task_id)
         return None
@@ -1450,12 +1471,9 @@ def begin_finalize(tx: Tx, reason: str) -> None:
 
 
 def final_status(g: Graph, delivered: Optional[int]) -> str:
-    """DONE：没有未解决的任务、没有“完成但未交付”的任务，并且交付的是确认点。"""
-    from belay.core.queries import done_not_delivered
-    cp = g.checkpoints.get(delivered) if delivered is not None else None
-    ok = (all_resolved(g) and cp is not None and cp.level == CONFIRMED and not cp.demoted and
-          not done_not_delivered(g, delivered))
-    return "DONE" if ok else "INCOMPLETE"
+    """DONE 的条件见 queries.status_reasons。"""
+    from belay.core.queries import status_reasons
+    return "INCOMPLETE" if status_reasons(g, delivered) else "DONE"
 
 
 def deliver(tx: Tx, reason: str, checkpoint: Optional[int] = None, lag: Optional[dict] = None) -> str:
@@ -1465,13 +1483,15 @@ def deliver(tx: Tx, reason: str, checkpoint: Optional[int] = None, lag: Optional
     cid = delivery_checkpoint(g, tx.cfg) if checkpoint is None else int(checkpoint)
     if not is_ancestor(g, cid, g.head):
         cid = delivery_checkpoint(g, tx.cfg)
-    status = final_status(g, cid)
+    from belay.core.queries import status_reasons
+    reasons = status_reasons(g, cid)
+    status = "INCOMPLETE" if reasons else "DONE"
     cp = g.checkpoints[cid]
     behind = chain_ids(g).index(cid)
     tx.emit("delivered", RUNTIME, RULE, checkpoint=cid, status=status, reason=reason, level=cp.level,
             head=g.head, behind_head=behind, unconfirmed_policy=tx.cfg.deliver_unconfirmed,
             not_delivered=[t.id for t in done_not_delivered(g, cid)], lag=dict(lag or {}),
-            full_verified=full_verified(g, cp.tree))
+            full_verified=full_verified(g, cp.tree), status_reasons=reasons)
     return status
 
 

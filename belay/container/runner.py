@@ -299,13 +299,39 @@ def seed_slot(spec):
     if tmp_idx and os.path.exists(tmp_idx):
         os.remove(tmp_idx)
     paths = [p.decode("utf-8", "surrogateescape").rstrip("/") for p in out.split(b"\0") if p]
-    if os.path.isdir(os.path.join(ws, ".git")):
-        paths.append(".git")
     for i in range(0, len(paths), 200):
         chunk = [p for p in paths[i:i + 200] if p and not p.startswith("../")]
         if chunk:
             subprocess.call(["cp", "-a", "--reflink=auto", "--parents"] + chunk + [slot + "/"], cwd=ws,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    seed_git(ws, slot)
+
+
+def seed_git(ws, slot):
+    """有些测试会调用 git（setuptools_scm、版本号、git describe）。不整份复制项目的 .git（大仓库会多占几个 GB），
+    而是在槽位里建一个轻量仓库：对象经 alternates 借用工作区的 .git/objects（只读），复制 HEAD 与引用，
+    索引按 HEAD 生成。槽位里的 git 写操作只落在这个轻量仓库里，碰不到工作区的仓库。"""
+    src = os.path.join(ws, ".git")
+    dst = os.path.join(slot, ".git")
+    if not os.path.isdir(src) or os.path.exists(dst):
+        return
+    try:
+        subprocess.call(GIT + ["init", "-q", "--template=", slot], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+        info = os.path.join(dst, "objects", "info")
+        if not os.path.isdir(info):
+            os.makedirs(info)
+        with open(os.path.join(info, "alternates"), "w") as f:
+            f.write(os.path.realpath(os.path.join(src, "objects")) + "\n")
+        for name in ("HEAD", "packed-refs", "shallow"):
+            if os.path.isfile(os.path.join(src, name)):
+                shutil.copy2(os.path.join(src, name), os.path.join(dst, name))
+        if os.path.isdir(os.path.join(src, "refs")):
+            shutil.rmtree(os.path.join(dst, "refs"), ignore_errors=True)
+            shutil.copytree(os.path.join(src, "refs"), os.path.join(dst, "refs"), symlinks=True)
+        subprocess.call(GIT + ["-C", slot, "reset", "-q"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        shutil.rmtree(dst, ignore_errors=True)          # 没建成就不要留下半个仓库
 
 
 def env_prefix(spec):

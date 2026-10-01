@@ -26,7 +26,7 @@ from belay.runtime.runtime import Runtime
 from belay.runtime.store import EventStore
 from belay.runtime.verifier import RunnerVerifier, VerifierSpec
 from tests.integration.test_belay_run import (ADD, ADD_SUB, BLOCK_T2, FIX_ADD, MUL, PLANNER, READ, SPEC, TASK,
-                                              call, first_message, results, say, tu)
+                                              assert_t2_blocked, call, first_message, results, say, tu)
 
 MOD = "def add(a, b):\n    return a - b\n\n\ndef mul(a, b):\n    return a * b\n"
 TESTS = ("from pkg.mod import add, mul\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\n"
@@ -162,7 +162,8 @@ def test_degraded_mode_has_no_background_verification(tmp_path):
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
     g = run.rt.graph
-    assert g.degraded and res.status == "DONE"
+    assert g.degraded
+    assert_t2_blocked(run, res)
     assert all(a.lane == "fg" for a in g.attempts.values())             # 没有后台存档
     assert all(j.where in ("workspace", "live") for j in g.jobs.values() if j.purpose != "baseline")
     h.verify_log(run)
@@ -250,7 +251,7 @@ def test_rejection_reasons_failure_log_gate_check_and_revert_change(tmp_path):
     assert "as the gate runs it" in out[5] and "REGRESSIONS" in out[6]           # D2：按门的口径复现
     assert "Reverted the change" in out[7]
     assert "return a * b" in out[8]                                             # D4：只撤销了那一段
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     g = run.rt.graph
     loc = g.locates["L1"]
     assert loc.results and loc.results[0]["exact"] and "pkg/mod.py" in json.dumps(loc.results[0]["files"])
@@ -297,7 +298,7 @@ def test_runtime_restart_reattaches_a_running_job(tmp_path):
     llm2 = ScriptedLLM([call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
     run = h.make(llm2)
     res = asyncio.run(run.resume())
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     events = h.verify_log(run)
     rec = next(e for e in events if e.type == "runtime_recovered")
     assert run.rt.graph.sessions["S1"].resumes == ("replay",)                   # 会话也原样接上
@@ -366,7 +367,7 @@ def test_rebuild_from_bundles_after_losing_the_container_state(tmp_path):
                         == 0 for s in kept)
     text = (h.repo / "pkg/mod.py").read_text()
     assert "return a + b" in text and "def sub(a, b)" in text               # 工作区 = 最新一张已导出快照
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
 
 
 # ======================================================================== 模块 H：交接落在步骤边界
@@ -391,7 +392,7 @@ def test_soft_threshold_hands_off_at_the_next_step_done(tmp_path):
     assert "T1.1 fix add — done" in opening2 and "T1.2 add sub  <- current step" in opening2
     tr = [json.loads(x) for x in open(g.sessions["S1"].transcript) if x.strip()]
     assert any(r["type"] == "handoff" and r.get("at_step_boundary") for r in tr)
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     h.verify_log(run)
 
 
@@ -438,7 +439,7 @@ def test_killed_mid_step_resumes_with_steps_and_partial_diff(tmp_path):
     assert "+    return a + b" in opening                                    # 部分改动：保留在工作区，交还给模型
     assert "Your last actions before the interruption" in opening
     assert "Files of the current step (re-read by the harness)" in opening
-    assert res.status == "DONE"
+    assert_t2_blocked(run, res)
     h.verify_log(run)
 
 
@@ -503,3 +504,42 @@ def test_diagnoser_and_reviewer_only_explain_or_tighten(tmp_path):
                                                                             "task_split", "compacted")]
     assert {e.type for e in llm_events} <= {"diagnosis_recorded", "review_recorded", "checkpoint_labeled"}
     assert res.status == "DONE"
+
+
+
+def test_bundles_are_consolidated_and_restore_every_checkpoint(tmp_path):
+    """G3：增量 bundle 够数后合并成一份完整的；只用宿主机上的 bundle 就能还原全部快照与里程碑存档，
+    自动存档的提交可以从快照的树原样重做。"""
+    h = H(tmp_path, BelayConfig(mirror_consolidate=2, mirror_every=1, snapshot_min_interval_sec=0))
+    edit = lambda i, a, b: tu(f"e{i}", "edit_file", file_path="pkg/mod.py", old_string=a, new_string=b)  # noqa: E731
+    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
+                       call(tu("c1", "checkpoint", summary="one")),
+                       call(edit(2, "def mul(a, b):", "def sub(a, b):\n    return a - b\n\n\ndef mul(a, b):")),
+                       call(tu("c2", "checkpoint", summary="two")),
+                       call(edit(3, "def mul(a, b):", "def neg(a):\n    return -a\n\n\ndef mul(a, b):")),
+                       call(tu("c3", "checkpoint", summary="three")),
+                       call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+    run = h.make(llm)
+    res = asyncio.run(run.start(TASK))
+    assert_t2_blocked(run, res)
+    meta = EventStore(h.settings.run_dir).get_meta("mirror")
+    files = sorted(p.name for p in (tmp_path / "run" / "git").glob("*.bundle"))
+    assert any(f.endswith("-full.bundle") for f in files) and files == sorted(meta["bundles"])
+    assert len(files) < meta["seq"]                                           # 旧的增量文件已删除
+    # 与重建相同：先从原始代码重建 0 号基线（bundle 以它为前提），再按顺序 unbundle
+    orig = tmp_path / "orig"
+    subprocess.run(["git", "clone", "-q", str(h.repo), str(orig)], check=True)    # 工作区的改动没有提交过
+    fresh = tmp_path / "fresh.git"
+    from belay.runtime.gitops import ShadowRepo
+    base_commit, _tree = asyncio.run(ShadowRepo(LocalEnv(str(orig)), str(fresh), str(orig)).init())
+    g = run.rt.graph
+    assert base_commit == g.checkpoints[0].commit
+    for name in meta["bundles"]:
+        subprocess.run(["git", f"--git-dir={fresh}", "bundle", "unbundle", str(tmp_path / "run" / "git" / name)],
+                       check=True, capture_output=True)
+
+    def has(sha):
+        return subprocess.run(["git", f"--git-dir={fresh}", "cat-file", "-e", sha]).returncode == 0
+    assert all(has(s.commit) for s in g.snapshots.values())
+    assert all(has(c.tree) for c in g.checkpoints.values() if c.id > 0)
+    assert all(has(c.commit) for c in g.checkpoints.values() if c.id > 0)

@@ -9,7 +9,7 @@ from belay.core.context import build_context
 from belay.core.invariants import check_log, llm_effects
 from belay.core.model import ACTIVE, BLOCKED, DONE, DONE_UNVERIFIED, OPEN
 from belay.core.queries import delivery_checkpoint, resume_point, suspect
-from belay.core.render import ledger, render_attempt
+from belay.core.render import ledger, ledger_markdown, render_attempt
 from belay.core.rules import Rejected
 from belay.core.suggest import suggest
 from belay.core.verify import related_units
@@ -234,6 +234,26 @@ def test_new_snapshot_wins_in_both_orders(order):
     assert s.g.checkpoints[s.g.head].tree == "new"
 
 
+def test_declared_units_on_an_auto_checkpoint_become_milestones():
+    s = sim(cfg=BelayConfig(confirm_regressions=False))
+    s.do(R.claim, "w1", "T3")
+    s.world.define("m1", {})
+    s.snap("m1")
+    assert s.g.checkpoints[1].kind == "auto"
+    assert s.checkpoint("m1") is None                                      # 后台已经存过同一棵树
+    cp = s.g.checkpoints[1]
+    assert cp.kind == "milestone" and s.g.sessions["S1"].progress
+    s.world.define("m2", {})
+    s.snap("m2")                                                           # 2：自动存档
+    s.do(R.plan_steps, "w1", [{"content": "write docstring", "status": "in_progress"}])
+    n = s.snap("m2", reason="step_done")
+    s.do(R.step_done, "w1", n, "docstring written")
+    assert s.g.checkpoints[2].kind == "step" and s.g.checkpoints[2].label == "docstring written"
+    s.world.define("m3", {})
+    s.snap("m3")                                                           # 3：自动存档
+    assert s.do(R.rollback, "w1") == 2                                     # 默认目标：最近的里程碑（步骤）
+
+
 def test_rollback_cancels_background_attempt():
     s = sim(auto_jobs=False)
     s.do(R.claim, "w1", "T3")
@@ -246,17 +266,17 @@ def test_rollback_cancels_background_attempt():
     assert any(e.kind == "cancel_orphans" for e in s.effects)
 
 
-def test_only_auto_checkpoints_do_not_count_as_progress():
+def test_auto_checkpoints_are_not_progress_even_when_confirmed():
     s = sim(cfg=BelayConfig(confirm_regressions=False))
-    s.do(R.claim, "w1", "T3")
-    s.world.base = dict(BASE)
-    for i in range(3):
-        s.world.define(f"w{i}", {MUL: "FAILED"} if i == 2 else {})
-    s.cfg = s.cfg.with_(stall_no_progress_sec=100)
+    s.do(R.claim, "w1", "T3")                                             # T3 没有检查项：只有存档与完成能算进展
+    s.world.define("w0", {})
     s.snap("w0")
-    assert s.g.checkpoints[1].kind == "auto"
-    s.do(R.end_session, "w1", "done")
-    assert not s.g.sessions["S1"].progress or s.g.checkpoints[1].level == "confirmed"
+    cp = s.g.checkpoints[1]
+    assert cp.kind == "auto" and cp.level == "confirmed"                  # 模拟器里提升立即完成
+    assert not s.g.sessions["S1"].progress
+    s.world.define("w1", {})
+    s.checkpoint("w1")                                                     # 手动存档（里程碑）算
+    assert s.g.checkpoints[2].kind == "milestone" and s.g.sessions["S1"].progress
 
 
 def test_stall_still_detected_with_auto_checkpoints_only():
@@ -728,21 +748,68 @@ def test_session_end_is_not_run_end():
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "no_progress")
 
 
-def test_run_done_requires_resolved_tasks_and_a_confirmed_delivery():
-    s = sim(cfg=manual(reviewer=False))
-    for tid, tree in (("T1", "t1"), ("T2", "t2")):
+def _finish(s: Sim, tasks) -> None:
+    for tid, tree in tasks:
         s.do(R.claim, "w1", tid)
         s.world.define(tree, {ADD: "PASSED"})
         s.review(tid, tree)
-    s.do(R.claim, "w1", "T3")
-    s.do(R.report_blocked, "w1", "T3", "environment", "no docs tool")
+
+
+def test_run_done_requires_satisfied_requirements_and_a_confirmed_delivery():
+    s = sim(cfg=manual(reviewer=False))
+    _finish(s, (("T1", "t1"), ("T2", "t2"), ("T3", "t3")))
     s.do(R.end_session, "w1", "done")
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")
     s.do(R.begin_finalize, "complete")
     assert s.do(R.promote_now) is False                                   # 模拟器里全量立即完成 → 提升
-    assert s.g.checkpoints[2].level == "confirmed" and s.g.confirmed == 2
-    assert s.do(R.deliver, "complete") == "DONE" and s.g.run.delivered == 2
+    assert s.g.checkpoints[3].level == "confirmed" and s.g.confirmed == 3
+    assert s.do(R.deliver, "complete") == "DONE" and s.g.run.delivered == 3
+    assert s.g.run.status_reasons == () and ledger(s.g)["status_reasons"] == []
     s.check_log()
+
+
+def test_blocked_requirement_is_incomplete_with_reasons():
+    s = sim(cfg=manual(reviewer=False))
+    _finish(s, (("T1", "t1"), ("T2", "t2")))
+    s.do(R.claim, "w1", "T3")
+    s.do(R.report_blocked, "w1", "T3", "environment", "no docs tool")
+    s.do(R.end_session, "w1", "done")
+    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")   # 全部解决：照常收尾
+    s.do(R.begin_finalize, "complete")
+    s.do(R.promote_now)
+    assert s.do(R.deliver, "complete") == "INCOMPLETE"
+    assert s.g.run.status_reasons == ("R3 is blocked (T3: environment)",)
+    assert "not DONE because R3 is blocked" in ledger_markdown(s.g)
+
+
+def test_everything_blocked_is_never_done():
+    s = sim(cfg=manual(reviewer=False))
+    for tid in ("T1", "T2", "T3"):
+        s.do(R.claim, "w1", tid)
+        s.do(R.report_blocked, "w1", tid, "insufficient_info", "unclear")
+    s.do(R.begin_finalize, "complete")
+    assert s.do(R.deliver, "complete") == "INCOMPLETE"
+    assert len([r for r in s.g.run.status_reasons if "is blocked" in r]) == 3
+
+
+def test_partially_blocked_requirement_and_reviewer_verdict_at_the_deadline():
+    s = sim(cfg=manual())
+    _finish(s, (("T1", "t1"), ("T2", "t2")))
+    tid = s.do(R.add_task, "w1", "docs part 2", ["R3"])
+    _finish(s, (("T3", "t3"),))
+    s.do(R.claim, "w1", tid)
+    s.do(R.report_blocked, "w1", tid, "environment", "no tool")
+    s.advance(5400)
+    s.do(R.tick)                                                         # 截止：复查结果只进账本
+    s.do(R.record_review, "T3", "done", {"implemented": "partial", "missing": ["module docstring"]})
+    s.do(R.record_review, "T2", "done", {"implemented": "yes"})
+    s.do(R.begin_finalize, "deadline")
+    s.do(R.promote_now)
+    assert s.do(R.deliver, "deadline") == "INCOMPLETE"
+    reasons = s.g.run.status_reasons
+    assert f"R3 is blocked ({tid}: environment)" in reasons                # 一条需求完成了一部分也不算满足
+    assert "the reviewer found T3 incomplete" in reasons
+    assert not any("T2" in r for r in reasons)
 
 
 def test_crash_restarts_are_bounded():

@@ -204,7 +204,7 @@ def test_fuzz_actually_exercises_the_rules():
             "checkpoint_confirmed", "checkpoint_demoted", "steps_planned", "step_done", "step_anchored",
             "step_invalidated", "locate_started", "locate_concluded", "regression_located", "diagnosis_requested",
             "diagnosis_recorded", "review_started", "review_recorded", "persistent_regression", "finalize_started",
-            "job_preempted"}
+            "job_preempted", "checkpoint_marked"}
     assert must <= types, must - types
     assert {"checkpoint_rejected", "evidence_failed", "rolled_back", "regression", "cas_conflict",
             "review_missing"} <= reasons

@@ -110,7 +110,7 @@ class Env:
         """写文件：先写到临时文件再 cat 覆盖目标，保留目标文件原有的权限与属主。返回写入内容的 sha256。"""
         return await self.write_bytes(path, text.encode("utf-8", errors="surrogateescape"))
 
-    async def read_bytes(self, path: str, chunk: int = 4 * 1024 * 1024) -> bytes:
+    async def read_bytes(self, path: str, chunk: int = 1024 * 1024) -> bytes:
         """读二进制文件（例如 git bundle）：分段 base64 传回，不受单条命令输出大小的限制。"""
         q = shlex.quote(path)
         res = await self.run(f"test -f {q} || exit 3; wc -c < {q}", timeout=60)

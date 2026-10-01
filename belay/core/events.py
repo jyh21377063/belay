@@ -86,6 +86,7 @@ EVENT_SPECS: dict[str, Spec] = {
     "checkpoint_rejected": Spec(("attempt", "regressions", "reason"), (RULE, OBSERVED)),
     "checkpoint_confirmed": Spec(("checkpoint",), (OBSERVED,)),
     "checkpoint_demoted": Spec(("checkpoint", "regressions"), (RULE,)),
+    "checkpoint_marked": Spec(("checkpoint", "kind"), (RULE,)),
     "rollback": Spec(("worker", "to", "abandoned"), (RULE,)),
     # ---- 定位、诊断、复查（模块 C–F）
     "persistent_regression": Spec(("tests", "trigger"), (RULE,)),
