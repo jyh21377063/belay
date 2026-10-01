@@ -774,11 +774,6 @@ def _checkpoint_labeled(g: Graph, e: Event) -> Graph:
     return _set_cp(g, replace(g.checkpoints[cid], label=str(e.get("label"))[:300]))
 
 
-def _progress_summary(g: Graph, e: Event) -> Graph:
-    rec = {"seq": e.seq, "worker": e.get("worker"), "text": str(e.get("text"))[:4000], "after": e.get("after")}
-    return replace(g, summaries=(g.summaries + (rec,))[-20:])
-
-
 HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
     "run_started": _run_started, "runtime_recovered": _runtime_recovered, "clock_started": _clock_started,
     "run_suspended": _run_suspended,
@@ -802,7 +797,6 @@ HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
     "relation_learned": _relation_learned, "diagnosis_requested": _diagnosis_requested,
     "diagnosis_recorded": _diagnosis_recorded, "review_started": _review_started,
     "review_recorded": _review_recorded, "checkpoint_labeled": _checkpoint_labeled,
-    "progress_summary": _progress_summary,
 }
 
 

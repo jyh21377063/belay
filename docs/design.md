@@ -34,7 +34,7 @@
 
 **来源纪律**（`invariants.check_log` / `llm_effects`）：`task_done`、`checkpoint_created`、`checkpoint_advancing`、
 `checkpoint_confirmed`、`step_anchored`、`delivered` 只能来自 `rule` / `observed`；`llm` 的事件只能记录、重开、新增
-（`diagnosis_recorded`、`review_recorded`、`checkpoint_labeled`、`progress_summary`），永远不引起完成、存档、提升。
+（`diagnosis_recorded`、`review_recorded`、`checkpoint_labeled`），永远不引起完成、存档、提升。
 由观察推断出的结论（学到的相关性、持续性回归）记为 `rule`。
 
 | 类别 | 事件 | 来源 | 视图变化 |
@@ -58,7 +58,7 @@
 | 定位 | `persistent_regression` / `locate_started` / `locate_concluded` / `regression_located` / `relation_learned` | rule / rule / rule / observed / rule | 见 §3.4 |
 | LLM | `diagnosis_requested` / `diagnosis_recorded` | rule / llm | 诊断者（只解释） |
 | | `review_started` / `review_recorded` | rule / llm | 复查者（只收紧：只能重开） |
-| | `checkpoint_labeled` / `progress_summary` | llm | 没有步骤时的兜底 |
+| | `checkpoint_labeled` | llm | 没有步骤时的兜底 |
 
 去掉的事件：`lease_renewed`、`lease_expired`（单 worker 下持有没有时效）、`wip_recorded`（并入 `snapshot_taken`）。
 
@@ -198,7 +198,7 @@
 - 交接时机（`session._manage_context`）：到软阈值（`handoff_soft_tokens`，默认等于 `l2_tokens`）且有进行中的步骤时暂缓
   L2，下一次 `step_done` 后交接；没有步骤时照旧 L2/L3；硬阈值（`l4_tokens`）照旧强制交接。
 - 没有步骤时的兜底：里程碑存档（以及每 `label_every` 个其他存档）用 `aux_llm` 生成一行标签（手动存档的 summary 直接作
-  标签）；长时间中断或重建后对对话尾部生成进度摘要。
+  标签）。
 
 ## 4. 调度建议与分层开场上下文（模块 I）
 

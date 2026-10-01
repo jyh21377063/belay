@@ -4,7 +4,7 @@
 这里定义事件类型、每种事件必需的 payload 字段和允许的来源；reduce.py 负责把事件应用到视图上。
 
 来源纪律：存档、完成、提升只能由 observed 与 rule 驱动；llm 的事件只能引起重开与新增
-（诊断、复查、标签、进度摘要只记录，不改变任何完成或存档类状态）。
+（诊断、复查、标签只记录，不改变任何完成或存档类状态）。
 """
 from __future__ import annotations
 
@@ -100,11 +100,10 @@ EVENT_SPECS: dict[str, Spec] = {
     "review_started": Spec(("task", "phase"), (RULE,)),
     "review_recorded": Spec(("task", "phase", "implemented"), (LLM,)),
     "checkpoint_labeled": Spec(("checkpoint", "label"), (LLM,)),
-    "progress_summary": Spec(("worker", "text"), (LLM,)),
 }
 EVENT_TYPES = tuple(EVENT_SPECS)
 # llm 来源的事件：只能记录、重开、新增，永远不能引起完成、存档、提升（不变量检查）
-LLM_ONLY_RECORDS = ("diagnosis_recorded", "review_recorded", "checkpoint_labeled", "progress_summary")
+LLM_ONLY_RECORDS = ("diagnosis_recorded", "review_recorded", "checkpoint_labeled")
 
 
 class EventError(ValueError):

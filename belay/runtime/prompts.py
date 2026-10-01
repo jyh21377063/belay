@@ -162,7 +162,3 @@ would act on. Reply with a single JSON object and nothing else:
 
 LABEL_SYSTEM = """Summarise in one line (at most 25 words) what the agent did in the conversation excerpt below, as \
 a label for a saved state of the code. Output only the line."""
-
-PROGRESS_SYSTEM = """The conversation excerpt below is the last part of an agent's session that was interrupted. \
-Write a short summary (at most 150 words) of what it was in the middle of and what it planned to do next. Output \
-only the summary."""

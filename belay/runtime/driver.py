@@ -39,7 +39,7 @@ from belay.llm import Usage
 from belay.runtime import planner as P
 from belay.runtime.gitops import CP_REF, SNAP_REF, ShadowRepo
 from belay.runtime.port import WorkerPort
-from belay.runtime.prompts import (DIAGNOSE_SYSTEM, LABEL_SYSTEM, PROGRESS_SYSTEM, REVIEW_BLOCKED_SYSTEM,
+from belay.runtime.prompts import (DIAGNOSE_SYSTEM, LABEL_SYSTEM, REVIEW_BLOCKED_SYSTEM,
                                    REVIEW_SYSTEM, system_prompt)
 from belay.runtime.runtime import Runtime
 from belay.runtime.session import BelaySession, ModelCallFailed, load_transcript_messages
@@ -597,8 +597,6 @@ class BelayRun:
         crashed = reason in ("crash", "recover", "rebuild", "restart", "resume")
         if crashed and rt.graph.baseline_ready:
             await self.take_snapshot("recover")                      # G7：恢复的第一步是补拍快照
-        if reason in ("recover", "rebuild") and prev is not None:
-            await self._progress_summary(prev.id)
         if not self.cfg.graph_context:
             text, summary = self._ablation_opening()
             return text, summary, []
@@ -740,21 +738,6 @@ class BelayRun:
         if res.status == "max_turns":
             report = await child.conclude(EXPLORE_WRAPUP)
         return (report or "(The exploration returned no report.)")[:20000]
-
-    async def _progress_summary(self, sid: str) -> None:
-        """没有步骤时的兜底：长时间中断或容器重建后，对“最后一条步骤或笔记之后”的对话尾部生成进度摘要（llm）。"""
-        g = self.rt.graph
-        t = focus_task(g, self.w)
-        if self.aux_llm is None or t is None or steps_of(g, t.id):
-            return
-        tail = self._transcript_tail(g.sessions[sid].transcript, 12000)
-        if not tail:
-            return
-        try:
-            resp = await self.aux_llm.call(PROGRESS_SYSTEM, [], [{"role": "user", "content": tail}])
-            await self.rt.submit(R.record_progress_summary, self.w, resp.text, g.seq)
-        except Exception as e:
-            self.log(f"progress summary failed: {type(e).__name__}: {e}")
 
     @staticmethod
     def _transcript_tail(path: Optional[str], max_chars: int, since_t: float = 0.0) -> str:

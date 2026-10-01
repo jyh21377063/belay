@@ -184,10 +184,6 @@ def _focus(g: Graph, worker: str, blobs: Mapping[str, str], cfg: BelayConfig, mo
         summ = latest_handoff_summary(g, worker)
         if summ:
             out.append("Summary you wrote at the last compaction or handoff (model-written):\n" + _clip(summ, 4000))
-        ps = [s for s in g.summaries if s.get("worker") == worker]
-        if ps:
-            out.append("Summary of the conversation before the interruption (model-written):\n"
-                       + _clip(ps[-1]["text"], 2000))
     calls = list(recent_calls)
     if calls:
         out.append("Your last actions before the interruption (already done; do not repeat them blindly):")

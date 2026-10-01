@@ -404,7 +404,6 @@ class Graph:
     locates: dict[str, Locate] = field(default_factory=dict)
     diagnoses: dict[str, Diagnosis] = field(default_factory=dict)
     relations: tuple[tuple[str, str], ...] = ()                 # rule：(源文件, 测试文件)
-    summaries: tuple[dict, ...] = ()                            # llm：进度摘要
     # C
     checkpoints: dict[int, Checkpoint] = field(default_factory=dict)
     attempts: dict[str, Attempt] = field(default_factory=dict)

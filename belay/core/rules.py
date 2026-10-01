@@ -1336,11 +1336,6 @@ def label_checkpoint(tx: Tx, cid: int, label: str) -> None:
         tx.emit("checkpoint_labeled", COMPACTOR, LLM, checkpoint=cid, label=label.strip()[:300])
 
 
-def record_progress_summary(tx: Tx, worker: str, text: str, after: Optional[int] = None) -> None:
-    if text.strip():
-        tx.emit("progress_summary", COMPACTOR, LLM, worker=worker, text=text.strip()[:4000], after=after)
-
-
 # ======================================================================== 运行的结束
 
 def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str, str]:
