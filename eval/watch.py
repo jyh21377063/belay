@@ -1,7 +1,8 @@
 """实时查看 agent 进度：把 agent 日志整理成可读的时间线。支持两种日志：
 
   claude-code.txt    Claude Code 的 stream-json（A、A-gate、PEE 组）
-  transcript.jsonl   自研 worker 的轨迹（B 组、Belay），额外显示越界、读后被改、上下文清理与重建、explore 子 agent
+  transcript.jsonl   自研 worker 的轨迹（B 组），额外显示越界、读后被改、上下文清理与重建、explore 子 agent
+  belay/sessions/S<n>.jsonl   Belay（v6）每个会话一份轨迹；一个会话结束后自动切到下一个会话
 
   python -m eval.watch                      # 自动找最近在写的 trial，持续跟踪（Ctrl-C 退出）
   python -m eval.watch flat-smoke           # 指定 run_id（取其中最近更新的 trial）
@@ -9,7 +10,8 @@
   python -m eval.watch -n 50 --no-follow    # 只看最近 50 条，不跟踪
   python -m eval.watch flat-smoke --thinking   # 同时显示思考内容的开头（仅自研 worker）
 
-日志位置：<results_root>/<run_id>/<benchmark>/<id>/<k>/pier/agent/<trial>/agent/{claude-code.txt,transcript.jsonl}
+日志位置：<results_root>/<run_id>/<benchmark>/<id>/<k>/pier/agent/<trial>/agent/{claude-code.txt,transcript.jsonl,
+belay/sessions/S<n>.jsonl}。Belay 在 setup 阶段做准备（基线双跑、规划）时还没有会话轨迹，看 belay/setup.json 是否已写出。
 探索子 agent 的轨迹在同目录的 transcript-explore-<n>.jsonl，可以直接把文件路径传给本命令查看。
 """
 from __future__ import annotations
@@ -22,7 +24,7 @@ from pathlib import Path
 
 from eval.config import DEFAULT_RUNS, load_yaml, resolve_path
 
-LOG_NAMES = ("claude-code.txt", "transcript.jsonl")
+LOG_NAMES = ("claude-code.txt", "transcript.jsonl", "belay/sessions/S*.jsonl")
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "edit_file", "write_file"}
 
 
@@ -37,7 +39,10 @@ def find_log(target: str | None) -> Path:
     base = Path(target) if target and Path(target).is_dir() else results_root() / (target or "")
     logs = sorted((p for name in LOG_NAMES for p in base.rglob(name)), key=lambda p: p.stat().st_mtime)
     if not logs:
-        sys.exit(f"在 {base} 下没有找到 {' 或 '.join(LOG_NAMES)}（agent 可能还在构建镜像，先看 trial.log）")
+        prep = sorted(base.rglob("belay/events.jsonl"))
+        hint = (f"Belay 还没有开始会话：可能还在 setup 阶段做准备（基线双跑、规划），看 {prep[-1].parent}/setup.json "
+                "是否已写出、events.jsonl 是否在增长" if prep else "agent 可能还在构建镜像，先看 trial.log")
+        sys.exit(f"在 {base} 下没有找到 {' 或 '.join(LOG_NAMES)}（{hint}）")
     return logs[-1]
 
 
@@ -210,6 +215,15 @@ def render_belay(ev: dict, st: State) -> list[str]:
         flag = "，工作区被改动" if ev.get("modified") else ""
         lines.append(f"{when}       🔍 explore#{ev.get('id')} 结束：{ev.get('status')}，{ev.get('turns')} 轮，"
                      f"输入 {tokens:,}，报告 {ev.get('report_chars')} 字符{flag}")
+    elif t == "compact":
+        lines.append(f"{when}       ✂️  压缩 L{ev.get('level')}：{ev.get('before', 0):,} → {ev.get('after', 0):,}")
+    elif t in ("handoff", "soft_handoff"):
+        what = "交接" if t == "handoff" else "到软阈值，等当前步骤完成再交接"
+        lines.append(f"{when}       🔄 {what}（上下文 {ev.get('context', 0):,}）")
+    elif t == "end" and "reason" in ev:                   # Belay 的会话结束：运行本身由 runtime 决定是否继续
+        st.done = True
+        lines.append(f"── 会话结束：{ev.get('reason')}  轮数={ev.get('turns')}  耗时={round(st.elapsed / 60, 1)}min"
+                     "  （runtime 决定开新会话还是收尾）")
     elif t == "end":
         st.done = True
         lines.append(f"── agent 结束：{ev.get('status')}  轮数={ev.get('turns')}  重建={ev.get('resets')}  "
@@ -220,7 +234,7 @@ def render_belay(ev: dict, st: State) -> list[str]:
 
 
 def renderer_for(log: Path):
-    return render_belay if log.name.startswith("transcript") else render
+    return render_belay if log.name.startswith("transcript") or log.parent.name == "sessions" else render
 
 
 def trial_name(log: Path) -> str:
@@ -299,8 +313,10 @@ def main(argv=None) -> int:
                     newest = log
                 if newest != log and newest.stat().st_mtime > log.stat().st_mtime:
                     print(status(st, log))
+                    same = newest.parent == log.parent and log.parent.name == "sessions"
                     log, st = newest, State(a.thinking)
-                    print(f"\n════ 切换到下一道题：{trial_name(log)}\n日志：{log}\n", flush=True)
+                    what = f"下一个会话 {log.stem}" if same else f"下一道题：{trial_name(log)}"
+                    print(f"\n════ 切换到{what}\n日志：{log}\n", flush=True)
                     pos, out = read_new(log, 0, st)
                     print("\n".join(out[-a.n:]), flush=True)
             if now - last_status > 60:
