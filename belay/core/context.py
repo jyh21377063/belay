@@ -210,9 +210,8 @@ def _pending(g: Graph, worker: str) -> str:
         for r in recs:
             by_trigger.setdefault(r.trigger, []).append(r.test)
         for trig, tests in by_trigger.items():
-            why = {"demoted": "failed the full suite on a checkpoint and still fails on your latest snapshot",
-                   "background": "failed on several consecutive snapshots",
-                   "dev_check": "fails in the background checks and in your run_check"}.get(trig, trig)
+            why = {"demoted": "failed the full suite on a checkpoint and still fails on your latest snapshot"
+                   }.get(trig, trig)
             out.append(f"- Persistent regression ({why}): " + ", ".join(tests[:8])
                        + (f" (+{len(tests) - 8} more)" if len(tests) > 8 else ""))
     for cp in chain(g):
@@ -341,14 +340,14 @@ def _workspace(g: Graph, worker: str) -> str:
                      "behind; provisional checkpoints are confirmed by the full suite in the background.")
     w = g.wips.get(worker)
     if w is None or w.base != cp.id:
-        lines.append("Your working tree has changes that are not in a checkpoint yet (the harness snapshots and "
-                     "checkpoints it in the background).")
+        lines.append("Your working tree has changes that are not in a checkpoint yet (they become one when you "
+                     "finish a step, call checkpoint or ready_for_review).")
     elif not w.files and not w.dropped:
         lines.append("Your working tree has no changes relative to it.")
     else:
         if w.files:
-            lines.append(f"Changes not in a checkpoint yet ({len(w.files)} file(s); the harness checkpoints them in "
-                         f"the background):\n{_fmt_files(w.files, 20)}")
+            lines.append(f"Changes not in a checkpoint yet ({len(w.files)} file(s); they become one when you finish "
+                         f"a step, call checkpoint or ready_for_review):\n{_fmt_files(w.files, 20)}")
         if w.dropped:
             lines.append("Changes under test paths (never delivered; checks run against the original test files): "
                          + ", ".join(w.dropped[:15]) + (" ..." if len(w.dropped) > 15 else ""))

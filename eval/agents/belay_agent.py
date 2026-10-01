@@ -13,7 +13,7 @@ run 阶段：对同一个 run_dir 新建 BelayRun（不跨事件循环复用对�
 runs.yaml 中除 FlatAgent 的参数外还可用：
   gate_spec         由 runner 按任务目录的 gate.json 传入（agent 定义里写 gate: true）；没有时运行不带测试验证
   task_instruction  由 runner 在 setup 前传入的任务原文（agent 定义里写 pass_instruction: true）
-  runtime           belay.core.config.BelayConfig 的字段（未知字段报错），例如 {auto_checkpoint: false}
+  runtime           belay.core.config.BelayConfig 的字段（未知字段报错），例如 {locate: false}
   aux_model         诊断者、复查者、存档标签用的模型（默认与 worker 相同）
   state_dir         容器内的状态目录（影子仓库、作业、验证槽位），默认 /opt/belay；必须在仓库之外
   finalize_margin_sec   预算里留给收尾的余量（截止之后 runtime 还会等最后的验证一小段时间），默认 150

@@ -272,7 +272,7 @@ def point_status(g: Graph, tree: str, test: str, index: Optional[dict[str, list[
 
 def job_priority(g: Graph, job: Job) -> int:
     """1 收尾与交付 / 基线；2 worker 在等的（手动存档、review 与证据、步骤锚点、交接、定位、按门自查）；
-    3 后台提升；4 后台自动存档。"""
+    3 后台提升；4 已被取代但还在跑的后台作业（以及旧日志里的自动存档）。"""
     if job.purpose == "baseline" or (g.run is not None and g.run.finalizing):
         return 1
     a = g.attempts.get(job.attempt) if job.attempt else None

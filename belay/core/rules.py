@@ -24,7 +24,7 @@ from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_PENDING, ATT_REJECTED, 
 from belay.core.plan import normalize_ws, quote_in_text, validate_split
 from belay.core.queries import (all_resolved, chain, chain_ids, consecutive_crashes, current_step, focus_task,
                                 held_tasks, is_ancestor, last_session, latest_milestone, latest_snapshot, next_id, num,
-                                open_attempt, open_persistent, remaining_sec, reserve_sec, sessions_without_progress,
+                                open_attempt, remaining_sec, reserve_sec, sessions_without_progress,
                                 snapshot_contained, snapshots_in_epoch, steps_of, unfinished_deps)
 from belay.core.reduce import apply
 from belay.core.suggest import suggestion_rank
@@ -37,9 +37,12 @@ from belay.core.verify import (PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED
 BLOCK_KINDS = ("insufficient_info", "environment", "check_conflict")
 TRIGGER_KIND = {"worker": KIND_MILESTONE, "review": KIND_REVIEW, "auto": KIND_AUTO, "step": KIND_STEP,
                 "handoff": KIND_HANDOFF, "session_end": KIND_HANDOFF, "deadline": KIND_FINAL, "final": KIND_FINAL}
+# 后台验证只取这些语义节点拍下的快照；其余快照（写操作、模型跑测试、恢复、回退……）只存不验，供恢复与二分使用。
+# 为前台意图拍的快照（手动存档、review、按门自查、收尾）由发起者自己验证。
 PRIORITY_SNAPSHOT_REASONS = {"step_done": "step", "handoff": "handoff", "session_end": "session_end"}
-# 自动存档只取这些原因拍下的快照；为前台意图拍的快照（手动存档、review、按门自查、收尾）由发起者自己验证
-AUTO_REASONS = ("writes", "interval", "model_test", "recover", "rollback", "revert", "suspend")
+HANDOFF_REASONS = ("handoff", "session_end")
+# worker 声明“做完了”的存档：只有它们被拒或被降级时才定位、诊断并通知 worker
+DECLARED_KINDS = (KIND_MILESTONE, KIND_REVIEW)
 
 
 class Rejected(Exception):
@@ -79,7 +82,7 @@ def _running_run(g: Graph) -> bool:
 
 
 def _background_ok(g: Graph) -> bool:
-    """后台活动（自动存档、提升、定位、持续性检测）只在正常运行、隔离有效时进行。"""
+    """后台活动（语义节点的验证、提升、定位）只在正常运行、隔离有效时进行。"""
     return _running_run(g) and not g.run.finalizing and not g.run.reserve and g.baseline_ready and not g.degraded
 
 
@@ -455,11 +458,13 @@ def refresh_anchors(tx: Tx) -> None:
 # ======================================================================== 快照（模块 B）
 
 def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
-    """记录一张快照；与这个 worker 上一张快照完全相同（同一段、同一链头）时不记，返回那一张的序号。"""
+    """记录一张快照；与这个 worker 上一张快照完全相同（同一段、同一链头）时不记，返回那一张的序号。
+    例外：交接 / 会话结束是按原因认出的验证节点，上一张不是这类快照时照样记一张（树相同），否则这个节点会漏验。"""
     g = tx.g
     last = latest_snapshot(g, worker)
-    if last is not None and last.tree == obs.tree and last.raw_tree == obs.raw_tree and last.epoch == g.epoch \
-            and last.testable == obs.testable:
+    same = last is not None and last.tree == obs.tree and last.raw_tree == obs.raw_tree and last.epoch == g.epoch \
+        and last.testable == obs.testable
+    if same and not (reason in HANDOFF_REASONS and last.reason not in HANDOFF_REASONS):
         return last.n
     n = g.last_snapshot + 1
     f = focus_task(g, worker)
@@ -474,11 +479,11 @@ def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
     return n
 
 
-def _priority_candidate(g: Graph, worker: str) -> Optional[tuple[Snapshot, str]]:
-    """后台线上优先验证的快照：还没被包含的步骤锚点、比链头新的交接快照（最早的先）。"""
+def _priority_candidate(g: Graph, worker: str) -> Optional[tuple[Snapshot, str, str]]:
+    """后台线要验证的快照：还没被包含的步骤锚点、比链头新的交接快照（最早的先）。返回（快照, 触发, 标签）。"""
     head = g.head_cp
     attempted = {a.snapshot for a in g.attempts.values()}
-    out: list[tuple[int, Snapshot, str]] = []
+    out: list[tuple[int, Snapshot, str, str]] = []
     if not g.degraded:
         for s in g.steps.values():
             if s.status != STEP_DECLARED or s.anchor_snapshot not in g.snapshots:
@@ -486,61 +491,33 @@ def _priority_candidate(g: Graph, worker: str) -> Optional[tuple[Snapshot, str]]
             snap = g.snapshots[s.anchor_snapshot]
             if snap.worker == worker and snap.testable and snap.epoch == g.epoch and snap.n not in attempted \
                     and snap.tree != head.tree and not snap.lost:
-                out.append((snap.n, snap, "step"))
+                out.append((snap.n, snap, "step", s.summary or s.title))
     for snap in g.snapshots.values():
-        if snap.worker == worker and snap.reason in ("handoff", "session_end") and snap.epoch == g.epoch and \
+        if snap.worker == worker and snap.reason in HANDOFF_REASONS and snap.epoch == g.epoch and \
                 snap.n not in attempted and snap.testable and snap.tree != head.tree and not snap.lost and \
                 not (head.epoch == snap.epoch and head.snapshot >= snap.n):
-            out.append((snap.n, snap, PRIORITY_SNAPSHOT_REASONS[snap.reason]))
+            out.append((snap.n, snap, PRIORITY_SNAPSHOT_REASONS[snap.reason], ""))
     out = [x for x in out if not (head.epoch == x[1].epoch and head.snapshot >= x[0])]
     if not out:
         return None
-    _, snap, trig = min(out, key=lambda x: x[0])
-    return snap, trig
-
-
-def _auto_candidate(g: Graph, worker: str) -> Optional[Snapshot]:
-    head = g.head_cp
-    floor = head.snapshot if head.epoch == g.epoch else 0
-    for a in g.attempts.values():
-        if a.lane == LANE_BG and a.worker == worker and a.epoch == g.epoch:
-            floor = max(floor, a.snapshot)
-    rejected_trees = {a.tree for a in g.attempts.values() if a.status == ATT_REJECTED and a.regressions}
-    for n in sorted(g.snapshots, reverse=True):
-        s = g.snapshots[n]
-        if n <= floor:
-            return None
-        if s.worker == worker and s.epoch == g.epoch and s.testable and not s.lost:
-            if s.tree == head.tree or s.tree in rejected_trees or s.reason not in AUTO_REASONS:
-                return None                     # 步骤锚点、交接与前台意图的快照不走自动线
-            return s
-    return None
+    _, snap, trig, label = min(out, key=lambda x: x[0])
+    return snap, trig, label
 
 
 def schedule_background(tx: Tx) -> None:
-    """后台存档线：同一时刻最多一个后台尝试。它结束后取最新的可测快照发起下一个（中间的快照跳过，不删除）。
-    步骤锚点与交接快照优先：它们到来时取代正在等结果的自动尝试。"""
-    g, cfg = tx.g, tx.cfg
+    """后台验证线：只验证语义节点（步骤锚点、交接、会话结束）的快照，同一时刻每个 worker 最多一个后台尝试。
+    没有基于时间或写操作次数的自动存档：普通快照只存不验。后台尝试被拒时链头不动，也不通知 worker、不定位。"""
+    g = tx.g
     if not _running_run(g) or g.run.finalizing or g.run.reserve or not g.baseline_ready or g.head_cp is None:
         return
     for w in sorted(g.workers):
         g = tx.g
+        if open_attempt(g, w, LANE_BG) is not None:
+            continue
         prio = _priority_candidate(g, w)
-        bg = open_attempt(g, w, LANE_BG)
-        if bg is not None:
-            if bg.status == ATT_PENDING and bg.kind == KIND_AUTO and prio is not None and prio[0].n > bg.snapshot:
-                supersede_attempt(tx, bg.id, "priority")
-            else:
-                continue
-        g = tx.g
         if prio is not None:
-            snap, trig = prio
-        elif cfg.auto_checkpoint and not g.degraded:
-            snap, trig = _auto_candidate(g, w), "auto"
-        else:
-            snap = None
-        if snap is not None:
-            request_checkpoint(tx, w, snap.n, trig, lane=LANE_BG)
+            snap, trig, label = prio
+            request_checkpoint(tx, w, snap.n, trig, lane=LANE_BG, summary=label)
 
 
 # ======================================================================== 存档：验证后比较并交换
@@ -651,11 +628,11 @@ def _decide(tx: Tx, aid: str, regs: tuple, flaky: tuple) -> None:
         tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=aid, regressions=list(regs), flaky=list(flaky),
                 reason="regression", detail="; ".join(errors)[:1000])
         _reopen_attempt_tasks(tx, aid, "checkpoint_rejected", regs)
-        if a.lane == LANE_FG or a.kind in (KIND_STEP, KIND_HANDOFF):
-            trig = "step" if a.kind == KIND_STEP else "rejected"
-            loc = start_locate(tx, regression_ids(regs), {"tree": a.tree, "snapshot": a.snapshot}, trig, ref=aid)
+        if a.lane == LANE_FG:                       # 只有 worker 声明的存档被拒才定位与诊断；后台的只是链头不动
+            loc = start_locate(tx, regression_ids(regs), {"tree": a.tree, "snapshot": a.snapshot}, "rejected",
+                               ref=aid)
             if loc is None:
-                maybe_diagnose(tx, trig, regression_ids(regs), None)
+                maybe_diagnose(tx, "rejected", regression_ids(regs), None)
             _repeated_diagnosis(tx, aid)
         schedule_background(tx)
     elif not any(x.status == ATT_ADVANCING for x in g.attempts.values()):
@@ -784,7 +761,8 @@ def evaluate_promotion(tx: Tx, cid: int) -> None:
         return
     tx.emit("checkpoint_demoted", RUNTIME, RULE, checkpoint=cid, regressions=list(regs)[:200],
             n_regressions=len(regs))
-    if not _background_ok(tx.g):
+    if not _background_ok(tx.g) or cp.kind not in DECLARED_KINDS:
+        schedule_promotion(tx)                      # 步骤、交接等中间节点：只降级（不再交付），不追查、不通知
         return
     # 问题是否还在：对最新的可测快照只跑这几个失败的测试
     ids = regression_ids(regs)
@@ -817,72 +795,6 @@ def _demotion_persists(tx: Tx, cid: int, tests: list[str], latest_n: int) -> Non
                        ref=f"cp:{cid}")
     if loc is None:
         maybe_diagnose(tx, "demoted", tests, None)
-
-
-# ======================================================================== 持续性回归（模块 E 的早发现）
-
-def _snapshot_statuses(g: Graph, test: str, index: dict, need: int) -> list[tuple[int, str]]:
-    """当前段里这个测试在可测快照上的已知状态（按序号）。从最新往回走：凑够 need 个已知状态、
-    并且走出末尾的连续失败就停，避免长程运行里每次都扫全部快照。"""
-    out: list[tuple[int, str]] = []
-    cache: dict[str, str] = {}
-    for n in sorted(g.snapshots, reverse=True):
-        s = g.snapshots[n]
-        if s.epoch != g.epoch:
-            if s.epoch < g.epoch:
-                break
-            continue
-        if not s.testable or s.lost:
-            continue
-        st = cache.get(s.tree) or point_status(g, s.tree, test, index)
-        cache[s.tree] = st
-        if st in (PT_PASS, PT_FAIL):
-            out.append((s.n, st))
-            if len(out) >= need and st == PT_PASS:
-                break
-    return list(reversed(out))
-
-
-def _streak_start(sts: list[tuple[int, str]]) -> Optional[int]:
-    """末尾连续失败的第一张快照。"""
-    first = None
-    for n, st in reversed(sts):
-        if st != PT_FAIL:
-            break
-        first = n
-    return first
-
-
-def detect_persistent(tx: Tx, jid: str) -> None:
-    g, cfg = tx.g, tx.cfg
-    if not _background_ok(g) or cfg.persist_k <= 0:
-        return
-    j = g.jobs[jid]
-    guard = guard_set(g.baseline)
-    failing = sorted(t for t, st in j.results.items() if t in guard and st != PASSED)[:50]
-    found: dict[str, list] = {}
-    index = jobs_by_tree(g) if failing else {}
-    for test in failing:
-        if open_persistent(g, test):
-            continue
-        sts = _snapshot_statuses(g, test, index, cfg.persist_k)
-        first = _streak_start(sts)
-        if j.live:                                  # worker 自己的 run_check 也看到它失败
-            if first is not None:
-                found.setdefault("dev_check", []).append((test, first))
-            continue
-        last = sts[-cfg.persist_k:]
-        if len(last) == cfg.persist_k and all(st == PT_FAIL for _, st in last):
-            found.setdefault("background", []).append((test, first))
-    for trigger, items in sorted(found.items()):
-        since = min(n for _, n in items)
-        tests = [t for t, _ in items]
-        tx.emit("persistent_regression", RUNTIME, RULE, tests=tests[:50], trigger=trigger, since=since,
-                epoch=g.epoch)
-        snap = tx.g.snapshots[since]
-        loc = start_locate(tx, tests, {"tree": snap.tree, "snapshot": since}, "persistent")
-        if loc is None:
-            maybe_diagnose(tx, "persistent", tests, None)
 
 
 # ======================================================================== 快照二分定位（模块 D3）
@@ -1245,7 +1157,7 @@ def job_preempted(tx: Tx, job_id: str) -> None:
 
 def job_finished(tx: Tx, job_id: str, state: str, results: dict, sec: float = 0.0, error: str = "",
                  reasons: Optional[dict] = None) -> None:
-    """作业结果（观察）→ 级联：重跑丢失的作业、推进在等结果的尝试、判定证据、提升与降级、定位、持续性检测。"""
+    """作业结果（观察）→ 级联：重跑丢失的作业、推进在等结果的尝试、判定证据、提升与降级、定位。"""
     job = tx.g.jobs.get(job_id)
     if job is None or job.state != JOB_RUNNING:
         return
@@ -1285,8 +1197,6 @@ def _cascade(tx: Tx, job_id: Optional[str] = None) -> None:
             _evaluate_recheck(tx, job_id)
     for lid in [l.id for l in tx.g.locates.values() if l.status == "running"]:
         advance_locate(tx, lid)
-    if job is not None and job.state == JOB_FINISHED and job.results:
-        detect_persistent(tx, job_id)
     schedule_promotion(tx)
     schedule_background(tx)
 
@@ -1354,7 +1264,7 @@ def detect_stalls(tx: Tx) -> None:
                     detail=f"no progress for {int((tx.now - idle_since) / 60)} min")
             return
         mine = sorted((a for a in g.attempts.values() if a.worker == w and a.status in (ATT_REJECTED, "created")
-                       and (a.lane == LANE_FG or a.kind == KIND_STEP)),
+                       and a.lane == LANE_FG),
                       key=lambda a: a.created_seq)[-cfg.stall_same_failure:]
         if len(mine) == cfg.stall_same_failure and all(a.status == ATT_REJECTED and a.regressions for a in mine):
             sigs = {failure_signature(a.regressions) for a in mine}

@@ -106,19 +106,20 @@ class _Hooks:
         await self.run.rt.submit(R.record_compaction, self.run.w, level, before, after, summary)
 
     async def before_tool(self, tu: dict) -> None:
-        """模型自己跑测试或构建时一定拍（命令执行前），并标为“模型认为可测”。"""
+        """模型自己跑测试或构建前拍一张（只存，不验证：调试中的中间态测不过是常态）。"""
         if tu.get("name") == "bash" and TEST_CMD.search(str((tu.get("input") or {}).get("command") or "")):
-            await self.run.take_snapshot("model_test", force=True)
+            await self.run.take_snapshot("model_test")
 
     async def after_tools(self, tool_uses: list[dict], results: list, todos) -> None:
+        """存：编辑类工具之后一定拍；bash 不一定写文件，累计 snapshot_bash_every 次再拍。树没变时不记新快照。"""
         run = self.run
-        writes = sum(1 for tu, (_out, err) in zip(tool_uses, results)
-                     if tu.get("name") in ("edit_file", "write_file", "bash") and not err)
+        ok = [tu.get("name") for tu, (_out, err) in zip(tool_uses, results) if not err]
+        edits = sum(1 for n in ok if n in ("edit_file", "write_file"))
         run.tool_seq += len(tool_uses)
-        run.writes_since += writes
+        run.bash_since += sum(1 for n in ok if n == "bash")
         if todos is not None:
             await run.update_steps(todos)
-        if writes:
+        if edits or run.bash_since >= run.cfg.snapshot_bash_every:
             await run.take_snapshot("writes")
 
     def write_guard(self):
@@ -179,8 +180,7 @@ class BelayRun:
         self.last_activity = clock()
         self.tools_running = 0
         self.tool_seq = 0
-        self.writes_since = 0
-        self.last_snapshot_t = 0.0
+        self.bash_since = 0
         self.session_task: Optional[asyncio.Task] = None
         self.session: Optional[BelaySession] = None
         self.usage = Usage()                       # 全部会话累计的用量（评测框架的 context 用）
@@ -449,22 +449,17 @@ class BelayRun:
                 self.log(f"tick failed: {type(e).__name__}: {e}")
 
     # ================================================================ 快照（模块 B）
-    async def take_snapshot(self, reason: str, force: bool = False) -> Optional[int]:
-        """在工具边界拍快照：限流（距上次不少于 snapshot_min_interval_sec，或累计写操作达到 snapshot_min_writes），
-        模型跑测试、会话结束、交接、截止、step_done、手动存档时跳过限流。返回快照序号（没拍时返回最近一张）。"""
+    async def take_snapshot(self, reason: str) -> Optional[int]:
+        """在工具边界拍快照（何时拍由调用方决定，见 after_tools；没有时间限流）。快照用于恢复、回退与事后二分；
+        只有原因是语义节点（步骤完成、交接、会话结束）的快照才进后台验证。树与上一张相同时不记新快照，
+        返回那一张的序号。"""
         async with self._snap_lock:
             g = self.rt.graph
-            now = self.rt.now()
-            if not force and now - self.last_snapshot_t < self.cfg.snapshot_min_interval_sec and \
-                    self.writes_since < self.cfg.snapshot_min_writes:
-                last = latest_snapshot(g, self.w)
-                return last.n if last else None
             if g.head_cp is None or not g.baseline_ready:
                 return None
             obs = await self._observe()
             n = await self.rt.submit(R.record_snapshot, self.w, obs, reason)
-            self.last_snapshot_t = now
-            self.writes_since = 0
+            self.bash_since = 0
             g = self.rt.graph
             exported = (self.store.get_meta("mirror", {}) or {}).get("snap", 0)
             if n is not None and n - exported >= self.cfg.mirror_every:
@@ -474,15 +469,15 @@ class BelayRun:
     async def _observe(self) -> SnapObs:
         g = self.rt.graph
         raw = await self.repo.snapshot(self.w)
+        last = latest_snapshot(g, self.w) or latest_snapshot(g)
+        if last is not None and last.raw_tree == raw and last.epoch == g.epoch:      # 没有改动：直接沿用上一张
+            return SnapObs(tree=last.tree, raw_tree=raw, files=last.files, dropped=last.dropped,
+                           testable=last.testable, commit=last.commit, precheck=last.precheck, tool_seq=self.tool_seq)
         base, head = g.checkpoints[0].tree, g.head_cp.tree
         if self.cfg.protect_tests and guard_set(g.baseline):
             tree, dropped = await self.repo.strip_tests(base, raw)
         else:
             tree, dropped = raw, []
-        last = latest_snapshot(g, self.w) or latest_snapshot(g)
-        if last is not None and last.raw_tree == raw and last.tree == tree and last.epoch == g.epoch:
-            return SnapObs(tree=tree, raw_tree=raw, files=last.files, dropped=last.dropped, testable=last.testable,
-                           commit=last.commit, precheck=last.precheck, tool_seq=self.tool_seq)
         files = await self.repo.numstat(head, tree) if tree != head else []
         testable, why = await self._precheck(files)
         parent = last.commit if last is not None and last.commit and not last.lost else g.checkpoints[0].commit
@@ -530,7 +525,7 @@ class BelayRun:
     async def update_steps(self, todos: list[dict]) -> None:
         g = self.rt.graph
         if R.newly_completed(g, self.w, todos):
-            n = await self.take_snapshot("step_done", force=True)
+            n = await self.take_snapshot("step_done")
             files = await self.step_files(n)
             await self.rt.submit(R.plan_steps, self.w, todos, n, files)
         else:
@@ -601,7 +596,7 @@ class BelayRun:
         prev = last_ended_session(rt.graph, self.w)
         crashed = reason in ("crash", "recover", "rebuild", "restart", "resume")
         if crashed and rt.graph.baseline_ready:
-            await self.take_snapshot("recover", force=True)          # G7：恢复的第一步是补拍快照
+            await self.take_snapshot("recover")                      # G7：恢复的第一步是补拍快照
         if reason in ("recover", "rebuild") and prev is not None:
             await self._progress_summary(prev.id)
         if not self.cfg.graph_context:
@@ -664,7 +659,7 @@ class BelayRun:
                 await rt.submit(R.end_session, self.w, "runtime_crash")
                 return
             session = self._make_session("", port, tpath, messages)
-            await self.take_snapshot("recover", force=True)
+            await self.take_snapshot("recover")
             blobs = await self._context_blobs("resume")
             session.append_reminder(resume_reminder(rt.graph, self.w, rt.now(), self.cfg, blobs,
                                                     self.store.events(after=rt.graph.sessions[sid].started_seq)
@@ -728,7 +723,7 @@ class BelayRun:
         self.peak_context = max(self.peak_context, session.peak_context)
         await rt.submit(R.end_session, self.w, end, session.peak_context, session.turns, error, session.ctx.todos)
         if end != "deadline" and not rt.graph.run.reserve and not rt.graph.run.finalizing:
-            await self.take_snapshot("handoff" if end == "handoff" else "session_end", force=True)
+            await self.take_snapshot("handoff" if end == "handoff" else "session_end")
             if rt.graph.degraded:                                      # 切换工作区的验证结束前不能开新会话
                 await rt.wait_until(lambda g: open_attempt(g, None, LANE_BG) is None)
             self.spawn(self.mirror("session_end"))
@@ -797,7 +792,7 @@ class BelayRun:
         await rt.wait_until(lambda g: open_attempt(g, None, LANE_FG) is None, timeout=left())
         trigger = "deadline" if reason == "deadline" else "final"
         try:
-            n = await self.take_snapshot(trigger, force=True)
+            n = await self.take_snapshot(trigger)
             aid = await rt.submit(R.request_checkpoint, self.w, n, trigger, tier="full") if n else None
         except Rejected as e:
             self.log(f"final checkpoint not attempted: {e}")
@@ -852,7 +847,7 @@ class BelayRun:
     # ================================================================ 外层调度：挂起
     async def suspend(self) -> None:
         """强制快照 → 导出 bundle → 会话以 suspended 结束 → run_suspended。之后在任何主机上 resume 即可接回。"""
-        await self.take_snapshot("suspend", force=True)
+        await self.take_snapshot("suspend")
         await self.mirror("suspend")
         self._cancel_reason = "suspended"
         if self.session_task is not None and not self.session_task.done():
@@ -958,7 +953,7 @@ class BelayRun:
         await self.rt.submit(R.ref_advanced, attempt, ok, commit, files, detail)
 
     async def _eff_mirror_checkpoint(self, checkpoint: int) -> None:
-        """存档 ref 每个都设（便宜）；补丁镜像与 bundle 只在里程碑上做。自动存档的提交是确定的，
+        """存档 ref 每个都设（便宜）；补丁镜像与 bundle 只在里程碑上做。非里程碑存档（交接）的提交是确定的，
         它的树就是某张快照的候选树：只要快照已导出，重建时可以原样重做（recovery.rebuild_container）。"""
         g = self.rt.graph
         cp = g.checkpoints[checkpoint]
@@ -972,7 +967,7 @@ class BelayRun:
         await self.mirror("milestone")
 
     async def _eff_label_checkpoint(self, checkpoint: int) -> None:
-        """没有步骤时的兜底：里程碑存档（以及每 label_every 个自动存档）生成一行“这段做了什么”（llm）。"""
+        """没有步骤时的兜底：里程碑存档（以及每 label_every 个其他存档）生成一行“这段做了什么”（llm）。"""
         g = self.rt.graph
         cp = g.checkpoints.get(checkpoint)
         if cp is None or cp.label or not self.cfg.labeler or self.aux_llm is None:
@@ -1000,7 +995,7 @@ class BelayRun:
             await self.repo.checkout(cp.tree, worker)
             if reset_ref:
                 await self.repo.set_ref(cp.commit)
-            await self.take_snapshot("rollback", force=True)
+            await self.take_snapshot("rollback")
         finally:
             self.restored.set()
 

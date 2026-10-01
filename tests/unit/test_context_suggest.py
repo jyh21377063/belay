@@ -22,7 +22,7 @@ PLAN = {"requirements": [{"id": f"r{i}", "quote": q, "summary": f"f{i}"} for i, 
 
 
 def sim(cfg=None) -> Sim:
-    s = Sim(BASE, cfg=cfg or BelayConfig(auto_checkpoint=False))
+    s = Sim(BASE, cfg=cfg or BelayConfig())
     s.setup(TASK, PLAN)
     s.do(R.start_session, "w1", "first", {})
     return s
@@ -98,7 +98,7 @@ def test_big_graph_keeps_protected_sections_within_budget_and_folds_the_rest():
                              for i, q in enumerate(lines)],
             "tasks": [{"id": f"t{i}", "title": f"task {i} " + "words " * 10, "links": [f"r{i % 300}"]}
                       for i in range(1000)]}
-    cfg = BelayConfig(auto_checkpoint=False, reviewer=False)
+    cfg = BelayConfig(reviewer=False)
     s = Sim(BASE, cfg=cfg, check_each=False)
     s.setup(task, plan)
     s.do(R.start_session, "w1", "first", {})

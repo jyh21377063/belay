@@ -85,8 +85,10 @@ python -m eval.report results/<run_id>                    # 重新生成汇总
 一条只追加的事件日志是唯一真相；任务图、执行状态、存档链三个视图由纯函数从日志推出；runtime 是唯一写者。
 循环跑在宿主机进程里，工具经由 `Env` 在任务容器中执行；容器里只需要 bash、coreutils、git 与 python3。
 
-agent 只管写代码：runtime 在工具边界自动拍快照，在验证槽位里用原始测试验证并推进一条两级存档链（related 通过是暂存点，
-全量通过是确认点，交付最新的确认点）；被拒或降级时先用快照二分定位，再让诊断者解释；需求账本与复查者防止漏做和提前结束；
+agent 只管写代码。存档分三层：**存**——runtime 在工具边界给每次实际改动拍快照，只存不测；**验**——只在语义节点
+（步骤完成、交接、手动存档、review、收尾）在验证槽位里用原始测试验证并推进一条两级存档链（related 通过是暂存点，
+全量通过是确认点，交付最新的确认点），没有基于时间的后台存档，后台节点被拒只是链头不动；**查**——只有 worker 声明完成的
+存档被拒或降级时，才在快照上二分定位、让诊断者解释并告诉 worker；需求账本与复查者防止漏做和提前结束；
 交接落在步骤边界，开场上下文分层且有界；全部状态以事件日志和 git bundle 保存在宿主机上，会话、runtime 进程、容器都可以
 随时被替换（内存重试、读盘重放、`resume --rebuild`）。
 
@@ -122,7 +124,7 @@ python -m belay.cli flat --workdir /path/to/repo --task-file task.md    # B 组
 
 ```bash
 python -m eval.run --profile belay-dev --tasks <一道题>                   # 调试集上先跑一道（保留容器）
-python -m eval.run --profile belay-dev --agent belay-no-auto --tasks <题>  # 消融
+python -m eval.run --profile belay-dev --agent belay-no-locate --tasks <题>  # 消融
 ```
 
 ## 待办

@@ -105,7 +105,7 @@ def test_away_section_keeps_the_top_events_and_counts_the_rest():
     mark = s.g.seq
     for i in range(8):
         s.world.define(f"x{i}", {})
-        s.snap(f"x{i}", files=[("pkg/a.py", 1, 1)])
+        s.snap(f"x{i}", files=[("pkg/a.py", 1, 1)], reason="session_end")
     away = [e for e in s.log if e.seq > mark]
     ctx = build_context(s.g, "w1", 50_000, s.now, cfg, mode="resume", away=away,
                         blobs={"away_files": "  pkg/a.py (+1 -1)"})

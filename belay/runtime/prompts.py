@@ -30,10 +30,12 @@ report tasks you cannot finish with `report_blocked`. Dependencies between tasks
 - Your plan for the current task is its list of steps: `todo_write` records it with the harness, and `step_done` \
 marks the current step finished (marking a todo completed does the same). After an interruption the harness hands \
 the plan back to you with your progress, so keep it up to date.
-- The harness snapshots your working tree as you work and checkpoints it in the background whenever no test that \
-passed on the original code fails, errors, is skipped or goes missing. You do not have to remember to save; call \
-`checkpoint` when you want a sound state confirmed right away and labelled. Changes under test paths are never \
-delivered: the existing tests are the acceptance baseline.
+- The harness snapshots your working tree as you work, so nothing is lost, but it does not test those snapshots: \
+work in progress is allowed to break tests. Your work becomes a checkpoint (verified: no test that passed on the \
+original code fails, errors, is skipped or goes missing) when you finish a step (`step_done`, verified in the \
+background), call `checkpoint` (verified right away and labelled) or `ready_for_review`, and once more at the end. \
+So finish steps when a coherent piece of work is complete. Changes under test paths are never delivered: the \
+existing tests are the acceptance baseline.
 - A task counts as done only when the harness observes its checks passing on a checkpoint; a task without checks \
 becomes done_unverified and may be reviewed and reopened. Your own statements are recorded as notes, not as \
 evidence.

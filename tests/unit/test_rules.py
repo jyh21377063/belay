@@ -40,7 +40,7 @@ def sim(**kw) -> Sim:
 
 def manual(**kw) -> BelayConfig:
     """关掉后台自动存档，只看前台规则。"""
-    return BelayConfig(auto_checkpoint=False, **kw)
+    return BelayConfig(**kw)
 
 
 # ======================================================================== 准备
@@ -172,11 +172,11 @@ def test_review_on_unchanged_tree_uses_head_and_runs_evidence():
 def test_precheck_failed_snapshot_is_on_the_timeline_but_never_queued():
     s = sim()
     s.do(R.claim, "w1", "T3")
-    n = s.snap("broken", testable=False)
-    assert s.g.snapshots[n].testable is False and not s.g.attempts                # 自动线不取
+    n = s.snap("broken", testable=False, reason="session_end")
+    assert s.g.snapshots[n].testable is False and not s.g.attempts                # 后台线不取
     s.world.define("t2", {})
-    s.snap("t2")
-    assert s.g.head == 1 and s.g.checkpoints[1].kind == "auto"
+    s.snap("t2", reason="session_end")
+    assert s.g.head == 1 and s.g.checkpoints[1].kind == "handoff"
     n2 = s.snap("broken2", testable=False, reason="checkpoint")
     aid = s.do(R.request_checkpoint, "w1", n2, "worker")                          # 前台：直接给出原因
     assert s.g.attempts[aid].reason == "precheck" and not s.g.attempts[aid].jobs
@@ -192,21 +192,33 @@ def test_job_dedupe_and_unknown_job_rerun():
     assert len(running) == 1 and running[0].id != j1
 
 
-# ======================================================================== 模块 B：自动快照与后台存档
+# ======================================================================== 模块 B：快照只存不验，语义节点才验证
 
-def test_background_checkpoints_follow_snapshots():
+def test_plain_snapshots_are_never_verified():
+    s = sim()
+    s.do(R.claim, "w1", "T3")
+    for i, reason in enumerate(("writes", "model_test", "recover", "rollback", "revert", "suspend")):
+        s.world.define(f"a{i}", {})
+        s.snap(f"a{i}", reason=reason)
+    assert s.g.head == 0 and not s.g.attempts and not s.g.jobs.keys() - {"J1", "J2"}   # 只有基线两次
+
+
+def test_handoff_snapshots_are_verified_in_background():
     s = sim()
     s.do(R.claim, "w1", "T3")
     s.world.define("a1", {})
     n = s.snap("a1")
-    g = s.g
-    assert g.head == 1 and g.checkpoints[1].kind == "auto" and g.checkpoints[1].snapshot == n
-    assert g.checkpoints[1].level == "provisional" or g.checkpoints[1].level == "confirmed"
     assert s.snap("a1") == n                                             # 同样的树不再记
+    h = s.snap("a1", reason="session_end")                               # 树没变也记一张：否则这个节点会漏验
+    g = s.g
+    assert h == n + 1 and g.head == 1 and g.checkpoints[1].kind == "handoff" and g.checkpoints[1].snapshot == h
+    assert s.snap("a1", reason="handoff") == h                           # 已经是交接快照：不再记
+    assert g.checkpoints[1].level == "provisional" or g.checkpoints[1].level == "confirmed"
     s.world.define("a2", {MUL: "FAILED"})
-    s.snap("a2")
-    assert s.g.head == 1 and s.g.wips["w1"].last_rejection is None      # 后台被拒不通知 worker
-    assert not s.g.sessions["S1"].progress or s.g.checkpoints[1].level == "confirmed"
+    s.snap("a2", reason="session_end")
+    g = s.g
+    assert g.head == 1 and g.wips["w1"].last_rejection is None          # 后台被拒：链头不动，不通知 worker
+    assert not g.locates and not g.diagnoses                            # 也不定位、不诊断
 
 
 @pytest.mark.parametrize("order", ["old_first", "new_first"])
@@ -215,7 +227,7 @@ def test_new_snapshot_wins_in_both_orders(order):
     s.do(R.claim, "w1", "T3")
     s.world.define("old", {})
     s.world.define("new", {})
-    s.snap("old")
+    s.snap("old", reason="session_end")
     bg = next(a for a in s.g.attempts.values() if a.lane == "bg")
     fg = s.checkpoint("new")
     fg_job = s.g.attempts[fg].jobs[0]
@@ -234,23 +246,25 @@ def test_new_snapshot_wins_in_both_orders(order):
     assert s.g.checkpoints[s.g.head].tree == "new"
 
 
-def test_declared_units_on_an_auto_checkpoint_become_milestones():
+def test_declared_units_on_a_handoff_checkpoint_become_milestones():
     s = sim(cfg=BelayConfig(confirm_regressions=False))
     s.do(R.claim, "w1", "T3")
     s.world.define("m1", {})
-    s.snap("m1")
-    assert s.g.checkpoints[1].kind == "auto"
+    s.snap("m1", reason="session_end")
+    assert s.g.checkpoints[1].kind == "handoff"
     assert s.checkpoint("m1") is None                                      # 后台已经存过同一棵树
     cp = s.g.checkpoints[1]
     assert cp.kind == "milestone" and s.g.sessions["S1"].progress
     s.world.define("m2", {})
-    s.snap("m2")                                                           # 2：自动存档
+    s.snap("m2")                                                           # 普通快照：不存档
+    assert s.g.head == 1
     s.do(R.plan_steps, "w1", [{"content": "write docstring", "status": "in_progress"}])
     n = s.snap("m2", reason="step_done")
     s.do(R.step_done, "w1", n, "docstring written")
     assert s.g.checkpoints[2].kind == "step" and s.g.checkpoints[2].label == "docstring written"
     s.world.define("m3", {})
-    s.snap("m3")                                                           # 3：自动存档
+    s.snap("m3")                                                           # 普通快照：不存档
+    assert s.g.head == 2
     assert s.do(R.rollback, "w1") == 2                                     # 默认目标：最近的里程碑（步骤）
 
 
@@ -258,7 +272,7 @@ def test_rollback_cancels_background_attempt():
     s = sim(auto_jobs=False)
     s.do(R.claim, "w1", "T3")
     s.world.define("a1", {})
-    s.snap("a1")
+    s.snap("a1", reason="session_end")
     bg = next(a for a in s.g.attempts.values() if a.lane == "bg")
     assert bg.status == "pending"
     to = s.do(R.rollback, "w1")
@@ -266,31 +280,31 @@ def test_rollback_cancels_background_attempt():
     assert any(e.kind == "cancel_orphans" for e in s.effects)
 
 
-def test_auto_checkpoints_are_not_progress_even_when_confirmed():
+def test_handoff_checkpoints_are_not_progress_even_when_confirmed():
     s = sim(cfg=BelayConfig(confirm_regressions=False))
     s.do(R.claim, "w1", "T3")                                             # T3 没有检查项：只有存档与完成能算进展
     s.world.define("w0", {})
-    s.snap("w0")
+    s.snap("w0", reason="session_end")
     cp = s.g.checkpoints[1]
-    assert cp.kind == "auto" and cp.level == "confirmed"                  # 模拟器里提升立即完成
+    assert cp.kind == "handoff" and cp.level == "confirmed"               # 模拟器里提升立即完成
     assert not s.g.sessions["S1"].progress
     s.world.define("w1", {})
     s.checkpoint("w1")                                                     # 手动存档（里程碑）算
     assert s.g.checkpoints[2].kind == "milestone" and s.g.sessions["S1"].progress
 
 
-def test_stall_still_detected_with_auto_checkpoints_only():
+def test_stall_still_detected_with_handoff_checkpoints_only():
     cfg = BelayConfig(stall_no_progress_sec=100, checkpoint_tier="related")
     s = Sim({ADD: "FAILED", MUL: "PASSED", Z: "PASSED"}, cfg=cfg, auto_jobs=False)
     s.setup(TASK, PLAN)
     s.do(R.start_session, "w1", "first", {})
     s.do(R.claim, "w1", "T3")
     s.world.define("w0", {})
-    s.snap("w0")
+    s.snap("w0", reason="session_end")
     bg = next(a for a in s.g.attempts.values() if a.lane == "bg")
     s.finish_job(bg.jobs[0])                                              # 只跑 related：暂存点
     promote = [j for j in s.g.jobs.values() if j.purpose == "promote"]
-    assert s.g.checkpoints[1].kind == "auto" and promote                 # 后台提升已排队，但还没跑完
+    assert s.g.checkpoints[1].kind == "handoff" and promote                 # 后台提升已排队，但还没跑完
     s.advance(101)
     s.do(R.tick)
     assert s.g.stalls and s.g.stalls[-1].kind == "no_progress"
@@ -311,12 +325,12 @@ def test_promotion_skips_older_provisional_points():
     s.do(R.claim, "w1", "T3")
     for t in ("p1", "p2", "p3"):
         s.world.define(t, {})
-    s.snap("p1")
+    s.snap("p1", reason="session_end")
     s.finish_job(_bg(s).jobs[0])
     p1 = _promote(s)
     assert p1.tree == "p1" and s.g.checkpoints[1].level == "provisional"
     for t in ("p2", "p3"):
-        s.snap(t)
+        s.snap(t, reason="session_end")
         s.finish_job(_bg(s).jobs[0])
     assert s.g.head == 3 and _promote(s).id == p1.id                      # 同一时刻只提升一个
     s.finish_job(p1.id)
@@ -329,17 +343,17 @@ def test_demotion_marks_suspects_and_delivery_falls_back():
     s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False))
     s.do(R.claim, "w1", "T3")
     s.world.define("p1", {})
-    s.snap("p1")
+    s.snap("p1", reason="session_end")
     s.finish_job(_bg(s).jobs[0])
     s.finish_job(_promote(s).id)
     assert s.g.confirmed == 1
     # 第二个暂存点：related 档位（pkg/mod.py → tests/test_mod.py）漏检了 Z
     s.world.define("p2", {Z: "FAILED"})
-    s.snap("p2")
+    s.snap("p2", reason="session_end")
     s.finish_job(_bg(s).jobs[0])
     prom = _promote(s)
     s.world.define("p3", {Z: "FAILED", ADD: "PASSED"})
-    s.snap("p3")
+    s.snap("p3", reason="session_end")
     s.finish_job(_bg(s).jobs[0])
     assert s.g.head == 3 and prom.tree == "p2"
     s.finish_job(prom.id)
@@ -347,6 +361,8 @@ def test_demotion_marks_suspects_and_delivery_falls_back():
     assert g.checkpoints[2].demoted and g.confirmed == 1 and suspect(g, 3)
     assert delivery_checkpoint(g, s.cfg) == 1
     assert _promote(s).tree == "p3"                                       # 降级点之后的暂存点照常提升
+    assert not any(j.purpose == "recheck" for j in g.jobs.values())       # 交接存档被降级：不追查、不通知
+    assert not g.persistent and not g.locates
 
 
 def test_demotion_recheck_fixed_or_still_failing():
@@ -354,9 +370,8 @@ def test_demotion_recheck_fixed_or_still_failing():
         s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False))
         s.do(R.claim, "w1", "T3")
         s.world.define("d1", {Z: "FAILED"})
-        s.snap("d1")
-        bg = next(a for a in s.g.attempts.values() if a.lane == "bg")
-        s.finish_job(bg.jobs[0])
+        aid = s.checkpoint("d1")                                          # worker 声明的存档才追查
+        s.finish_job(s.g.attempts[aid].jobs[0])
         s.world.define("d2", {} if fixed else {Z: "FAILED"})
         s.snap("d2")
         promote = next(j for j in s.g.jobs.values() if j.purpose == "promote")
@@ -413,11 +428,11 @@ def test_relation_learned_from_located_demotion():
     s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False))
     s.do(R.claim, "w1", "T3")
     s.world.define("r1", {})
-    s.snap("r1")
+    s.snap("r1", reason="session_end")
     s.finish_job(next(a for a in s.g.attempts.values() if a.lane == "bg").jobs[0])
     s.world.define("r2", {Z: "FAILED"})
-    s.snap("r2")
-    s.finish_job(next(a for a in s.g.attempts.values() if a.lane == "bg" and a.status == "pending").jobs[0])
+    aid = s.checkpoint("r2")
+    s.finish_job(s.g.attempts[aid].jobs[0])
     for j in [j for j in s.g.jobs.values() if j.purpose == "promote" and j.state == "running"]:
         s.finish_job(j.id)
     while s.pending_jobs:
@@ -443,7 +458,7 @@ def _timeline(s: Sim, statuses: list[str]) -> list[int]:
 
 
 def locate_sim(statuses, **cfg):
-    s = sim(auto_jobs=True, cfg=BelayConfig(auto_checkpoint=False, confirm_regressions=False, **cfg))
+    s = sim(auto_jobs=True, cfg=BelayConfig(confirm_regressions=False, **cfg))
     s.do(R.claim, "w1", "T3")
     ns = _timeline(s, statuses)
     loc = s.do(R.start_locate, [Z], {"tree": f"tl{len(statuses) - 1}", "snapshot": ns[-1]}, "rejected")
@@ -467,7 +482,7 @@ def test_bisect_skips_untestable_midpoints_and_caps_steps():
 
 
 def test_bisect_with_transient_failure_reports_the_last_transition():
-    s = sim(cfg=BelayConfig(auto_checkpoint=False, confirm_regressions=False))
+    s = sim(cfg=BelayConfig(confirm_regressions=False))
     s.do(R.claim, "w1", "T3")
     ns = _timeline(s, ["P", "F", "P", "P", "F", "F"])
     for n in ns[:3]:                                                     # 图里已有 s1–s3 的结果（一过性失败）
@@ -478,7 +493,7 @@ def test_bisect_with_transient_failure_reports_the_last_transition():
 
 
 def test_bisect_across_rollback_uses_the_rollback_target():
-    s = sim(cfg=BelayConfig(auto_checkpoint=False, confirm_regressions=False))
+    s = sim(cfg=BelayConfig(confirm_regressions=False))
     s.do(R.claim, "w1", "T3")
     s.world.define("k1", {})
     s.checkpoint("k1", files=OTHER)
@@ -517,20 +532,24 @@ def test_rejection_triggers_locate_and_diagnosis():
     assert not llm_effects(s.log)
 
 
-# ======================================================================== 模块 E：持续性回归
+# ======================================================================== 模块 E：中间态不追查
 
-def test_persistent_regression_after_k_snapshots_but_not_transient():
-    s = sim(cfg=BelayConfig(confirm_regressions=False, persist_k=3))
+def test_failing_intermediate_states_never_escalate():
+    """步骤与交接存档反复被拒、worker 自己的检查也失败：都是中间态，不定位、不诊断、不算停滞。"""
+    s = sim(cfg=BelayConfig(confirm_regressions=False, stall_same_failure=3))
     s.do(R.claim, "w1", "T3")
-    for i, st in enumerate(["P", "F", "P"]):                              # 一过性失败：不触发
-        s.world.define(f"x{i}", {} if st == "P" else {Z: "FAILED"})
-        s.snap(f"x{i}", files=OTHER)
-    assert not s.g.persistent
-    for i in range(3):
+    s.do(R.plan_steps, "w1", [{"content": f"step {i}", "status": "pending"} for i in range(4)])
+    for i in range(4):
         s.world.define(f"y{i}", {Z: "FAILED"})
         s.snap(f"y{i}", files=OTHER)
-    assert Z in s.g.persistent and s.g.persistent[Z].trigger == "background"
-    assert any(l.trigger == "persistent" for l in s.g.locates.values())
+        _step(s, f"y{i}")
+        s.snap(f"y{i}", files=OTHER, reason="session_end")
+    s.do(R.run_check, "w1", "y3", [Z], False, ["pkg/other.py"])
+    g = s.g
+    rejected = [a for a in g.attempts.values() if a.status == "rejected"]
+    assert len(rejected) >= 3 and all(a.lane == "bg" for a in rejected) and g.head == 0
+    assert not g.persistent and not g.locates and not g.diagnoses
+    assert not any(x.kind == "repeated_failure" for x in g.stalls)
 
 
 # ======================================================================== 其他请求
@@ -571,12 +590,12 @@ def test_rollback_defaults_to_the_latest_milestone():
     s.review("T1", "t1")                                                  # 1：review 里程碑
     s.do(R.claim, "w1", "T3")
     s.world.define("t2", {ADD: "PASSED"})
-    s.snap("t2")                                                          # 2：自动存档
-    assert s.g.head == 2 and s.g.checkpoints[2].kind == "auto"
+    s.snap("t2")                                                          # 普通快照：不存档
+    assert s.g.head == 1
     with pytest.raises(Rejected):
         s.do(R.rollback, "w1", 7)
-    assert s.do(R.rollback, "w1") == 1                                    # 默认退到最近的里程碑
-    assert s.g.checkpoints[2].abandoned and s.g.tasks["T1"].status == DONE
+    assert s.do(R.rollback, "w1") == 1                                    # 默认退到最近的里程碑（丢掉 WIP）
+    assert not s.g.checkpoints[1].abandoned and s.g.tasks["T1"].status == DONE
     s.do(R.rollback, "w1", 0)
     g = s.g
     assert g.head == 0 and g.tasks["T1"].status == OPEN and g.tasks["T1"].reopen_reason == "rolled_back"
@@ -617,7 +636,7 @@ def test_anchor_rejected_then_contained_by_a_later_checkpoint():
     _step(s, "sb")
     st = s.g.steps["T3.1"]
     assert st.status == "declared"
-    assert s.g.wips["w1"].last_rejection["kind"] == "step"               # 锚点被拒要通知
+    assert s.g.wips["w1"].last_rejection is None                          # 锚点被拒：中间态，不通知
     s.world.define("sc", {})
     s.checkpoint("sc")
     assert s.g.steps["T3.1"].status == "anchored"                        # 后续存档包含了锚点
@@ -719,7 +738,7 @@ def test_deadline_reserve():
 
 
 def test_stall_hint_then_replan_and_repeated_failure():
-    cfg = BelayConfig(stall_no_progress_sec=600, reserve_min_sec=10, auto_checkpoint=False, locate=False)
+    cfg = BelayConfig(stall_no_progress_sec=600, reserve_min_sec=10, locate=False)
     s = sim(cfg=cfg)
     s.do(R.claim, "w1", "T1")
     s.advance(601)

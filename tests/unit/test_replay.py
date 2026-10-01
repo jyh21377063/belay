@@ -46,8 +46,7 @@ FILES = [[("pkg/mod.py", 3, 1)], [("pkg/other.py", 2, 2)], [("setup.py", 1, 0)],
 def drive(seed: int, steps: int = 200):
     rnd = random.Random(seed)
     cfg = BelayConfig(stall_no_progress_sec=900, reserve_min_sec=60, confirm_regressions=rnd.random() < 0.7,
-                      auto_checkpoint=rnd.random() < 0.8, persist_k=rnd.choice([2, 3]),
-                      locate_max_steps=rnd.choice([3, 8]))
+                      locate=rnd.random() < 0.9, locate_max_steps=rnd.choice([3, 8]))
     s = Sim(BASE, cfg=cfg, auto_jobs=False, auto_located=rnd.random() < 0.8)
     s.setup(TASK, PLAN, budget=rnd.choice([1500, 20000]))
     s.do(R.start_session, "w1", "first", {})
@@ -90,7 +89,7 @@ def drive(seed: int, steps: int = 200):
             elif op == "snap":
                 tree = new_tree() if rnd.random() < 0.85 else s.g.head_cp.tree
                 s.snap(tree, files=rnd.choice(FILES), testable=rnd.random() < 0.9,
-                       reason=rnd.choice(["writes", "writes", "model_test", "interval", "handoff"]))
+                       reason=rnd.choice(["writes", "writes", "model_test", "session_end", "handoff"]))
             elif op == "steps":
                 s.do(R.plan_steps, "w1", [{"content": f"step {i}", "status": rnd.choice(
                     ["pending", "in_progress", "completed"])} for i in range(rnd.randint(1, 4))],

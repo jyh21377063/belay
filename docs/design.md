@@ -95,35 +95,40 @@
 - 破坏探针（`runner.py isolation-probe`）：在槽位里找一个被测试导入的源文件，先确认 `import` 解析到槽位，再在文件开头插
   `raise ImportError` 跑那个测试，必须失败。命令里写死了工作区绝对路径（`VerifierSpec.mentions`）同样判为无效。
 - 降级模式（`graph.degraded`）：作业回到 `where=workspace`（`TreeOverlay` 切换工作区），与 worker 的写类工具在
-  `workspace_lock` 上互斥；不做任何后台验证（不自动存档、不提升、不定位、不做持续性检测），只在 worker 本来就在等待时
+  `workspace_lock` 上互斥；不做任何后台验证（不验证步骤锚点、不提升、不定位），只在 worker 本来就在等待时
   验证（手动存档、ready_for_review、会话结束与交接——这时驱动等验证结束再开新会话、收尾）。基线用工作区上的两次。
 - 调度：`RunnerVerifier` 的槽位池 + 优先级队列（`verify.job_priority`：1 收尾与基线 / 2 worker 在等的 / 3 提升 /
-  4 自动存档）。第 1、2 档到达而槽位被第 3、4 档占着时取消低档作业（TERM）并重新排队，写 `job_preempted`，不算丢失。
+  4 已被取代还在跑的后台作业）。第 1、2 档到达而槽位被第 3、4 档占着时取消低档作业（TERM）并重新排队，写 `job_preempted`，不算丢失。
   第 3、4 档以 `nice` 运行，可选限制并发（`background_cpu_limit`）。
 - 作业进程：`setsid` 起会话，`timeout --foreground` 保证取消信号能到达 runner；外层 shell 用 trap 挡住 TERM，保证写完成
   标记；进程组 id 由作业自己写。启动命令先把自己的输出换成 `/dev/null`，launch 立即返回（v5 里 launch 实际会等作业跑完）。
 
-### 3.2 自动快照与后台存档（模块 B）
+### 3.2 快照与语义节点验证（模块 B）
 
-- 快照时机（`driver.take_snapshot`）：写类工具之后按限流（`snapshot_min_interval_sec` 或 `snapshot_min_writes`）；模型跑
-  测试 / 构建的 bash 命令执行前一定拍（`model_test`）；会话结束、交接、截止、`step_done`、手动存档、review、按门自查、
-  回退与撤销之后、恢复开始时跳过限流。树与上一张相同就不记。
+三层：**存**（快照，只存不测）→ **验**（只在语义节点验证）→ **查**（只有 worker 声明完成的存档被拒才二分定位）。
+没有任何基于时间的存档或提醒：不同任务的节奏不同，时间不是“一段工作完成了”的信号。
+
+- 快照时机（`_Hooks.after_tools` → `driver.take_snapshot`，没有限流）：`edit_file` / `write_file` 之后一定拍；bash 不一定
+  写文件，累计 `snapshot_bash_every` 次再拍；模型跑测试 / 构建的 bash 命令执行前拍（`model_test`）；会话结束、交接、
+  截止、`step_done`、手动存档、review、按门自查、回退与撤销之后、恢复开始时都拍。原样树与上一张相同就直接沿用（不做
+  剔除测试、预检与提交），不记新快照。快照只用于恢复、回退与事后二分，本身不触发验证。
 - 每张快照是一个确定的提交（树 = `{raw: 原样树, cand: 候选树}`，父提交是上一张快照），ref 为 `refs/belay/snap/<n>`：
   防 gc，也让 git bundle 能增量导出。
 - 预检：改动的 `.py` 文件用 `compile()` 检查语法（不写 `.pyc`）；可配 `precheck_cmd`。失败的快照标为不可测：不进验证
   队列，但留在时间线上。
-- 后台线（`rules.schedule_background`）：同一时刻最多一个后台尝试。优先验证还没被包含的步骤锚点与比链头新的交接快照
-  （最早的先，到来时取代正在等结果的自动尝试）；否则取最新的可测快照（原因 ∈ `AUTO_REASONS`，为前台意图拍的快照由
-  发起者自己验证）。
+- 后台线（`rules.schedule_background`）：同一时刻每个 worker 最多一个后台尝试，只验证语义节点：还没被包含的步骤锚点
+  与比链头新的交接 / 会话结束快照（最早的先）。普通快照（写操作、`model_test`、恢复、回退……）不进验证队列；为前台意图
+  拍的快照（手动存档、review、按门自查、收尾）由发起者自己验证。后台尝试因回归被拒时链头不动、只记在图里：不定位、
+  不诊断、不通知 worker（中间态测不过是常态），也不计入“同一回归反复被拒”的停滞检测。
 - 新快照胜出：前台、后台尝试各至多一个；链头的快照序号不小于尝试的快照序号（同段）时，尝试被 `attempt_superseded`
   取代（它带着的 review 任务转到链头上判定）；父节点在 `checkpoint_advancing` 时才确定，CAS 用它校验。同一批级联里两个
   尝试同时完成时，第二个等第一个落地后再推进（多半随即被取代）。
 - 进展（`reduce._progress`）只来自：任务完成、某个任务的检查项第一次在存档上通过、步骤锚定、worker 声明的单元
-  （手动 / 步骤 / review / 收尾存档，包括 `checkpoint_marked`）的创建与确认。自动存档与交接存档不算，被后台提升为确认点
+  （手动 / 步骤 / review / 收尾存档，包括 `checkpoint_marked`）的创建与确认。交接存档不算，被后台提升为确认点
   也不算：否则一个不断写出能过门的半成品、却从不完成任何东西的 worker 会永远“有进展”，停滞检测与“连续几个会话没有
   进展就停”都失效。
 - 里程碑标记（`checkpoint_marked`）：手动存档、`step_done`、`ready_for_review` 要存的树已经被后台存过时（链头就是它），
-  或者步骤的锚点落在一个自动存档上，就把那个自动 / 交接存档升级为对应的里程碑（带标签）。否则回退的默认目标
+  或者步骤的锚点落在一个交接存档上，就把那个交接存档升级为对应的里程碑（带标签）。否则回退的默认目标
   （最近的里程碑）会越过 worker 明确声明过的完整单元。
 
 ### 3.3 两级存档链（模块 C）
@@ -132,8 +137,9 @@
 - 提升（`schedule_promotion`）：验证队列有空闲时，只看最新确认点与最近一次降级之后的暂存点，取最新的跑全量（更老的
   跳过），同一时刻只提升一个。全量通过（回归先确认重跑）→ `checkpoint_confirmed`；确认过的回归 → `checkpoint_demoted`，
   它之后的暂存点是 suspect，直到它们自己跑完全量。
-- 降级后对最新的可测快照只跑这几个失败的测试（`recheck`）：仍失败 → `persistent_regression(trigger=demoted)` → 通知
-  worker + 定位 + 诊断；已通过 → 只记录。
+- 降级后：worker 声明的存档（手动存档、review）对最新的可测快照只跑这几个失败的测试（`recheck`）：仍失败 →
+  `persistent_regression(trigger=demoted)` → 通知 worker + 定位 + 诊断；已通过 → 只记录。步骤与交接存档被降级只是
+  不再交付，不追查、不通知。
 - 收尾（`driver._finalize`）：`finalize_started` 取消后台尝试 → 对当前 WIP 做一次 full 前台尝试 → 链头仍是暂存点且还有
   时间就提升它 → 取消剩下的作业 → 交付最新的确认点（`delivered` 带 `level`、`lag`、`not_delivered`）。
 - 交付一致性：`done_checkpoint` 不在交付点祖先链上的任务记为“完成但未交付”。
@@ -157,16 +163,17 @@
   失败），与之后第一次失败之间取中点跑那个测试单元；跑不出结果的点记为 unknown 跳过；达到 `locate_max_steps` /
   `locate_max_sec` 就给出已缩小的区间。多个测试共享作业，按（好端, 坏端）分组写 `locate_concluded`；外壳算出组内
   “好 → 坏”的改动与 diff 后写 `regression_located`（带当时持有的任务、步骤与会话）。
-  触发：前台 / 步骤 / 交接尝试因回归被拒、降级后问题仍在、持续性回归。
+  触发（只针对 worker 声明完成的存档）：前台尝试（手动存档、review）因回归被拒、它们被降级后问题仍在。二分时才按需
+  测中间快照；预检不过的快照不可测，直接跳过（相当于 `git bisect skip`）。
 - D4：`revert_change(located)` 逐文件三方合并（ours = 工作区，base = 坏端，theirs = 好端），全部干净才写回，有冲突就什么
-  都不改（`gitops.revert_files`）。降级与持续性回归的通知把它列为首选、`rollback` 为备选。
+  都不改（`gitops.revert_files`）。降级通知把它列为首选、`rollback` 为备选。
 - 学到的相关性：降级触发、且定位精确时，把“改动的源文件 → 失败测试所在文件”记为 `relation_learned`；`related_units`
   之后把它们加入选择。
 
-### 3.5 持续性回归、诊断者（模块 E）
+### 3.5 诊断者（模块 E）
 
-- 持续性回归（`rules.detect_persistent`）：同一守护测试在当前段最近 `persist_k` 个可测快照上都失败；或 worker 自己的
-  `run_check` 也看到它失败而最新快照上它也失败。一过性失败不触发。之后没有任何同段快照上它通过就算“仍未解决”。
+- 不再从后台快照或 worker 自己的 `run_check` 里推断“持续性回归”：那些都是中间态。`persistent_regression` 只剩降级后
+  问题仍在（`trigger=demoted`）一种；之后没有任何同段快照上它通过就算“仍未解决”。
 - 诊断：规则写 `diagnosis_requested`（同一（回归签名, 定位区间）只一次；同一签名第二次被拒时带上前一次的结论再诊断），
   外壳从图里组装输入（失败原因、测试源码、定位 diff、当时的任务 / 步骤 / 需求原文 / 笔记 / 压缩摘要，限
   `diagnose_input_tokens`），用 `aux_llm` 调用，结果经 `record_diagnosis` 校验：`intentional=true` 的引文不在任务原文里就
@@ -190,7 +197,7 @@
   部分改动默认保留在工作区，开场上下文展示基底 → 最新快照的 diff，并预读涉及的文件。
 - 交接时机（`session._manage_context`）：到软阈值（`handoff_soft_tokens`，默认等于 `l2_tokens`）且有进行中的步骤时暂缓
   L2，下一次 `step_done` 后交接；没有步骤时照旧 L2/L3；硬阈值（`l4_tokens`）照旧强制交接。
-- 没有步骤时的兜底：里程碑存档（以及每 `label_every` 个自动存档）用 `aux_llm` 生成一行标签（手动存档的 summary 直接作
+- 没有步骤时的兜底：里程碑存档（以及每 `label_every` 个其他存档）用 `aux_llm` 生成一行标签（手动存档的 summary 直接作
   标签）；长时间中断或重建后对对话尾部生成进度摘要。
 
 ## 4. 调度建议与分层开场上下文（模块 I）
@@ -228,7 +235,7 @@
 - 镜像（G3）：每张快照、每个存档都有 ref；`driver.mirror` 按节奏（每 `mirror_every` 张快照、每个里程碑存档、会话结束、
   交付、挂起）导出增量 bundle（`git bundle create <新 ref> ^<上次已导出的提交>`，以 0 号基线提交为前提），经 base64 分段
   传回宿主机 `run_dir/git/<n>.bundle`；已导出的 ref 记在事件库的 meta 里。增量 bundle 累积到 `mirror_consolidate` 份时
-  合并成一份完整的 `<n>-full.bundle`，旧文件删除。自动存档不单独触发导出：它的树就是某张快照的候选树，提交是确定的，
+  合并成一份完整的 `<n>-full.bundle`，旧文件删除。非里程碑存档（交接）不单独触发导出：它的树就是某张快照的候选树，提交是确定的，
   重建时按原来的父提交与日期原样重做。补丁镜像 `checkpoints/<k>.diff` 也只写里程碑。
 - 恢复的第一步是补拍一张 `recover` 快照（G7）；离开期间的变化（G1）进入开场。
 - 外层调度：`BelayRun.suspend()` = 强制快照 → 导出 bundle → 会话以 suspended 结束 → `run_suspended`。
@@ -250,10 +257,10 @@
 
 - 手动 `checkpoint(summary)` 的 summary 直接作为里程碑标签；标签模型只给没有标签、没有步骤的存档补一行。
 - todo 列表里新标为 completed 的条目等同于 `step_done`（计划只写了 `step_done` 工具）；两者都保留。
-- 按计划只在里程碑上导出 bundle；自动存档靠“快照已导出 + 提交确定”保证可重做，另加了合并（见 §6）。
+- 按计划只在里程碑上导出 bundle；非里程碑存档靠“快照已导出 + 提交确定”保证可重做，另加了合并（见 §6）。
 - DONE 的条件在 F2 的基础上加了“每条需求都被满足”和“复查者没有认定没做完”（§3.3），修正了 0-4 指出的“全部受阻 +
   链头全量通过仍记为 DONE”。
-- 降级模式下也不做规则定位与持续性检测（二分作业会切换工作区）；诊断仍会以“相对最新确认点的 diff”为输入进行。
+- 降级模式下也不做规则定位（二分作业会切换工作区）；诊断仍会以“相对最新确认点的 diff”为输入进行。
 - 构建缓存种子之外，槽位里还建一个轻量的 `.git`（有些测试会调用 git，例如 setuptools_scm、`git describe`）：对象经
   alternates 借用工作区的 `.git/objects`，只复制 HEAD 与引用，索引按 HEAD 生成。不整份复制，大仓库不会多占几 GB；
   槽位里的 git 写操作只落在这个轻量仓库里。
@@ -268,7 +275,7 @@
 | 要求 | 测试 |
 | --- | --- |
 | 事件、推导、非法转换 | `tests/unit/test_reduce.py` |
-| 规则：两条线、新快照胜出、提升 / 降级 / 交付一致性、二分（精确、跳过、非单调、跨回退、上限）、持续性回归、诊断与复查、步骤与恢复点、DONE 的条件 | `tests/unit/test_rules.py` |
+| 规则：两条线、新快照胜出、提升 / 降级 / 交付一致性、二分（精确、跳过、非单调、跨回退、上限）、只追查声明完成的存档、诊断与复查、步骤与恢复点、DONE 的条件 | `tests/unit/test_rules.py` |
 | 重放一致性（快照、后台线、步骤、定位、诊断、复查、抢占……随机驱动 40 个种子） | `tests/unit/test_replay.py` |
 | 分层开场：段顺序、前缀稳定、跨会话笔记、300 需求 / 1000 任务 / 100 会话仍在预算内、board 过滤 | `tests/unit/test_context_suggest.py` |
 | 外壳辅助：traceback 截取、sys.path 映射、L1 保留读取、读盘重放、离开期间上限 | `tests/unit/test_runtime_helpers.py` |

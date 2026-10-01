@@ -237,11 +237,6 @@ def task_files(g: Graph, task_id: str) -> list[tuple[str, int, int]]:
     return sorted((p, a, d) for p, (a, d) in agg.items())
 
 
-def last_checkpoint_t(g: Graph) -> float:
-    cp = g.head_cp
-    return cp.created_t if cp else 0.0
-
-
 def delivery_checkpoint(g: Graph, cfg: BelayConfig) -> int:
     """交付点：最新的确认点；除基线外没有确认点时按 deliver_unconfirmed 决定。"""
     conf = latest_confirmed_ancestor(g, g.head)

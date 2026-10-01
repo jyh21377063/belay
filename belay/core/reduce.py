@@ -20,7 +20,7 @@ from belay.core.model import (ACTIVE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, A
 from belay.core.queries import has_cycle, is_ancestor, last_session, latest_confirmed_ancestor
 from belay.core.verify import PASSED, results_for_tree
 
-PROGRESS_KINDS = (KIND_MILESTONE, KIND_STEP, KIND_REVIEW, KIND_FINAL)   # 自动存档与交接存档不算进展
+PROGRESS_KINDS = (KIND_MILESTONE, KIND_STEP, KIND_REVIEW, KIND_FINAL)   # 交接存档（及旧日志里的自动存档）不算进展
 
 
 class IllegalEvent(ValueError):
@@ -601,7 +601,7 @@ def _checkpoint_created(g: Graph, e: Event) -> Graph:
     wip = g.wips.get(a.worker)
     if wip is not None and wip.tree == a.tree:      # 存进去的正是当前的 WIP：它相对新存档没有未验证的改动了
         g = replace(g, wips=_put(g.wips, a.worker, replace(wip, base=cid, files=(), last_rejection=None)))
-    if a.kind in PROGRESS_KINDS:                    # 自动存档与交接存档不算进展（确认与否都一样）
+    if a.kind in PROGRESS_KINDS:                    # 交接存档不算进展（确认与否都一样）
         g = _progress(g, e, a.worker)
     return _check_passes(g, e, a.tree)
 
@@ -615,7 +615,7 @@ def _checkpoint_rejected(g: Graph, e: Event) -> Graph:
     a2 = replace(a, status=ATT_REJECTED, regressions=regs, flaky=tuple(e.get("flaky") or ()), reason=e.get("reason"))
     g = replace(g, attempts=_put(g.attempts, aid, a2))
     wip = g.wips.get(a.worker)
-    if wip is not None and (a.lane == LANE_FG or a.kind in (KIND_STEP, "handoff")):
+    if wip is not None and a.lane == LANE_FG:      # 只记 worker 声明的存档被拒；步骤与交接是中间态，不推给 worker
         rej = {"attempt": aid, "seq": e.seq, "reason": e.get("reason"), "regressions": list(regs[:50]),
                "n_regressions": len(regs), "flaky": list(a2.flaky[:20]), "detail": e.get("detail", ""),
                "snapshot": a.snapshot, "kind": a.kind}

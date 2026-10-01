@@ -147,11 +147,12 @@ def test_happy_path_done(tmp_path):
     patch = (h.run_dir() / "deliverable.diff").read_text()
     assert "+    return a + b" in patch and "+def sub(a, b):" in patch
     assert (h.run_dir() / "checkpoints/2.diff").exists() and (h.run_dir() / "ledger.md").exists()
-    assert not (h.run_dir() / "checkpoints/1.diff").exists()                # 自动存档不写补丁镜像
+    assert (h.run_dir() / "checkpoints/1.diff").exists()                    # 两个 review 都是里程碑：都写补丁镜像
     events = h.verify_log(run)
-    assert [e.type for e in events].count("checkpoint_created") == 3        # 0、1（自动）、2（review）
+    assert [e.type for e in events].count("checkpoint_created") == 3        # 0、1（review T1）、2（review T2）
+    assert not any(e.type == "checkpoint_attempted" and e.get("lane") == "bg" for e in events)   # 编辑本身不触发验证
     assert events[-1].type == "delivered" and events[-1].get("status") == "DONE"
-    assert g.checkpoints[1].kind == "auto" and g.checkpoints[2].kind == "review"
+    assert g.checkpoints[1].kind == "review" and g.checkpoints[2].kind == "review"
     assert g.checkpoints[2].level == "confirmed" and events[-1].get("level") == "confirmed"
     assert (h.run_dir() / "git" / "1.bundle").exists()                     # G3：影子仓库对象导出到宿主机
 
@@ -199,9 +200,10 @@ def test_session_end_is_not_run_end(tmp_path):
     assert [s.end_reason for s in g.sessions.values()] == ["done", "done"]
     assert g.sessions["S2"].reason == "restart"
     events = h.verify_log(run)
-    # 编辑之后 runtime 自动拍快照、后台存档（worker 不需要记得存档）
+    # 编辑只拍快照、不验证；会话结束是验证节点：树和最后一张写操作快照相同也照样记一张、进后台验证
     att = [e for e in events if e.type == "checkpoint_attempted"]
-    assert att[0].get("trigger") == "auto" and att[0].get("lane") == "bg"
+    assert att[0].get("trigger") == "session_end" and att[0].get("lane") == "bg"
+    assert not any(e.get("trigger") == "auto" for e in att)
     opening2 = first_message(llm.requests[4])
     assert "continuing work in a new session" in opening2
     assert "### T1 [active] Fix add" in opening2 and "return a + b" in opening2
@@ -379,8 +381,10 @@ def _crash_then_resume(h: Harness, cls, script1, script2, **attrs):
 @pytest.mark.parametrize("cas_first", [False, True])
 def test_runtime_crash_around_cas_is_reconciled(tmp_path, cas_first):
     h = Harness(tmp_path)
-    # runtime 在后台自动存档推进 CAS 的时候死掉；恢复后原样接上会话（读盘重放），被打断的编辑记为“效果未知”
-    s1 = [PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD)]
+    # runtime 在后台验证步骤锚点、推进 CAS 的时候死掉；恢复后原样接上会话（读盘重放），被打断的调用记为“效果未知”
+    todos = tu("t", "todo_write", todos=[{"content": "fix add", "status": "in_progress"}])
+    s1 = [PLANNER, call(tu("1", "claim", task="T1"), READ, todos), call(FIX_ADD),
+          call(tu("sd", "step_done", summary="add fixed"))]
     s2 = [call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")]
     run, res, llm2 = _crash_then_resume(h, CrashBeforeCAS, s1, s2, cas_first=cas_first)
     assert_t2_blocked(run, res)
@@ -448,13 +452,13 @@ def test_run_check_wait_and_rollback(tmp_path):
     h = Harness(tmp_path)
     break_mul = tu("bm", "edit_file", file_path="pkg/mod.py", old_string="return a * b", new_string="return a + b + 0")
     llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(break_mul),
-                       call(tu("rc", "run_check")), call(tu("w", "wait", jobs=["J4"])),
+                       call(tu("rc", "run_check")), call(tu("w", "wait", jobs=["J3"])),
                        call(tu("rb", "rollback")), call(READ), call(FIX_ADD),
                        call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
     out = results(llm)
-    assert "Started job J4" in out[3]                                       # J3 是后台自动存档的验证作业
+    assert "Started job J3" in out[3]                                       # J1、J2 是基线；编辑不触发验证作业
     assert "REGRESSIONS" in out[4] and MUL in out[4]
     assert "restored to checkpoint 0" in out[5]
     assert "return a * b" in out[6] and "return a - b" in out[6]            # 回退后文件回到原样
@@ -494,7 +498,7 @@ def test_stuck_worker_is_restarted_but_long_tool_calls_are_not_stuck(tmp_path):
 
 def test_stall_escalates_to_replan_and_split(tmp_path):
     cfg = BelayConfig(stall_no_progress_sec=1.0, stall_same_failure=3, confirm_regressions=False,
-                      auto_checkpoint=False, locate=False)
+                      locate=False)
     h = Harness(tmp_path, cfg)
     split = {"children": [{"title": "Fix add core", "links": ["R1"]}, {"title": "Fix add edge cases", "links": ["R1"]}]}
     planner = ScriptedLLM([PLANNER, say(json.dumps(split))])

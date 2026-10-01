@@ -171,9 +171,9 @@ TOOLS = [
              "summary": {"type": "string", "description": "One line: what the step did"}}},
          step_done),
     Tool("checkpoint",
-         "Confirm your current working tree as a checkpoint now and label it (the harness also checkpoints in the "
-         "background, so you do not need this to avoid losing work). Changes under test paths are restored to the "
-         "original first. The tests related to your changes are run; if none of the tests that passed on the "
+         "Confirm your current working tree as a checkpoint now and label it (finished steps are also verified in "
+         "the background; work in progress is only snapshotted, not tested). Changes under test paths are restored "
+         "to the original first. The tests related to your changes are run; if none of the tests that passed on the "
          "original code fails, errors, is skipped or goes missing, the checkpoint chain advances. Otherwise nothing "
          "changes and you get the failing checks back with their failure reasons.",
          {"type": "object", "properties": {"summary": {"type": "string", "description": "What this state contains"}}},
@@ -232,7 +232,7 @@ TOOLS = [
          read_only=True),
     Tool("rollback",
          "Discard your changes and restore the working tree to a checkpoint (default: the latest milestone, i.e. "
-         "your last checkpoint, finished step or finished task, not a background checkpoint). Rolling back to an "
+         "your last checkpoint, finished step or finished task, not one saved at a handoff). Rolling back to an "
          "earlier checkpoint abandons the checkpoints after it, and tasks finished on them are reopened. Use it when "
          "you have just broken things; for a regression found later, prefer revert_change.",
          {"type": "object", "properties": {"checkpoint": {"type": "integer"}}}, rollback),

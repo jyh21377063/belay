@@ -161,7 +161,7 @@ class Wip:
     dropped: tuple[str, ...] = ()            # 被剔除的测试路径改动
     snapshot: int = 0
     seq: int = 0
-    last_rejection: Optional[dict] = None    # 最近一次 worker 能据此行动的被拒（手动、步骤、交接）
+    last_rejection: Optional[dict] = None    # 最近一次 worker 声明的存档被拒（手动存档、review、收尾）
 
 
 @dataclass(frozen=True)
@@ -251,13 +251,13 @@ class Compaction:
 
 @dataclass(frozen=True)
 class Persistent:
-    """持续性回归（rule）：同一个守护测试在连续几个可测快照上失败，或降级后在最新快照上仍然失败。"""
+    """持续性回归（rule）：worker 声明的存档被降级后，失败的测试在最新快照上仍然失败。"""
     test: str
     seq: int
     t: float
     since: int                               # 从哪张快照起失败
     epoch: int
-    trigger: str                             # background | dev_check | demoted
+    trigger: str                             # demoted（旧日志里还可能有 background | dev_check）
     checkpoint: Optional[int] = None
 
 
@@ -271,7 +271,7 @@ class Locate:
     bad_checkpoint: Optional[int]
     epoch: int
     lower: int                               # 该段起点存档（回退目标或 0 号）
-    trigger: str                             # rejected | demoted | persistent | step
+    trigger: str                             # rejected | demoted（旧日志：persistent | step）
     started_seq: int
     started_t: float
     ref: Optional[str] = None                # 尝试 id 或 "cp:<k>"
@@ -283,7 +283,7 @@ class Locate:
 @dataclass(frozen=True)
 class Diagnosis:
     id: str
-    trigger: str                             # rejected | demoted | persistent | repeated
+    trigger: str                             # rejected | demoted | repeated（旧日志：persistent）
     tests: tuple[str, ...]
     key: str                                 # (回归签名, 定位区间)：同一个键只诊断一次（repeated 除外）
     seq: int
@@ -299,7 +299,7 @@ class Diagnosis:
 class Attempt:
     id: str
     worker: str
-    trigger: str                             # worker | review | auto | step | handoff | session_end | deadline | final
+    trigger: str                             # worker | review | step | handoff | session_end | deadline | final（旧日志：auto）
     tree: str
     base: int                                # 尝试时的链头（只作记录；父节点在推进时才确定）
     tier: str                                # related | full

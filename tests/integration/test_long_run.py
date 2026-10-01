@@ -176,7 +176,10 @@ def test_worker_edits_during_verification_are_not_lost(tmp_path):
     h = H(tmp_path, repo_kw={"tests": slow}, deliver_checkout=False)
     edit2 = tu("e2", "edit_file", file_path="pkg/mod.py", old_string="def mul(a, b):",
                new_string="def sub(a, b):\n    return a - b\n\n\ndef mul(a, b):")
-    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
+    todos = tu("t", "todo_write", todos=[{"content": "fix add", "status": "in_progress"},
+                                         {"content": "add sub", "status": "pending"}])
+    llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ, todos), call(FIX_ADD),
+                       call(tu("sd", "step_done", summary="add fixed")),             # 步骤锚点进后台验证
                        call(tu("s", "bash", command="sleep 0.5")), call(edit2),       # 后台验证正在跑
                        call(tu("w", "bash", command="sleep 3")), call(BLOCK_T2),
                        call(tu("3", "ready_for_review", task="T1")), say("done")])
@@ -292,7 +295,9 @@ def _phase1(h: H, cls, script, **attrs):
 def test_runtime_restart_reattaches_a_running_job(tmp_path):
     slow = TESTS.replace("def test_add():", "import time\n\n\ndef test_add():\n    time.sleep(6)")
     h = H(tmp_path, repo_kw={"tests": slow})
-    _phase1(h, CrashDuringJob, [PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
+    todos = tu("t", "todo_write", todos=[{"content": "fix add", "status": "in_progress"}])
+    _phase1(h, CrashDuringJob, [PLANNER, call(tu("1", "claim", task="T1"), READ, todos), call(FIX_ADD),
+                                call(tu("sd", "step_done", summary="add fixed")),   # 步骤锚点的验证作业
                                 call(tu("s", "bash", command="sleep 3"))])
     assert not (tmp_path / "state/jobs/J3/done").exists()                     # 作业在 runtime 死后仍在跑
     llm2 = ScriptedLLM([call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
@@ -327,7 +332,7 @@ class CrashAfterMirror(ScriptedLLM):
 
 
 def test_rebuild_from_bundles_after_losing_the_container_state(tmp_path):
-    h = H(tmp_path, BelayConfig(snapshot_min_interval_sec=0))
+    h = H(tmp_path, BelayConfig(snapshot_bash_every=1))
     ref: list = []
     script = [PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
               call(tu("c", "checkpoint", summary="add fixed")), call(ADD_SUB), call(tu("x", "bash", command="true"))]
@@ -510,7 +515,7 @@ def test_diagnoser_and_reviewer_only_explain_or_tighten(tmp_path):
 def test_bundles_are_consolidated_and_restore_every_checkpoint(tmp_path):
     """G3：增量 bundle 够数后合并成一份完整的；只用宿主机上的 bundle 就能还原全部快照与里程碑存档，
     自动存档的提交可以从快照的树原样重做。"""
-    h = H(tmp_path, BelayConfig(mirror_consolidate=2, mirror_every=1, snapshot_min_interval_sec=0))
+    h = H(tmp_path, BelayConfig(mirror_consolidate=2, mirror_every=1, snapshot_bash_every=1))
     edit = lambda i, a, b: tu(f"e{i}", "edit_file", file_path="pkg/mod.py", old_string=a, new_string=b)  # noqa: E731
     llm = ScriptedLLM([PLANNER, call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
                        call(tu("c1", "checkpoint", summary="one")),

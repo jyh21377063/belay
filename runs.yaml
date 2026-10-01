@@ -126,16 +126,15 @@ agents:
       # aux_model: deepseek-flash       # 诊断者、复查者、存档标签用的模型（默认与 worker 相同）
       finalize_margin_sec: 150          # 预算里留给收尾的余量（runtime 截止后还会等最后的验证最多 60 秒）
       runtime: &belay_runtime           # belay/core/config.py 的 BelayConfig；未知字段会报错；每个机制都可以关掉
-        auto_checkpoint: true           # 自动快照 + 后台存档
         verify_slots: 1                 # 验证槽位数（并发验证作业数）；8 vCPU / 并发 2 题时建议 1
         diagnoser: true
         reviewer: true
         # 压缩阈值默认按 Claude Code 的量级（L1 50 万 / L2 70 万 / 硬交接 76 万 token），与 flat 的 clear / reset 对齐
 
   # 消融：同一套 runtime 关掉某个机制
-  belay-no-auto:              # 没有后台自动存档（只在手动存档、步骤、review、交接时验证）
+  belay-no-locate:            # 前台存档被拒时不做快照二分定位（只给失败的测试与原因）
     <<: *belay
-    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, auto_checkpoint: false}}
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, locate: false}}
 
   belay-no-graph-context:     # 开场与 L2 不用图重建，改用模型写的完整摘要
     <<: *belay
@@ -209,7 +208,7 @@ profiles:
     repeats: 1
     grading: {inline_verify: false}
 
-  belay-dev:                  # Belay 调试（完整机制）；消融用 --agent belay-no-auto 等
+  belay-dev:                  # Belay 调试（完整机制）；消融用 --agent belay-no-locate 等
     split: dev
     agent: belay
     repeats: 1

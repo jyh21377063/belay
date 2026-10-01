@@ -3,9 +3,10 @@
 每个请求 = 外壳先观察（需要时给工作区拍快照）→ Runtime.submit(规则) → 需要等结果的请求（checkpoint、
 ready_for_review、wait、rollback）等图满足条件 → 渲染给模型看的文字。规则拒绝的请求以 {"error": True} 返回。
 
-通知（原则 6：只推 worker 能据此行动的信息）：持续存在的回归、被降级且问题仍在的存档、定位结果、诊断结论、
-步骤锚点被拒、复查者重开任务、任务被拆分、同一回归反复被拒。后台自动存档的一过性被拒只记在图里（board 可见）。
-通知不含剩余时间或已用时间：时间只由 runtime 用来决定何时收尾。
+通知（原则 6：只推 worker 能据此行动的信息）：worker 声明完成的存档（手动存档、review）被降级且问题仍在、
+定位结果、诊断结论、复查者重开任务、任务被拆分、同一回归反复被拒。步骤锚点与交接快照在后台验证，被拒只是链头
+不动，记在图里（board 可见），不通知：中间态测不过是常态。
+通知不含剩余时间或已用时间：时间只由 runtime 用来决定何时收尾；也没有按时间提醒存档。
 """
 from __future__ import annotations
 
@@ -13,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 
 from belay.core import rules as R
 from belay.core.model import ATT_PENDING, ATT_ADVANCING, JOB_FINISHED, JOB_RUNNING, REVIEW
-from belay.core.queries import last_checkpoint_t
 from belay.core.render import (checkpoint_line, render_attempt, render_board, render_diagnosis, render_history,
                                render_job, render_located, render_task, task_line)
 from belay.core.rules import Rejected
@@ -28,7 +28,6 @@ class WorkerPort:
         self.run = run
         self.w = worker
         self._notices: list[str] = []
-        self._last_reminder = run.rt.now()
         self._returned_locates: set[str] = set()      # 已经随拒绝消息返回过的定位
         run.rt.listeners.append(self._on_events)
 
@@ -51,18 +50,14 @@ class WorkerPort:
             elif t == "task_split":
                 self._notices.append(f"Task {e.get('task')} was split into "
                                      f"{', '.join(c['id'] for c in e.get('children'))}; claim the one you work on.")
-            elif t == "persistent_regression":
+            elif t == "persistent_regression" and e.get("trigger") == "demoted":
                 tests = ", ".join(e.get("tests")[:5])
-                if e.get("trigger") == "demoted":
-                    cp = g.checkpoints.get(e.get("checkpoint"))
-                    self._notices.append(f"Checkpoint {e.get('checkpoint')} failed the full test suite on {tests} "
-                                         "(the related tests did not select them). Your current changes still make "
-                                         f"{tests} fail. The harness is locating where it started; "
-                                         + ("the checkpoint is no longer part of what would be delivered."
-                                            if cp is not None and cp.demoted else ""))
-                else:
-                    self._notices.append(f"{tests} have been failing on your recent working trees (not a "
-                                         "one-off): the harness is locating the change that started it.")
+                cp = g.checkpoints.get(e.get("checkpoint"))
+                self._notices.append(f"Checkpoint {e.get('checkpoint')} failed the full test suite on {tests} "
+                                     "(the related tests did not select them). Your current changes still make "
+                                     f"{tests} fail. The harness is locating where it started; "
+                                     + ("the checkpoint is no longer part of what would be delivered."
+                                        if cp is not None and cp.demoted else ""))
             elif t == "regression_located":
                 loc = g.locates.get(e.get("locate"))
                 if loc is None or loc.id in self._returned_locates or loc.epoch != g.epoch:
@@ -72,25 +67,11 @@ class WorkerPort:
                 txt = render_diagnosis(g, e.get("diagnosis"))
                 if txt:
                     self._notices.append(txt)
-            elif t == "checkpoint_rejected" and e.get("regressions"):
-                a = g.attempts.get(e.get("attempt"))
-                if a is not None and a.kind == "step" and a.worker == self.w:
-                    self._notices.append(f"The checkpoint of your finished step (snapshot s{a.snapshot}) was "
-                                         f"rejected: {'; '.join(e.get('regressions')[:5])}. That step broke checks "
-                                         "that passed on the original code.")
             elif t == "task_reopened" and e.get("reason") in ("review_missing", "review_reading"):
                 why = "; ".join(e.get("failures")[:5])
                 self._notices.append(f"A reviewer reopened {e.get('task')}: {why}. Claim it again to finish it.")
 
     def drain_notices(self) -> list[str]:
-        g, now, cfg = self.run.rt.graph, self.run.rt.now(), self.run.cfg
-        if not cfg.auto_checkpoint:
-            wip = g.wips.get(self.w)
-            if wip and wip.files and now - max(last_checkpoint_t(g), self._last_reminder) > \
-                    cfg.checkpoint_reminder_sec:
-                self._last_reminder = now
-                self._notices.append("You have changes that are not in any checkpoint yet. Only checkpointed work is "
-                                     "delivered, so call checkpoint once your work is in a sound state.")
         out, self._notices = [n for n in self._notices if n], []
         return out
 
@@ -176,20 +157,20 @@ class WorkerPort:
         return "\nThe harness is locating where this started; the result will be reported to you."
 
     async def _r_checkpoint(self, summary: str = "") -> str:
-        n = await self.run.take_snapshot("checkpoint", force=True)
+        n = await self.run.take_snapshot("checkpoint")
         aid = await self._submit(R.request_checkpoint, self.w, n, "worker", summary=summary)
         if aid is not None:
             await self._wait_attempt(aid)
         return render_attempt(self.run.rt.graph, aid) + await self._with_located(aid)
 
     async def _r_ready_for_review(self, task: str, summary: str = "") -> str:
-        n = await self.run.take_snapshot("review", force=True)
+        n = await self.run.take_snapshot("review")
         aid = await self._submit(R.request_review, self.w, task, n, summary=summary)
         await self.run.rt.wait_until(lambda g: g.tasks[task].status != REVIEW)
         return render_attempt(self.run.rt.graph, aid, task) + await self._with_located(aid)
 
     async def _r_step_done(self, summary: str = "") -> str:
-        n = await self.run.take_snapshot("step_done", force=True)
+        n = await self.run.take_snapshot("step_done")
         files = await self.run.step_files(n)
         sid = await self._submit(R.step_done, self.w, n, summary, files)
         g = self.run.rt.graph
@@ -202,7 +183,7 @@ class WorkerPort:
 
     async def _r_run_check(self, tests: list = (), full: bool = False, as_gate: bool = False) -> str:
         if as_gate:
-            n = await self.run.take_snapshot("gate", force=True)
+            n = await self.run.take_snapshot("gate")
             jid = await self._submit(R.gate_check, self.w, n, tests, full)
         else:
             raw, changed = await self.run.observe_raw(self.w)
@@ -270,7 +251,7 @@ class WorkerPort:
         ok, detail = await self.run.repo.revert_files(rec["good"]["tree"], rec["bad"]["tree"], paths)
         if not ok:
             raise Rejected(f"Nothing was changed: {detail}. Undo it by hand, or roll back.")
-        await self.run.take_snapshot("revert", force=True)
+        await self.run.take_snapshot("revert")
         return (f"Reverted the change between {rec['good'].get('id')} and {rec['bad'].get('id')} in "
                 f"{', '.join(paths[:10])} ({detail}). Read these files again before editing them.")
 

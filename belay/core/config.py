@@ -6,10 +6,13 @@
   confirm_regressions    回归先重跑一次确认，重跑通过的记为 flaky
   protect_tests          候选剔除测试路径下的改动
   stall=False            不做停滞检测
-  auto_checkpoint=False  只拍快照，不做后台自动存档（手动存档、步骤锚点、交接照旧验证）
+  locate=False           前台存档被拒时不做快照二分定位
   diagnoser=False        不做 LLM 诊断，worker 只拿到规则定位的结果
   reviewer=False         不做收紧式复查
 压缩阈值按 Claude Code 的量级设定（只在真正接近上下文上限时才压缩），跑起来再调。
+
+三层：存（每次实际改动都拍快照，不验证、不打扰 worker）→ 验（只在语义节点验证：步骤完成、交接、手动存档、review、
+收尾；没有基于时间的后台存档）→ 查（只有 worker 声明完成的前台存档被拒时，才在快照上二分定位并告诉 worker）。
 """
 from __future__ import annotations
 
@@ -27,12 +30,9 @@ class BelayConfig:
     checkpoint_tier: str = "related"        # related | full：平时的验证档位；截止与收尾永远是 full
     confirm_regressions: bool = True
     protect_tests: bool = True
-    checkpoint_reminder_sec: float = 1200   # 只在 auto_checkpoint=False 时提醒 worker 存档
     deliver_unconfirmed: bool = False       # 除基线外没有确认点时：False 交付基线，True 交付最新暂存点
-    # ---- 自动快照与后台存档（模块 B）
-    auto_checkpoint: bool = True
-    snapshot_min_interval_sec: float = 60
-    snapshot_min_writes: int = 5
+    # ---- 快照（模块 B）：edit_file / write_file 之后都拍；只有 bash 时每这么多次拍一次（树没变就不记）
+    snapshot_bash_every: int = 5
     precheck_python: bool = True            # 快照前对改动的 .py 文件做语法检查（不写 .pyc）
     precheck_cmd: str = ""                  # 非 Python 项目的廉价预检命令（在工作区执行，退出码 0 = 可测）
     # ---- 验证槽位（模块 A）
@@ -45,7 +45,6 @@ class BelayConfig:
     locate_max_steps: int = 8
     locate_max_sec: float = 3600
     locate_wait_sec: float = 120            # 手动存档被拒时最多等这么久，让定位结果随拒绝消息一起返回
-    persist_k: int = 3
     diagnoser: bool = True
     diagnose_input_tokens: int = 30_000
     # ---- 复查（模块 F）
@@ -129,6 +128,8 @@ class BelayConfig:
             raise ValueError("checkpoint_tier 只能是 related / full")
         if cfg.l3_mode not in ("overflow", "always", "off"):
             raise ValueError("l3_mode 只能是 overflow / always / off")
+        if cfg.snapshot_bash_every < 1:
+            raise ValueError("snapshot_bash_every 至少为 1")
         if cfg.verify_slots < 1:
             raise ValueError("verify_slots 至少为 1")
         return cfg
