@@ -123,6 +123,13 @@ def _runtime_recovered(g: Graph, e: Event) -> Graph:
     return g
 
 
+def _clock_started(g: Graph, e: Event) -> Graph:
+    """准备阶段（基线、规划）在预算之外做完后，预算从这里开始计时（评测框架的 setup 阶段不计入 agent 预算）。"""
+    _running(g)
+    _need(not g.sessions, "the clock starts before the first session")
+    return replace(g, run=replace(g.run, deadline_t=float(e.get("deadline_t"))), last_progress_t=e.t)
+
+
 def _run_suspended(g: Graph, e: Event) -> Graph:
     _running(g)
     return replace(g, run=replace(g.run, suspended=g.run.suspended + 1))
@@ -773,7 +780,8 @@ def _progress_summary(g: Graph, e: Event) -> Graph:
 
 
 HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
-    "run_started": _run_started, "runtime_recovered": _runtime_recovered, "run_suspended": _run_suspended,
+    "run_started": _run_started, "runtime_recovered": _runtime_recovered, "clock_started": _clock_started,
+    "run_suspended": _run_suspended,
     "deadline_reserve": _deadline_reserve, "finalize_started": _finalize_started, "delivered": _delivered,
     "plan_proposed": _plan_proposed, "requirement_frozen": _requirement_frozen, "task_added": _task_added,
     "task_split": _task_split, "task_claimed": _task_claimed, "task_released": _task_released,

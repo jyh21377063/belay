@@ -147,12 +147,15 @@ class RunnerVerifier:
         self._queue: list[_Waiter] = []
         self._order = itertools.count()
         self._uploaded = False
+        self._timeout = "timeout --foreground"
 
     async def setup(self) -> None:
         if self._uploaded:
             return
         await self._must(f"mkdir -p {shlex.quote(self.jobs_dir)} {shlex.quote(self.verify_dir)}")
         await self.env.write_text(self.runner_path, RUNNER_SOURCE.read_text(encoding="utf-8"))
+        probe = await self.env.run("timeout --foreground 5 true", timeout=30, cwd="/")
+        self._timeout = "timeout --foreground" if probe.return_code == 0 else "timeout"   # busybox 没有 --foreground
         self._uploaded = True
 
     def job_dir(self, job_id: str) -> str:
@@ -265,7 +268,7 @@ class RunnerVerifier:
         await self.env.write_text(f"{self.job_dir(job.id)}/spec.json", json.dumps(spec))
         inner = f"python3 {shlex.quote(self.runner_path)} run {d}/spec.json {d}"
         # --foreground：timeout 不另起进程组，取消时 kill -TERM -<进程组> 才能到达 runner（它负责杀掉测试进程组）
-        wrapped = f"timeout --foreground -k 10 {int(self.spec.timeout_sec) + 120} bash -c {shlex.quote(inner)}"
+        wrapped = f"{self._timeout} -k 10 {int(self.spec.timeout_sec) + 120} bash -c {shlex.quote(inner)}"
         # 进程组 id 由作业自己写（$$ 就是 setsid 之后的会话首进程）；外层 shell 用 trap 挡住 TERM，保证写完成标记。
         # 启动命令先把自己的输出换成 /dev/null，否则后台的子 shell 会一直占着 exec 的输出管道，
         # launch 要等作业跑完才返回（重启后也就无从“重新接上”）

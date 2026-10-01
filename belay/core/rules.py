@@ -92,6 +92,11 @@ def start_run(tx: Tx, run_id: str, task: str, budget_sec: float, workers: Iterab
             verifier=verifier)
 
 
+def start_clock(tx: Tx) -> None:
+    """预算从现在开始：deadline = 现在 + 预算。"""
+    tx.emit("clock_started", RUNTIME, RULE, deadline_t=tx.now + tx.g.run.budget_sec)
+
+
 def create_base(tx: Tx, commit: str, tree: str) -> None:
     tx.emit("checkpoint_created", RUNTIME, OBSERVED, checkpoint=0, commit=commit, tree=tree, trigger="baseline")
 

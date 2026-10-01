@@ -116,11 +116,18 @@ python -m belay.cli flat --workdir /path/to/repo --task-file task.md    # B 组
 （大工具输出、diff、压缩后的消息）、`checkpoints/<k>.diff`（里程碑存档的补丁镜像，给人看）、`deliverable.diff`
 （交付物 = 最新的确认点）、`worktree.diff`（结束时工作区的完整改动）、`ledger.json` / `ledger.md`（六类口径，以及不是 DONE 的原因）。
 
-> eval 适配（`eval/agents/belay_agent.py`）仍指向 v4 的旧 runtime，接评测时按 `belay.runtime.driver.BelayRun` 重写。
+评测接入（`eval/agents/belay_agent.py`）：setup 阶段调 `BelayRun.prepare`（影子仓库、基线双跑、导入隔离、规划，不占
+预算），run 阶段对同一个运行目录调 `run_prepared`（预算从这里开始计时）；被评测框架超时取消时 `emergency_deliver`
+把工作区检出为最新的确认点再导出补丁。运行目录在 trial 的 agent 日志目录下 `belay/`。
+
+```bash
+python -m eval.run --profile belay-dev --tasks <一道题>                   # 调试集上先跑一道（保留容器）
+python -m eval.run --profile belay-dev --agent belay-no-auto --tasks <题>  # 消融
+```
 
 ## 待办
 
 - [ ] `eval/convert/promax_to_harbor.py`、`sweevo_to_harbor.py`：instruction.md 只写 problem_statement；SWE-EVO 的单提交重建写进 Dockerfile；`tests/test.sh` 写 `/logs/verifier/reward.json`（`{"resolved": 0|1, "fix_rate": x}`）
-- [ ] `eval/agents/belay_agent.py`：按 v5 的 `BelayRun` 重新接入
+- [x] `eval/agents/belay_agent.py`：按 v6 的 `BelayRun` 重新接入
 - [ ] 多 worker（可选）：每个 worker 一个 worktree、存档 = 三方合并再验证
 - [ ] 填写 `task_selection.md` 4.3 节的实测难度

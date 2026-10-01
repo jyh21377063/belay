@@ -543,3 +543,33 @@ def test_bundles_are_consolidated_and_restore_every_checkpoint(tmp_path):
     assert all(has(s.commit) for s in g.snapshots.values())
     assert all(has(c.tree) for c in g.checkpoints.values() if c.id > 0)
     assert all(has(c.commit) for c in g.checkpoints.values() if c.id > 0)
+
+
+# ======================================================================== 评测接入：准备在预算之外
+
+def test_prepare_then_run_starts_the_budget_clock_late(tmp_path):
+    """评测框架的 setup 阶段做准备（时钟停在 1000），run 阶段才开始计时（真实时钟）：截止时间从 run 开始算。"""
+    h = H(tmp_path, budget=600)
+
+    async def prepare():
+        run = BelayRun(ScriptedLLM([PLANNER]), LocalEnv(str(h.repo)), h.settings, h.cfg, h.spec,
+                       aux_llm=ScriptedLLM([]), clock=lambda: 1000.0, log=h.logs.append)
+        await run.prepare(TASK)
+        run.store.close()
+
+    async def run_phase():
+        llm = ScriptedLLM([call(tu("1", "claim", task="T1"), READ), call(FIX_ADD),
+                           call(tu("3", "ready_for_review", task="T1")), call(BLOCK_T2), say("done")])
+        run = BelayRun(llm, LocalEnv(str(h.repo)), h.settings, h.cfg, h.spec, aux_llm=ScriptedLLM([]),
+                       log=h.logs.append)
+        assert run.prepared(TASK) and not run.prepared(TASK + " more")
+        return run, await run.run_prepared()
+    asyncio.run(prepare())
+    run, res = asyncio.run(run_phase())
+    events = h.verify_log(run)
+    types = [e.type for e in events]
+    started = next(e for e in events if e.type == "run_started")
+    clock_ev = next(e for e in events if e.type == "clock_started")
+    assert started.get("deadline_t") == 1600.0 and clock_ev.get("deadline_t") > 1600.0 + 10 ** 6
+    assert types.index("clock_started") < types.index("session_started")
+    assert_t2_blocked(run, res)

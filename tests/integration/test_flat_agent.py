@@ -77,56 +77,106 @@ def test_flat_agent_end_to_end(setup):
     assert (agent_dir / "transcript.jsonl").exists()
 
 
-def test_belay_agent_is_strict_and_delivers_the_integration_branch(setup):
+TASK = "Fix add() in calc.py so that it returns the sum of its arguments."
+PLAN = {"requirements": [{"id": "R1", "quote": TASK, "summary": "fix add"}],
+        "tasks": [{"id": "T1", "title": "Fix add", "links": ["R1"]}]}
+PLANNER = [{"type": "text", "text": json.dumps(PLAN)}]
+QUIET = {"reviewer": False, "labeler": False, "diagnoser": False}       # 这些后台 LLM 调用会打乱脚本的顺序
+
+
+def tu(i, name, **inp):
+    return {"type": "tool_use", "id": i, "name": name, "input": inp}
+
+
+WORKER = [[tu("1", "claim", task="T1"), tu("2", "read_file", file_path="calc.py")],
+          [tu("3", "edit_file", file_path="calc.py", old_string="a - b", new_string="a + b")],
+          [tu("4", "bash", command="git stash list")],
+          [tu("5", "ready_for_review", task="T1")],
+          [{"type": "text", "text": "done"}]]
+
+
+def belay_agent(agent_dir, **kw):
+    tmp = agent_dir.parent
+    return BelayAgent(logs_dir=agent_dir, model_name="deepseek-flash", extra_env={"DEEPSEEK_API_KEY": "x"},
+                      state_dir=str(tmp / "belay-state"), runtime={**QUIET, **kw.pop("runtime", {})}, **kw)
+
+
+def test_belay_agent_without_gate_runs_strict_and_delivers(setup):
     repo, agent_dir = setup
     env = FakePierEnvironment(repo, agent_dir)
-    tmp = agent_dir.parent
-    paths = {"state": str(tmp / "belay-state"), "bin": str(tmp / "belay-bin"), "dev_jobs": str(tmp / "belay-jobs")}
-    agent = BelayAgent(logs_dir=agent_dir, model_name="deepseek-flash", extra_env={"DEEPSEEK_API_KEY": "x"}, workers=1,
-                       runtime={"isolation": False, "tick_sec": 0.5, "requirement_planner": "rules"},
-                       paths=paths)
-    llm = ScriptedLLM([list(s) for s in SCRIPT])
+    agent = belay_agent(agent_dir)
+    llm = ScriptedLLM([PLANNER] + [list(s) for s in WORKER])
     agent._make_llm = lambda: llm
     context = SimpleNamespace(metadata=None)
 
     async def go():
-        await agent.setup(env)
-        await agent.run("Fix add()", env, context)
+        await agent.setup(env)                             # 没有任务原文：准备留到 run() 里做
+        await agent.run(TASK, env, context)
     asyncio.run(go())
-    assert context.metadata["violations"] == {"git_write": 1}
-    denied = llm.requests[3]["messages"][-1]["content"][0]
-    assert denied["is_error"] and "Git write" in denied["content"]
-    # 没有测试配置：提交直接合并；worker 结束后 runtime 把工作区作为最终候选，交付集成分支 HEAD
-    assert context.metadata["belay_status"] == "DONE" and context.metadata["merges"] == 1
+    denied = llm.requests[4]["messages"][-1]["content"][0]
+    assert denied["is_error"] and "Git write" in denied["content"]          # Belay 组：越界直接拒绝
+    meta = context.metadata
+    assert meta["belay_status"] == "DONE" and meta["delivered_level"] == "confirmed", meta
+    assert meta["prepared_in_setup"] is False and context.n_agent_steps == 5
     patch = (agent_dir / "patch.diff").read_text()
     assert "+    return a + b" in patch
-    assert (agent_dir / "belay" / "ledger.json").exists() and (agent_dir / "belay" / "events.jsonl").exists()
+    for name in ("ledger.json", "events.jsonl", "setup.json", "deliverable.diff"):
+        assert (agent_dir / "belay" / name).exists(), name
 
 
-def test_belay_agent_splits_requirements_during_setup(setup):
-    """runner 在 setup 前传入任务原文时，需求拆解在 setup 里完成（不占预算），run() 不再重拆。"""
+def test_belay_agent_prepares_in_setup_and_verifies_with_the_gate(setup):
     repo, agent_dir = setup
+    (repo / "tests").mkdir()
+    (repo / "tests/test_calc.py").write_text("from calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+                                             "\n\ndef test_zero():\n    assert add(0, 0) == 0\n")
+    subprocess.run("git add -A && git -c user.email=a@b -c user.name=t commit -qm tests", shell=True, cwd=repo,
+                   check=True)
     env = FakePierEnvironment(repo, agent_dir)
-    tmp = agent_dir.parent
-    paths = {"state": str(tmp / "belay-state"), "bin": str(tmp / "belay-bin"), "dev_jobs": str(tmp / "belay-jobs")}
-    split = {"requirements": [{"statement": "add() returns the sum of its arguments.", "quotes": ["Fix add()"],
-                               "kind": "change", "section": ""}]}
-    plan_calls = [[{"type": "text", "text": json.dumps(split)}],
-                  [{"type": "text", "text": json.dumps({"ok": True, "issues": []})}]]
-    agent = BelayAgent(logs_dir=agent_dir, model_name="deepseek-flash", extra_env={"DEEPSEEK_API_KEY": "x"}, workers=1,
-                       runtime={"isolation": False, "tick_sec": 0.5}, paths=paths, task_instruction="Fix add()")
-    llm = ScriptedLLM(plan_calls + [list(s) for s in SCRIPT])
+    gate = {"workdir": str(repo), "test_cmd": "python -m pytest -rA -p no:cacheprovider tests", "timeout_sec": 120}
+    agent = belay_agent(agent_dir, gate_spec=json.dumps(gate), task_instruction=TASK)
+    llm = ScriptedLLM([PLANNER] + [list(s) for s in WORKER])
     agent._make_llm = lambda: llm
     context = SimpleNamespace(metadata=None)
 
     async def go():
         await agent.setup(env)
-        assert len(llm.requests) == 2                      # 拆 + 审，都在 setup 里
-        await agent.run("Fix add()", env, context)
+        assert len(llm.requests) == 1                      # 规划在 setup 里做完，不占预算
+        setup_info = json.loads((agent_dir / "belay" / "setup.json").read_text())
+        assert setup_info["prepared"] and setup_info["guard_checks"] == 1 and setup_info["isolation"]["valid"]
+        await agent.run(TASK, env, context)
     asyncio.run(go())
-    plan = json.loads((agent_dir / "belay" / "requirements.json").read_text())
-    assert plan["source"] == "llm" and plan["requirements"][0]["text"] == "add() returns the sum of its arguments."
-    assert plan["requirements"][0]["quotes"] == ["Fix add()"]
-    assert (agent_dir / "belay" / "planner.jsonl").exists()
-    assert "add() returns the sum" in llm.requests[2]["messages"][0]["content"]   # worker 看到的需求来自拆解
-    assert context.metadata["belay_status"] == "DONE"
+    events = [json.loads(x) for x in (agent_dir / "belay" / "events.jsonl").read_text().splitlines()]
+    types = [e["type"] for e in events]
+    assert "clock_started" in types and types.index("clock_started") < types.index("session_started")
+    assert context.metadata["belay_status"] == "DONE" and context.metadata["prepared_in_setup"]
+    patch = (agent_dir / "patch.diff").read_text()
+    assert "+    return a + b" in patch and "tests/" not in patch
+
+
+def test_belay_agent_cancelled_by_the_harness_delivers_the_confirmed_checkpoint(setup):
+    repo, agent_dir = setup
+    env = FakePierEnvironment(repo, agent_dir)
+    agent = belay_agent(agent_dir)
+    script = [PLANNER, WORKER[0], WORKER[1], [tu("c", "checkpoint", summary="fixed")],
+              [tu("e2", "edit_file", file_path="calc.py", old_string="a + b", new_string="a * b")],
+              [tu("s", "bash", command="sleep 30")]]
+    llm = ScriptedLLM([list(s) for s in script])
+    agent._make_llm = lambda: llm
+    context = SimpleNamespace(metadata=None)
+
+    async def go():
+        await agent.setup(env)
+        task = asyncio.create_task(agent.run(TASK, env, context))
+        for _ in range(200):                               # 等到 worker 开始跑那个长命令
+            await asyncio.sleep(0.1)
+            if len(llm.requests) >= 6:
+                break
+        await asyncio.sleep(1.0)
+        task.cancel()                                      # 评测框架超时
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(go())
+    assert context.metadata["worker_status"] == "cancelled"
+    assert context.metadata["belay_emergency_checkpoint"] is not None
+    patch = (agent_dir / "patch.diff").read_text()
+    assert "+    return a + b" in patch and "a * b" not in patch          # 交付的是确认过的存档，不是半成品

@@ -44,6 +44,7 @@ EVENT_SPECS: dict[str, Spec] = {
     # ---- 运行
     "run_started": Spec(("run_id", "task", "budget_sec", "deadline_t", "workers"), (RULE,)),
     "runtime_recovered": Spec(("downtime_sec",), (OBSERVED,)),
+    "clock_started": Spec(("deadline_t",), (RULE,)),
     "run_suspended": Spec(("reason",), (RULE,)),
     "deadline_reserve": Spec(("reserve_sec",), (RULE,)),
     "finalize_started": Spec(("reason",), (RULE,)),

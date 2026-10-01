@@ -258,7 +258,10 @@
   alternates 借用工作区的 `.git/objects`，只复制 HEAD 与引用，索引按 HEAD 生成。不整份复制，大仓库不会多占几 GB；
   槽位里的 git 写操作只落在这个轻量仓库里。
 - 分片轮转的全量、竞争式分支、运行级 supervisor 都没有做（计划里是扩展点）。
-- `eval/` 本轮没有改：`eval/agents/belay_agent.py` 仍需按 `BelayRun` 重写（0-1）。
+- 评测接入（0-1）：`eval/agents/belay_agent.py`。准备（`prepare`）放在评测框架的 setup 阶段，`clock_started` 让预算从
+  run 阶段开始计时；run 阶段新建 `BelayRun` 打开同一个运行目录（不跨事件循环复用 asyncio 对象）；被取消时
+  `emergency_deliver` 不经过规则，直接按图把工作区检出为交付点。worker 以 root 运行，靠 `Policy.strict()` 挡住状态目录
+  （v4 的低权限用户隔离没有移植）。`eval/tools/appeal_eval.py` 仍引用 v4 的模块，已经不能用。
 
 ## 9. 测试（`python -m pytest -q`，不需要容器和模型）
 

@@ -35,6 +35,7 @@ from belay.core.render import ledger, ledger_markdown
 from belay.core.rules import Rejected, SnapObs
 from belay.core.verify import guard_set, is_test_path, job_priority, reasons_for_tree, test_files_of, units
 from belay.env import Env
+from belay.llm import Usage
 from belay.runtime import planner as P
 from belay.runtime.gitops import CP_REF, SNAP_REF, ShadowRepo
 from belay.runtime.port import WorkerPort
@@ -182,6 +183,9 @@ class BelayRun:
         self.last_snapshot_t = 0.0
         self.session_task: Optional[asyncio.Task] = None
         self.session: Optional[BelaySession] = None
+        self.usage = Usage()                       # 全部会话累计的用量（评测框架的 context 用）
+        self.turns = 0
+        self.peak_context = 0
         self._cancel_reason: Optional[str] = None
         self._bg: set[asyncio.Task] = set()
         self._job_tasks: dict[str, asyncio.Task] = {}
@@ -195,6 +199,69 @@ class BelayRun:
         self._wire()
         await self._setup(task, run_id)
         return await self._main()
+
+    async def prepare(self, task: str, run_id: str = "run") -> None:
+        """只做准备（影子仓库、基线双跑与导入隔离、规划与冻结需求），然后关闭。评测框架在 setup 阶段调用它，
+        不占 agent 的预算；之后用一个新的 BelayRun 对同一个 run_dir 调 run_prepared()。"""
+        self.rt = Runtime(self.store, self.cfg, clock=self.clock, log=self.log)
+        self._wire()
+        try:
+            await self._setup(task, run_id)
+        finally:
+            await self._drain_background()
+            await self.rt.close()
+
+    async def run_prepared(self) -> RunResult:
+        """接着 prepare() 运行：预算从现在开始计时（clock_started），然后进入主循环。"""
+        self.rt = Runtime.open(self.store, self.cfg, clock=self.clock, log=self.log)
+        self._wire()
+        self._load_isolation()
+        self.platform = (await self.env.run("uname -sm", timeout=30)).output.strip() or "Linux"
+        if not self.rt.graph.sessions:
+            await self.rt.submit(R.start_clock)
+        return await self._main()
+
+    def prepared(self, task: str) -> bool:
+        """run_dir 里有一次针对这段任务原文、已经冻结需求、还没开始会话的准备。"""
+        g = self.store.events()
+        from belay.core.reduce import replay
+        graph = replay(g) if g else None
+        return bool(graph and graph.run and graph.frozen and graph.baseline_ready and not graph.sessions and
+                    " ".join(graph.run.task.split()) == " ".join(task.split()))
+
+    async def emergency_deliver(self) -> Optional[int]:
+        """被外部取消（评测框架超时）时的兜底：停下 worker 与作业，按图把工作区检出为交付点，写账本。
+        不经过规则（runtime 可能已经停了）；交付点的选取与正常收尾相同（最新的确认点）。"""
+        if self.rt is None or self.rt.graph.head_cp is None:
+            return None
+        self.stop_event.set()
+        if self.session_task is not None and not self.session_task.done():
+            self._cancel_reason = "deadline"
+            self.session_task.cancel()
+        g = self.rt.graph
+        if g.run is not None and g.run.delivered is not None:
+            return g.run.delivered
+        if self.verifier is not None:
+            for j in [j for j in g.jobs.values() if j.state == JOB_RUNNING]:
+                try:
+                    await self.verifier.cancel(j.id)
+                except Exception:
+                    pass
+        cid = delivery_checkpoint(g, self.cfg)
+        try:
+            await self.repo.checkout(g.checkpoints[cid].tree, self.w)
+        except Exception as e:
+            self.log(f"emergency delivery: checkout failed: {type(e).__name__}: {e}")
+        d = Path(self.s.run_dir)
+        try:
+            L = ledger(g)
+            L.update(status="incomplete", delivered_checkpoint=cid, emergency=True)
+            (d / "ledger.json").write_text(json.dumps(L, indent=1, ensure_ascii=False), encoding="utf-8")
+            (d / "ledger.md").write_text(ledger_markdown(g) + f"\n(emergency delivery of checkpoint {cid} after "
+                                         "an external cancellation)\n", encoding="utf-8")
+        except Exception as e:
+            self.log(f"emergency delivery: ledger failed: {type(e).__name__}: {e}")
+        return cid
 
     async def resume(self, rebuild: bool = False) -> RunResult:
         from belay.runtime.recovery import reconcile
@@ -656,6 +723,9 @@ class BelayRun:
             self.session_task = None
             self.session = None
             port.close()
+        self.usage.add(session.usage)
+        self.turns += session.turns
+        self.peak_context = max(self.peak_context, session.peak_context)
         await rt.submit(R.end_session, self.w, end, session.peak_context, session.turns, error, session.ctx.todos)
         if end != "deadline" and not rt.graph.run.reserve and not rt.graph.run.finalizing:
             await self.take_snapshot("handoff" if end == "handoff" else "session_end", force=True)
