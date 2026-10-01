@@ -122,7 +122,8 @@ def _pending(g: Graph, worker: str) -> str:
         for r in recs:
             by_trigger.setdefault(r.trigger, []).append(r.test)
         for trig, tests in by_trigger.items():
-            why = {"demoted": "failed the full suite on a checkpoint and still fails on your latest snapshot"
+            why = {"demoted": "failed the full suite on a checkpoint and still fails on your latest snapshot",
+                   "background": "failed the regression gate on two background snapshots in a row"
                    }.get(trig, trig)
             out.append(f"- Persistent regression ({why}): " + ", ".join(tests[:8])
                        + (f" (+{len(tests) - 8} more)" if len(tests) > 8 else ""))
@@ -196,7 +197,9 @@ def _away_line(g: Graph, e: Event) -> Optional[str]:
         return f"{e.get('requirement')} is verified by its checks on checkpoint {e.get('checkpoint')}"
     if t == "submit_updated" and e.get("status") in ("accepted", "returned"):
         return f"submit {e.get('submit')} was {e.get('status')}" + \
-            (f"; still open: {id_ranges(e.get('open'))}" if e.get("open") else "")
+            (f"; still open: {id_ranges(e.get('open'))}" if e.get("open") else "") + \
+            (f"; held once for {len(e.get('notes'))} reviewer note(s) on unrequested behavior changes"
+             if e.get("notes") and not e.get("open") else "")
     if t == "todo_anchored":
         td = g.todos.get(e.get("todo"))
         return f"todo \"{td.title[:60] if td else e.get('todo')}\" is in checkpoint {e.get('checkpoint')}"

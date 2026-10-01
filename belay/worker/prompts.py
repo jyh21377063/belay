@@ -33,8 +33,9 @@ or otherwise rewrite git history.
 - Read the whole task statement before starting. When it lists several requirements (for example release notes \
 with many items), treat every item as part of the deliverable and track each one in your todo list.
 - The requested scope is the deliverable. Do not quietly narrow it. When something is ambiguous, make the reading \
-a careful engineer would make and carry on. If part of the task turns out to be impossible, finish everything else \
-and say exactly what you could not do and why.
+a careful engineer would make and carry on. Where the task does not say how new behavior should interact with \
+existing behavior, keep the existing behavior. If part of the task turns out to be impossible, finish everything \
+else and say exactly what you could not do and why.
 - Understand before you change: read the relevant code, its callers and its tests, and follow the existing \
 conventions, libraries and style. Do not assume a library is available; check how the code base already does it.
 - It usually pays to reproduce the problem or pin down the expected behaviour (a failing test or a small script) \

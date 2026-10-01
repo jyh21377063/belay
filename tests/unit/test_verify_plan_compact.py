@@ -124,6 +124,13 @@ def test_extract_json():
     assert extract_json('noise ```json\n{"a": 1}\n``` tail') == {"a": 1}
     assert extract_json('prefix {"b": [1, 2]} suffix') == {"b": [1, 2]}
     assert extract_json("no json here") is None
+    # 说明文字里有别的花括号、字符串里有不合法的反斜杠转义：按键找、宽松解码
+    text = 'The {field} default matters.\n{"requirements": [{"id": "R1", "evidence": ["re \\d+ in C:\\x"]}]} ok'
+    assert extract_json(text, "requirements") == {"requirements": [{"id": "R1", "evidence": ["re \\d+ in C:\\x"]}]}
+    assert extract_json('{"a": 1} then {"requirements": []}', "requirements") == {"requirements": []}
+    assert extract_json('{"a": 1}', "requirements") is None
+    assert extract_json('{"requirements": [{"id": "R1"', "requirements") is None      # 截断：拿不到
+    assert extract_json('{"ok": "a\\\\b"}') == {"ok": "a\\b"}                     # 合法的转义不动
 
 
 # ======================================================================== compact

@@ -119,6 +119,7 @@ class Submit:
     reason: str = ""                         # 被拒的原因
     failing: dict = field(default_factory=dict)   # 需求 → 没过的检查（证据失败）
     open: tuple[str, ...] = ()               # rule：判定结束时仍未完成的 actionable 需求
+    notes: tuple[dict, ...] = ()             # llm：复查者看到的、需求没要求的原有行为改动（只提示，软退回一次）
     accepted_seq: Optional[int] = None
 
 
@@ -132,7 +133,8 @@ class Review:
     submit: Optional[str]
     seq: int
     status: str = "running"                  # running | recorded
-    results: dict = field(default_factory=dict)   # llm：需求 → {implemented, missing, evidence, reading}
+    results: dict = field(default_factory=dict)   # llm：需求 → {implemented, missing, evidence, reading, side_effects}
+    retry_of: Optional[str] = None           # rule：失败条目单条重试时，原来那批复查的 id
 
 
 # ======================================================================== 视图 B：执行状态
@@ -287,7 +289,7 @@ class Locate:
     bad_checkpoint: Optional[int]
     epoch: int
     lower: int                               # 该段起点存档（回退目标或 0 号）
-    trigger: str                             # rejected | demoted（旧日志：persistent | step）
+    trigger: str                             # rejected | demoted | background（旧日志：persistent | step）
     started_seq: int
     started_t: float
     ref: Optional[str] = None                # 尝试 id 或 "cp:<k>"
@@ -299,7 +301,7 @@ class Locate:
 @dataclass(frozen=True)
 class Diagnosis:
     id: str
-    trigger: str                             # rejected | demoted | repeated（旧日志：persistent）
+    trigger: str                             # rejected | demoted | background | repeated（旧日志：persistent）
     tests: tuple[str, ...]
     key: str                                 # (回归签名, 定位区间)：同一个键只诊断一次（repeated 除外）
     seq: int

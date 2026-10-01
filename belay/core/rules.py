@@ -28,8 +28,8 @@ from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_PENDING, ATT_REJECT
 from belay.core.plan import normalize_ws, quote_in_text
 from belay.core.queries import (actionable, chain, chain_ids, consecutive_crashes, current_todo, evidence_checks,
                                 is_ancestor, last_session, latest_milestone, latest_snapshot, latest_submit,
-                                mentioned_requirements, next_id, num, open_attempt, open_requirements, open_submit,
-                                remaining_sec, reserve_sec, reviews_running, sessions_without_progress,
+                                mentioned_requirements, next_id, num, open_attempt, open_persistent, open_requirements,
+                                open_submit, remaining_sec, reserve_sec, reviews_running, sessions_without_progress,
                                 snapshot_contained, snapshots_in_epoch, submit_accepted, todos_in_order)
 from belay.core.reduce import apply
 from belay.core.verify import (PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED, check_unit,
@@ -509,12 +509,14 @@ def _decide(tx: Tx, aid: str, regs: tuple, flaky: tuple) -> None:
         errors = sorted({j.error[:300] for j in g.jobs.values() if j.tree == a.tree and j.error and not j.live})
         tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=aid, regressions=list(regs), flaky=list(flaky),
                 reason="regression", detail="; ".join(errors)[:1000])
-        if a.lane == LANE_FG:                       # 只有 worker 的提交被拒才定位与诊断；后台的只是链头不动
+        if a.lane == LANE_FG:                       # worker 的提交被拒：立即定位与诊断
             loc = start_locate(tx, regression_ids(regs), {"tree": a.tree, "snapshot": a.snapshot}, "rejected",
                                ref=aid)
             if loc is None:
                 maybe_diagnose(tx, "rejected", regression_ids(regs), None)
             _repeated_diagnosis(tx, aid)
+        else:                                       # 后台的：链头不动；同一回归连续两个后台存档都在才定位与诊断
+            _background_persists(tx, aid)
         schedule_background(tx)
     elif not any(x.status == ATT_ADVANCING for x in g.attempts.values()):
         tx.emit("checkpoint_advancing", RUNTIME, RULE, attempt=aid, parent_commit=g.head_cp.commit, date=tx.now,
@@ -652,6 +654,31 @@ def _evaluate_recheck(tx: Tx, jid: str) -> None:
     if still:
         snap = next((s for s in g.snapshots.values() if s.tree == j.tree), None)
         _demotion_persists(tx, cp.id, still, snap.n if snap else cp.snapshot)
+
+
+def _background_persists(tx: Tx, aid: str) -> None:
+    """后台存档被拒，且上一个被拒的后台存档（另一棵树、同一段）也有同样的回归：不是改到一半的临时状态，
+    记为持续性回归，定位并诊断（结果在 worker 的下一轮作为提示送达，不打断它）。同一组测试只做一次。"""
+    g = tx.g
+    a = g.attempts[aid]
+    snap = g.snapshots.get(a.snapshot)
+    if snap is None or not _running_run(g) or g.run.finalizing:
+        return
+    prev = [x for x in g.attempts.values() if x.lane == LANE_BG and x.status == ATT_REJECTED and x.id != aid
+            and x.created_seq < a.created_seq and x.tree != a.tree and x.snapshot in g.snapshots
+            and g.snapshots[x.snapshot].epoch == snap.epoch]
+    if not prev:
+        return
+    p = max(prev, key=lambda x: x.created_seq)
+    common = sorted(set(regression_ids(a.regressions)) & set(regression_ids(p.regressions)))
+    common = [t for t in common if not is_cmd(t) and not open_persistent(g, t)]
+    if not common:
+        return
+    tx.emit("persistent_regression", RUNTIME, RULE, tests=common[:50], trigger="background", checkpoint=None,
+            since=p.snapshot, epoch=snap.epoch, latest=a.snapshot)
+    loc = start_locate(tx, common, {"tree": a.tree, "snapshot": a.snapshot}, "background", ref=aid)
+    if loc is None:
+        maybe_diagnose(tx, "background", common, None)
 
 
 def _demotion_persists(tx: Tx, cid: int, tests: list[str], latest_n: int) -> None:
@@ -1015,8 +1042,25 @@ def _start_reviews(tx: Tx, sid: Optional[str]) -> int:
     return n
 
 
+def submit_notes(g: Graph, sid: str) -> list[dict]:
+    """这次 submit 的复查里，复查者列出的"需求没要求、但改动改变了的原有行为"（llm，只作提示）。"""
+    out = []
+    for v in sorted(g.reviews.values(), key=lambda x: x.seq):
+        if v.submit != sid or v.phase != "done" or v.status != "recorded":
+            continue
+        for rid in v.requirements:
+            res = v.results.get(rid) or {}
+            r = g.requirements.get(rid)
+            if res.get("implemented") == "yes" and r is not None and r.status == REQ_SUBMITTED:
+                for x in res.get("side_effects") or ():
+                    out.append({"requirement": rid, "note": str(x)[:300]})
+    return out[:15]
+
+
 def finish_submit(tx: Tx, sid: str) -> None:
-    """复查都结束了：还有没完成的 actionable 需求 → 交还清单（returned）；没有 → 接受（运行可以收尾）。"""
+    """复查都结束了：还有没完成的 actionable 需求 → 交还清单（returned）；没有 → 接受（运行可以收尾）。
+    复查者列出了需求没要求的原有行为改动 → 软退回一次：需求不重开，worker 看过之后自己决定改不改，原样再交就接受
+    （每条需求只复查一次，所以同一批提示不会再出现）。"""
     g = tx.g
     s = g.submits.get(sid)
     if s is None or s.status != SUB_REVIEWING:
@@ -1024,7 +1068,14 @@ def finish_submit(tx: Tx, sid: str) -> None:
     if any(v.submit == sid and v.status == "running" for v in g.reviews.values()):
         return
     left = [r.id for r in open_requirements(g)]
-    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned" if left else "accepted", open=left)
+    if left:
+        tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned", open=left)
+        return
+    notes = submit_notes(g, sid) if tx.cfg.review_side_effects and not (g.run.reserve or g.run.finalizing) else []
+    if notes:
+        tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned", open=[], notes=notes)
+        return
+    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="accepted", open=[])
 
 
 def record_review(tx: Tx, vid: str, results: dict) -> None:
@@ -1042,12 +1093,21 @@ def record_review(tx: Tx, vid: str, results: dict) -> None:
             impl = r.get("implemented")
             if impl not in ("yes", "partial", "no"):
                 impl = "failed"
+        side = r.get("side_effects") if v.phase == "done" else None
         clean[rid] = {"implemented": impl, "missing": [str(x)[:300] for x in (r.get("missing") or [])][:20],
                       "evidence": [str(x)[:300] for x in (r.get("evidence") or [])][:20],
-                      "reading": str(r.get("reading") or "")[:1500] or None}
+                      "reading": str(r.get("reading") or "")[:1500] or None,
+                      "side_effects": [str(x)[:300] for x in (side if isinstance(side, list) else [])
+                                       if str(x).strip()][:3]}
     tx.emit("review_recorded", REVIEWER, LLM, review=vid, results=clean)
     if tx.g.run.reserve or tx.g.run.finalizing:
         return                                     # 截止收尾时已经没有时间再做：只进账本
+    if v.retry_of is None:                         # 没拿到结论的条目（输出截断、格式坏了）各自单条重试一次
+        want = REQ_SUBMITTED if v.phase == "done" else REQ_BLOCKED
+        for rid, res in clean.items():
+            if res["implemented"] == "failed" and tx.g.requirements[rid].status == want:
+                tx.emit("review_started", RUNTIME, RULE, review=next_id("V", tx.g.reviews), phase=v.phase,
+                        requirements=[rid], checkpoint=v.checkpoint, submit=v.submit, retry_of=vid)
     for rid, res in clean.items():
         r = tx.g.requirements[rid]
         if v.phase == "done" and res["implemented"] in ("no", "partial") and r.status == REQ_SUBMITTED:

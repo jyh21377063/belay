@@ -53,6 +53,15 @@ TEST_CMD = re.compile(r"\b(pytest|py\.test|nosetests|tox|cargo\s+test|go\s+test|
                       r"npm\s+(run\s+)?test|yarn\s+test|jest|mocha|make(\s+\S+)*\s+(test|check)|ctest|unittest)\b")
 
 
+def _reply_json(resp, key: Optional[str] = None) -> Optional[dict]:
+    """辅助模型回复里的 JSON：先看正文；正文里没有（有的模型把答案写进了思考块）再看思考块。"""
+    data = P.extract_json(resp.text, key)
+    if data is None:
+        thinking = "\n".join(b.get("thinking", "") for b in resp.content if b.get("type") == "thinking")
+        data = P.extract_json(thinking, key) if thinking else None
+    return data
+
+
 @dataclass
 class RunSettings:
     run_dir: str
@@ -1052,7 +1061,10 @@ class BelayRun:
             if self.aux_llm is None:
                 raise RuntimeError("no model for the diagnoser")
             resp = await self.aux_llm.call(DIAGNOSE_SYSTEM, [], [{"role": "user", "content": body}])
-            result = P.extract_json(resp.text) or {}
+            result = _reply_json(resp) or {}
+            if not result:
+                self.log(f"diagnosis {diagnosis} failed: no JSON in the reply (stop_reason={resp.stop_reason}): "
+                         f"{resp.text[:300]!r}")
             await self.rt.submit(R.record_diagnosis, diagnosis, result, not result)
         except Exception as e:
             self.log(f"diagnosis {diagnosis} failed: {type(e).__name__}: {e}")
@@ -1125,10 +1137,16 @@ class BelayRun:
                                     notes=latest_handoff_summary(g, self.w) or "",
                                     budget=self.cfg.review_input_chars)
                 resp = await self.aux_llm.call(REVIEW_SYSTEM, [], [{"role": "user", "content": body}])
-            data = P.extract_json(resp.text) or {}
-            for item in data.get("requirements") or []:
+            data = _reply_json(resp, "requirements")
+            for item in (data or {}).get("requirements") or []:
                 if isinstance(item, dict) and str(item.get("id") or "") in v.requirements:
                     results[str(item["id"])] = item
+            if data is None:
+                self.log(f"review {review} failed: no JSON in the reply (stop_reason={resp.stop_reason}, "
+                         f"{len(resp.text)} chars): {resp.text[:300]!r}")
+            elif len(results) < len(v.requirements):
+                self.log(f"review {review}: no answer for {sorted(set(v.requirements) - set(results))} "
+                         f"(stop_reason={resp.stop_reason})")
         except Exception as e:
             self.log(f"review {review} failed: {type(e).__name__}: {e}")
         await self.rt.submit(R.record_review, review, results)

@@ -52,6 +52,11 @@ class WorkerPort:
                                      f"{tests} fail. The harness is locating where it started; "
                                      + ("the checkpoint is no longer part of what would be delivered."
                                         if cp is not None and cp.demoted else ""))
+            elif t == "persistent_regression" and e.get("trigger") == "background":
+                tests = ", ".join(e.get("tests")[:5])
+                self._notices.append(f"Your recent changes make {tests} fail: the background checks saw it on two "
+                                     "snapshots in a row, and new checkpoints stop until it passes again. The "
+                                     "harness is locating where it started and will tell you what it finds.")
             elif t == "regression_located":
                 loc = g.locates.get(e.get("locate"))
                 if loc is None or loc.id in self._returned_locates or loc.epoch != g.epoch:

@@ -31,19 +31,50 @@ class PlanOutcome:
     source: str                      # llm | rule（机械切分）
 
 
-def extract_json(text: str) -> Optional[dict]:
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    candidates = [m.group(1)] if m else []
+_ESCAPE = re.compile(r'\\(.)', re.S)
+
+
+def _fix_escapes(s: str) -> str:
+    """模型常把正则 / Windows 路径里的反斜杠原样写进 JSON 字符串：把不合法的转义改成字面反斜杠。"""
+    return _ESCAPE.sub(lambda m: m.group(0) if m.group(1) in '"\\/bfnrtu' else "\\\\" + m.group(1), s)
+
+
+def _loads_lenient(s: str):
+    try:
+        return json.loads(s)
+    except ValueError:
+        return json.loads(_fix_escapes(s))
+
+
+def extract_json(text: str, key: Optional[str] = None) -> Optional[dict]:
+    """从模型回复里取出 JSON 对象：先看代码块，再看整段首尾花括号，最后从每个 '{' 起逐个尝试解码。
+    给了 key 时优先返回含这个键的对象（回复前面的说明文字里常有别的花括号）。"""
+    text = text or ""
+    candidates = [m.group(1) for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)]
     i, j = text.find("{"), text.rfind("}")
     if i >= 0 and j > i:
         candidates.append(text[i:j + 1])
     for c in candidates:
         try:
-            v = json.loads(c)
-            if isinstance(v, dict):
-                return v
+            v = _loads_lenient(c)
         except ValueError:
             continue
+        if isinstance(v, dict):
+            if key is None or key in v:
+                return v
+    dec = json.JSONDecoder()
+    starts = [m.start() for m in re.finditer(r"\{", text)][:300]
+    for s in starts:
+        for fix in (False, True):
+            src = _fix_escapes(text[s:]) if fix else text[s:]
+            try:
+                v, _ = dec.raw_decode(src)
+            except ValueError:
+                continue
+            if isinstance(v, dict):
+                if key is None or key in v:
+                    return v
+            break
     return None
 
 

@@ -354,6 +354,7 @@ def _submit_updated(g: Graph, e: Event) -> Graph:
     failing = {str(k): list(v)[:20] for k, v in dict(e.get("failing") or {}).items()}
     s2 = replace(s, status=st, reason=str(e.get("reason") or s.reason),
                  failing=failing or s.failing, open=tuple(e.get("open") or s.open),
+                 notes=tuple(dict(n) for n in (e.get("notes") or ())) or s.notes,
                  accepted_seq=e.seq if st == SUB_ACCEPTED else s.accepted_seq)
     g = _set_sub(g, s2)
     for rid, fails in failing.items():               # 证据失败：需求仍是 open，记下没过的检查
@@ -736,7 +737,7 @@ def _review_started(g: Graph, e: Event) -> Graph:
               f"cannot review {rid} ({phase}) in status {r.status}")
         _need(r.review != "running", f"{rid} is already under review")
         g = _set_req(g, replace(r, review="running", review_missing=()))
-    v = Review(vid, phase, rids, e.get("checkpoint"), e.get("submit"), e.seq)
+    v = Review(vid, phase, rids, e.get("checkpoint"), e.get("submit"), e.seq, retry_of=e.get("retry_of"))
     return replace(g, reviews=_put(g.reviews, vid, v))
 
 

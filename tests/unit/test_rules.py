@@ -126,19 +126,39 @@ def test_degraded_mode_and_handoff_mode_only_verify_handoffs():
         assert s.g.head == 1 and s.g.checkpoints[1].kind == "handoff"
 
 
-def test_background_rejections_never_escalate():
-    """后台验证被拒是常态（中间态测不过）：链头不动，不通知、不定位、不诊断、不算停滞。"""
+def test_background_rejections_escalate_only_when_the_same_regression_persists():
+    """后台验证被拒是常态（中间态测不过）：链头不动、不算停滞；一次被拒什么都不做。
+    同一回归在连续两个后台存档（不同的树）上都在：记为持续性回归，定位并诊断，结果作为提示送达。"""
     s = sim(cfg=BelayConfig(confirm_regressions=False, stall_same_failure=3))
-    for i in range(4):
-        s.world.define(f"y{i}", {Z: f"FAILED"} if i % 2 == 0 else {Z: "ERROR"})
-        s.snap(f"y{i}", files=OTHER)
+    s.world.define("y0", {Z: "FAILED"})
+    s.snap("y0", files=OTHER)
+    g = s.g
+    assert [a.status for a in g.attempts.values()] == ["rejected"] and g.head == 0
+    assert g.wips["w1"].last_rejection is None
+    assert not g.persistent and not g.locates and not g.diagnoses       # 一次：可能只是改到一半
+    s.world.define("y1", {Z: "ERROR"})
+    s.snap("y1", files=OTHER)
     g = s.g
     rejected = [a for a in g.attempts.values() if a.status == "rejected"]
-    assert len(rejected) == 4 and all(a.lane == "bg" for a in rejected) and g.head == 0
-    assert g.wips["w1"].last_rejection is None
-    assert not g.persistent and not g.locates and not g.diagnoses
+    assert len(rejected) == 2 and all(a.lane == "bg" for a in rejected) and g.head == 0
+    assert set(g.persistent) == {Z} and g.persistent[Z].trigger == "background"
+    assert [l.trigger for l in g.locates.values()] == ["background"]
+    assert [(d.trigger, d.status) for d in g.diagnoses.values()] == [("background", "requested")]
+    assert "two background snapshots in a row" in build_context(g, "w1", 50_000, s.now, s.cfg, mode="resume").text
+    for i in (2, 3):                                                     # 同一组测试只处理一次
+        s.world.define(f"y{i}", {Z: "FAILED"})
+        s.snap(f"y{i}", files=OTHER)
+    assert len(s.g.locates) == 1 and len([e for e in s.log if e.type == "persistent_regression"]) == 1
     s.do(R.tick)
     assert not any(x.kind == "repeated_failure" for x in s.g.stalls)
+    s.check_log()
+    # 两次被拒的回归不一样：不升级
+    s = sim(cfg=BelayConfig(confirm_regressions=False))
+    s.world.define("y0", {Z: "FAILED"})
+    s.snap("y0", files=OTHER)
+    s.world.define("y1", {MUL: "FAILED"})
+    s.snap("y1", files=OTHER)
+    assert not s.g.persistent and not s.g.locates
 
 
 @pytest.mark.parametrize("order", ["bg_first", "fg_first"])
@@ -195,6 +215,48 @@ def test_submit_classifies_requirements_reviews_and_returns_the_list():
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")
     assert not llm_effects(s.log)
     s.check_log()
+
+
+def test_reviewer_side_effects_hold_the_submit_once_and_the_worker_decides():
+    s = sim(cfg=fg())
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    s.review("V1", {"R2": {"implemented": "yes", "side_effects": ["mul() now rounds results, which callers see"]},
+                    "R3": {"implemented": "yes", "side_effects": []}})
+    g = s.g
+    sub = g.submits[sid]
+    assert sub.status == "returned" and sub.open == () and len(sub.notes) == 1
+    assert reqs(s) == {"R1": REQ_VERIFIED, "R2": REQ_SUBMITTED, "R3": REQ_SUBMITTED}   # 需求不重开：只是提示
+    text = render_submit(g, sid)
+    assert "held once" in text and "mul() now rounds" in text and "call submit again" in text
+    assert "held once" in render_board(g, "w1", s.now, s.cfg)
+    assert R.next_step(g, "w1", s.now, s.cfg) == ("resume_session", "S1")      # 会话不结束：worker 自己决定
+    assert "mul() now rounds" in ledger_markdown(g)
+    sid2 = s.submit("t1")                                                # 原样再交：不再复查，接受
+    assert s.g.submits[sid2].status == "accepted" and s.running_reviews() == []
+    s.check_log()
+    # 开关关掉：复查者报了也不扣
+    s = sim(cfg=fg(review_side_effects=False))
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    s.review("V1", {"R2": {"implemented": "yes", "side_effects": ["x"]}, "R3": {"implemented": "yes"}})
+    assert s.g.submits[sid].status == "accepted"
+    # 需求没做完时照常交还清单；被重开的需求上的提示不算
+    s = sim(cfg=fg())
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    s.review("V1", {"R2": {"implemented": "no", "side_effects": ["x"]}, "R3": {"implemented": "yes"}})
+    sub = s.g.submits[sid]
+    assert sub.status == "returned" and sub.open == ("R2",) and sub.notes == ()
+    assert R.submit_notes(s.g, sid) == []
+    # 截止预留里不扣：没时间再改
+    s = sim(cfg=fg())
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    s.advance(5400)
+    s.do(R.tick)
+    s.review("V1", {"R2": {"implemented": "yes", "side_effects": ["x"]}, "R3": {"implemented": "yes"}})
+    assert s.g.submits[sid].notes == () and R.submit_notes(s.g, sid)       # 只进账本（截止时由收尾接手）
 
 
 def test_submit_regression_is_rejected_with_reasons_locate_and_diagnosis():
@@ -332,9 +394,19 @@ def test_reviewer_failure_does_not_reopen_and_deadline_only_records():
     s = sim(cfg=fg())
     s.world.define("t1", {ADD: "PASSED"})
     sid = s.submit("t1")
-    s.review("V1", {})                                                   # 复查者失败：什么都不重开
+    s.review("V1", {})                                                   # 复查者失败：什么都不重开，各自单条重试一次
+    assert s.g.submits[sid].status == "reviewing"
+    assert s.running_reviews() == ["V2", "V3"]
+    assert [s.g.reviews[v].requirements for v in ("V2", "V3")] == [("R2",), ("R3",)]
+    assert {s.g.reviews[v].retry_of for v in ("V2", "V3")} == {"V1"}
+    s.review("V2", {"R2": {"implemented": "yes"}})
+    s.review("V3", {})                                                   # 单条也失败：不再重试，不阻塞，记为未复查
+    assert s.running_reviews() == []
     assert s.g.submits[sid].status == "accepted"
-    assert {s.g.requirements[r].review for r in ("R2", "R3")} == {"failed"}
+    assert s.g.requirements["R2"].review == "yes" and s.g.requirements["R3"].review == "failed"
+    assert "not reviewed" in render_submit(s.g, sid) and "R3" in render_submit(s.g, sid)
+    assert ledger(s.g)["unreviewed"] == ["R3"]
+    assert "not reviewed" in ledger_markdown(s.g)
     s = sim(cfg=fg())
     s.world.define("t1", {ADD: "PASSED"})
     sid = s.submit("t1")

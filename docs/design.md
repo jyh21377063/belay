@@ -167,8 +167,10 @@ worker 的提交被拒、或提交的存档被降级时，才二分定位）。�
   快照预检不过就往前找最近的可测快照。为前台意图拍的快照（submit、收尾）后台不取，由发起者自己验证。
   `cfg.background`：`latest`（默认）/ `handoff`（只验交接快照，v6 的做法，用于消融）/ `off`。降级模式等同 `handoff`。
 - 为什么能这样做：回归门只判断“原来能过的有没有被弄坏”，所以任何过门的快照都是不比基线差的合法交付物；交付最新的
-  过门快照，正好是评分上最好的选择。后台被拒是常态（中间态），只是链头不动：不通知、不定位、不诊断、不计入“同一
-  回归反复被拒”的停滞检测。代价只有 CPU（第 3 档作业，`nice`、`background_cpu_limit`）。
+  过门快照，正好是评分上最好的选择。后台被拒是常态（中间态），只是链头不动，不计入“同一回归反复被拒”的停滞检测；
+  一次被拒不通知、不定位、不诊断。同一个测试在连续两个被拒的后台尝试（不同的树、同一段）上都是回归时
+  （`rules._background_persists`），才记 `persistent_regression(trigger=background)` → 通知 worker + 定位 + 诊断，结果
+  作为下一轮的提示送达，不打断它；同一个测试在它重新通过之前只处理一次。代价只有 CPU（第 3 档作业，`nice`、`background_cpu_limit`）。
 - **新快照胜出**：前台、后台尝试各至多一个；链头的快照序号不小于尝试的快照序号（同段）时，尝试被 `attempt_superseded`
   取代（它带着的提交转到链头上判定）；正在跑的尝试不会被更新的快照打断，跑完再去拿最新的。父节点在
   `checkpoint_advancing` 时才确定，CAS 用它校验。
@@ -221,8 +223,8 @@ worker 的提交被拒、或提交的存档被降级时，才二分定位）。�
 
 ### 4.5 诊断者（模块 E）
 
-- 不从后台快照里推断“持续性回归”：那些都是中间态。`persistent_regression` 只剩降级后
-  问题仍在（`trigger=demoted`）一种；之后没有任何同段快照上它通过就算“仍未解决”。
+- `persistent_regression` 有两种来源：降级后问题仍在（`trigger=demoted`）；同一回归在连续两个被拒的后台尝试上都在
+  （`trigger=background`，一次被拒只是中间态，不算）。之后没有任何同段快照上它通过就算“仍未解决”。
 - 诊断：规则写 `diagnosis_requested`（同一（回归签名, 定位区间）只一次；同一签名第二次被拒时带上前一次的结论再诊断），
   外壳从图里组装输入（失败原因、测试源码、定位 diff、当时进行中的 todo 与它提到的需求原文、压缩摘要，限
   `diagnose_input_tokens`），用 `aux_llm` 调用，结果经 `record_diagnosis` 校验：`intentional=true` 的引文不在任务原文里就
@@ -242,14 +244,24 @@ worker 的提交被拒、或提交的存档被降级时，才二分定位）。�
    `submit.failing` 与 `last_failure`；其余 → submitted（锚在这个存档上）。
 4. 复查（`_start_reviews`）：还没复查过、被复查者重开的次数没到 `review_max_reopens` 的 submitted 需求，以及以
    insufficient_info 受阻的需求，按 `review_batch` 条一批发起 `review_started`；提交进入 `reviewing`。
-5. 所有批次都有结果后（`finish_submit`）：还有 open 的 actionable 需求 → `returned`（清单交还 worker，带原因）；没有 →
-   `accepted`，会话结束，运行收尾。
+5. 所有批次都有结果后（`finish_submit`）：还有 open 的 actionable 需求 → `returned`（清单交还 worker，带原因）；
+   没有，但复查者列出了需求没要求的原有行为改动（`side_effects`，见下）→ 软退回一次：`returned`、`open=[]`、带
+   `notes`，需求不重开，worker 看过之后自己决定改不改，原样再交就接受（每条需求只复查一次，同一批提示不会再出现）；
+   都没有 → `accepted`，会话结束，运行收尾。之所以不能把提示附在“接受”里：接受之后会话就结束了，worker 看不到。
 
 复查者（`driver._eff_review` + `runtime/review.py`）：输入是需求原文 + 按每条需求原文里的名字（反引号里的代码、带下划线
 / 驼峰 / 带点的标识符、文件路径、PR 号）筛出的相关 hunk + 全部改动文件的列表 + 剩余预算内的完整 diff，再加上 worker
 的提交摘要、todo 与交接摘要（都标为自述）。它只能收紧：`no` / `partial` → `requirement_reopened(review_missing)`；受阻的
-需求给出合理读法 → `requirement_reopened(review_reading)`；`yes` 什么都不做；调用失败记为 `failed`，也什么都不做。
-截止收尾时复查结果只进账本。账本口径（`render.requirement_category`）：verified / reviewed（自报，复查通过）/
+需求给出合理读法 → `requirement_reopened(review_reading)`；`yes` 什么都不做。
+复查者还对每条需求列出至多 3 条“改动改变了、需求原文没要求改的、调用方或测试能观察到的原有行为”（`side_effects`：
+默认值、优先级、消息、类型、顺序……），只作提示，不影响 implemented 的判定（`cfg.review_side_effects` 可关）。这是为
+“需求没说清新旧行为怎么共存”这类错准备的：回归门只看得到原有的测试，看不到这种改动；worker 的系统提示里也有一句
+“任务没说新行为与原有行为怎么共存时，保持原有行为”。
+复查的回复按 `requirements` 键从正文里找 JSON（说明文字里有别的花括号也行，不合法的反斜杠转义宽松处理；正文里没有再
+看思考块），拿不到就把回复开头与 stop_reason 写进日志。一批里没拿到结论的条目各自单条重试一次（`retry_of`）；单条
+还失败就记为 `failed`（未复查），不阻塞：复查者只能收紧，它自己出故障不该反过来卡住 worker；未复查的需求在 submit
+结果与账本（`unreviewed`）里单独列出。
+截止收尾时复查结果只进账本（不重开、不重试、不软退回）。账本口径（`render.requirement_category`）：verified / reviewed（自报，复查通过）/
 self-reported（复查没跑完或没有复查）/ done-not-delivered / blocked / open。在 SWE-EVO 这类题上，大部分需求会落在
 reviewed：图能提供硬保证的只有“不回归”和“每条需求都被过问过”，需求是不是真做对了，靠的是复查。
 
@@ -337,6 +349,8 @@ crash | stuck | runtime_crash。`next_step`：提交被接受 → 收尾；截�
 
 - 回归门豁免：允许在有引文和失败证据时豁免具体的测试，代价是门不再完全由基线决定，所以每条豁免都进账本。
 - 提交被接受后已经复查通过的需求，之后的提交不再复查（只复查新提交的、还没复查过的）。
+- 复查者的 `side_effects` 现在只是提示（软退回一次），不强制；看评测结果再决定要不要变成重开。
+- 后台被拒的回归只在连续两次出现时才追查；改成一次就追查会把大量中间态送去定位，太吵。
 - `rollback` 不再是工具；规则保留给恢复流程（容器重建后链上的存档丢了）。worker 用 `revert_change` 撤销定位出的改动。
 - 规划器只产出需求清单（没有任务、依赖、优先级、拆分）；停滞时只给提示，不再重新规划。
 - 降级模式下不做规则定位（二分作业会切换工作区）；后台只验证交接快照。
@@ -348,9 +362,9 @@ crash | stuck | runtime_crash。`next_step`：提交被接受 → 收尾；截�
 | 要求 | 测试 |
 | --- | --- |
 | 事件、推导、非法转换 | `tests/unit/test_reduce.py` |
-| 规则：后台验证最新快照、新快照胜出、需求随检查项验证、提交（判定、证据失败、受阻、复查批次与上限、截止）、todo 与锚点、提升 / 降级 / 交付一致性、二分、只追查提交、回归门豁免、停滞、DONE 的条件 | `tests/unit/test_rules.py` |
+| 规则：后台验证最新快照、新快照胜出、需求随检查项验证、提交（判定、证据失败、受阻、复查批次与上限、单条重试、软退回、截止）、todo 与锚点、提升 / 降级 / 交付一致性、二分、追查提交与后台持续回归、回归门豁免、停滞、DONE 的条件 | `tests/unit/test_rules.py` |
 | 重放一致性（提交、复查、todo、后台验证、定位、诊断、回退、抢占……随机驱动 40 个种子） | `tests/unit/test_replay.py` |
 | 分层开场：段顺序、前缀稳定、重开原因、300 需求 / 100 会话仍在预算内、board 过滤 | `tests/unit/test_context.py` |
 | 外壳辅助：traceback 截取、sys.path 映射、L1 保留读取、读盘重放、离开期间上限 | `tests/unit/test_runtime_helpers.py` |
-| 端到端：提交被接受、复查交还清单、追问后隐式提交、回归被拒、交接、内存重试 / 读盘重放、截止交付 | `tests/integration/test_belay_run.py` |
+| 端到端：提交被接受、复查交还清单、复查提示软退回、复查失败单条重试、追问后隐式提交、回归被拒、交接、内存重试 / 读盘重放、截止交付 | `tests/integration/test_belay_run.py` |
 | 长程：导入隔离、降级、验证与编辑并发、抢占、被拒信息与撤销、重新接上作业、从 bundle 重建、todo 停顿点交接、中途被杀、诊断者与复查者 | `tests/integration/test_long_run.py` |

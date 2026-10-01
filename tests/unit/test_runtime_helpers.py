@@ -110,3 +110,15 @@ def test_away_section_keeps_the_top_events_and_counts_the_rest():
     sec = ctx.text.split("## While you were away")[1].split("## ")[0]
     assert sec.count("\n- ") <= 4 and "and " in sec and "more" in sec
     assert "The working tree changed since your previous session" in sec
+
+
+def test_reply_json_reads_the_text_then_the_thinking_block():
+    from belay.llm import Response
+    from belay.runtime.driver import _reply_json
+    body = '{"requirements": [{"id": "R1", "implemented": "yes"}]}'
+    r = Response([{"type": "thinking", "thinking": "the {x} part"}, {"type": "text", "text": "Here: " + body}], "end_turn")
+    assert _reply_json(r, "requirements")["requirements"][0]["id"] == "R1"
+    r = Response([{"type": "thinking", "thinking": "answer: " + body}, {"type": "text", "text": ""}], "end_turn")
+    assert _reply_json(r, "requirements")["requirements"][0]["implemented"] == "yes"
+    r = Response([{"type": "text", "text": '{"requirements": [{"id": "R1", "impl'}], "max_tokens")
+    assert _reply_json(r, "requirements") is None

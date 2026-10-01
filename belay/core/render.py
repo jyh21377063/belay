@@ -7,7 +7,7 @@ from belay.core.config import BelayConfig
 from belay.core.model import (ACTIONABLE, ATT_CREATED, ATT_REJECTED, ATT_SUPERSEDED, CONFIRMED, JOB_FINISHED,
                               REQ_BLOCKED, REQ_FINISHED, REQ_OPEN, REQ_SUBMITTED, REQ_VERIFIED, SUB_ACCEPTED,
                               SUB_REJECTED, SUB_RETURNED, TODO_ANCHORED, TODO_COMPLETED, Graph, Requirement)
-from belay.core.queries import (actionable, chain, done_not_delivered, evidence_checks, id_ranges, is_ancestor,
+from belay.core.queries import (actionable, chain, delivery_checkpoint, done_not_delivered, evidence_checks, id_ranges, is_ancestor,
                                 latest_submit, num, open_requirements, status_reasons, suspect, todos_in_order)
 from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, active_guard, checkpoint_full_ok, full_verified,
                                reasons_for_tree, regression_ids, results_for_tree, tree_regressions)
@@ -94,7 +94,8 @@ def render_board(g: Graph, worker: str, now: float, cfg: BelayConfig, status: Op
     sub = latest_submit(g, worker)
     if sub is not None:
         out.append(f"Last submit {sub.id}: {sub.status}" + (f" ({sub.reason})" if sub.reason else "")
-                   + (f"; still open: {id_ranges(sub.open)}" if sub.open else ""))
+                   + (f"; still open: {id_ranges(sub.open)}" if sub.open else "")
+                   + (f"; held once for {len(sub.notes)} reviewer note(s)" if sub.notes and not sub.open else ""))
     reqs = actionable(g)
     counts: dict[str, int] = {}
     for r in reqs:
@@ -241,11 +242,24 @@ def render_submit(g: Graph, sid: str) -> str:
         out.append(f"Submit {sid} accepted: no requirement on the checklist is left open.")
         if ver:
             out.append(f"Verified by their checks: {id_ranges(ver)}")
+        unrev = [rid for rid in sub if g.requirements[rid].review == "failed"]
+        sub = [rid for rid in sub if rid not in unrev]
         if sub:
             out.append(f"Submitted (self-reported; the reviewer did not find anything missing): {id_ranges(sub)}")
+        if unrev:
+            out.append(f"Submitted (self-reported; not reviewed, the reviewer gave no answer): {id_ranges(unrev)}")
         if blk:
             out.append(f"Reported blocked: {id_ranges(blk)}")
         out.append("The harness now finalizes the run; you can stop.")
+        return "\n".join(out)
+    if s.status == SUB_RETURNED and not s.open and s.notes:
+        out.append(f"Submit {sid} is held once before acceptance. Every requirement is done, but the reviewer "
+                   "noticed changes to existing behavior that the requirements do not ask for:")
+        for n in s.notes[:15]:
+            out.append(f"  - {n.get('requirement')}: {n.get('note')}")
+        out.append("This is advice, not a failure. If a change is not needed, consider keeping the original "
+                   "behavior; if it is intended (or cannot be avoided), leave it. Then call submit again; it will "
+                   "not be held for the same notes.")
         return "\n".join(out)
     if s.status == SUB_RETURNED:
         out.append(f"Submit {sid} is not accepted yet: {len(s.open)} requirement(s) are still open. Keep working on "
@@ -366,7 +380,12 @@ CATEGORIES = ("verified", "reviewed", "self-reported", "done-not-delivered", "bl
 
 def ledger(g: Graph) -> dict:
     """结构化账本：运行结束时写入报告，也用于实验指标。"""
-    delivered = g.run.delivered if g.run and g.run.delivered is not None else g.confirmed
+    if g.run and g.run.delivered is not None:
+        delivered = g.run.delivered
+    elif g.run and g.head is not None:                 # 运行中：现在交付的话会交付哪个存档
+        delivered = delivery_checkpoint(g, BelayConfig(deliver_unconfirmed=bool(g.run.deliver_unconfirmed)))
+    else:
+        delivered = g.confirmed
     reqs = actionable(g)
     cats = {c: [] for c in CATEGORIES}
     for r in reqs:
@@ -378,6 +397,7 @@ def ledger(g: Graph) -> dict:
         "status_reasons": list(g.run.status_reasons) if g.run and g.run.delivered is not None
         else status_reasons(g, delivered),
         "delivered_checkpoint": g.run.delivered if g.run else None,
+        "would_deliver": delivered if not (g.run and g.run.delivered is not None) else None,
         "delivered_level": dcp.level if dcp else None,
         "delivered_full_ok": checkpoint_full_ok(g, delivered),
         "deliver_unconfirmed": g.run.deliver_unconfirmed if g.run else None,
@@ -403,10 +423,15 @@ def ledger(g: Graph) -> dict:
         "not_delivered": [r.id for r in done_not_delivered(g, delivered)],
         "unfinished": [r.id for r in open_requirements(g)],
         "submits": [{"id": s.id, "status": s.status, "implicit": s.implicit, "checkpoint": s.checkpoint,
-                     "open": list(s.open), "reason": s.reason} for s in sorted(g.submits.values(), key=lambda s: s.seq)],
+                     "open": list(s.open), "reason": s.reason, "notes": [dict(n) for n in s.notes]}
+                    for s in sorted(g.submits.values(), key=lambda s: s.seq)],
         "reviews": [{"id": v.id, "phase": v.phase, "requirements": list(v.requirements), "status": v.status,
-                     "results": {k: x.get("implemented") for k, x in v.results.items()}}
+                     "retry_of": v.retry_of,
+                     "results": {k: x.get("implemented") for k, x in v.results.items()},
+                     "side_effects": {k: list(x.get("side_effects") or []) for k, x in v.results.items()
+                                      if x.get("side_effects")}}
                     for v in sorted(g.reviews.values(), key=lambda v: v.seq)],
+        "unreviewed": [r.id for r in actionable(g) if r.review == "failed"],
         "checkpoints": [{"id": c.id, "parent": c.parent, "trigger": c.trigger, "kind": c.kind, "level": c.level,
                          "tier": c.tier, "files": len(c.files), "demoted": c.demoted, "abandoned": c.abandoned,
                          "snapshot": c.snapshot, "label": c.label}
@@ -435,8 +460,14 @@ def ledger(g: Graph) -> dict:
 def ledger_markdown(g: Graph) -> str:
     L = ledger(g)
     c = L["categories"]
+    if L["delivered_checkpoint"] is not None:
+        dl = f"delivered checkpoint {L['delivered_checkpoint']} ({L['delivered_level']})"
+    elif L["would_deliver"] is not None:
+        dl = f"not delivered yet; delivering now would deliver checkpoint {L['would_deliver']} ({L['delivered_level']})"
+    else:
+        dl = "not delivered yet"
     out = ["# Belay ledger", "",
-           f"- status: **{L['status']}**, delivered checkpoint {L['delivered_checkpoint']} ({L['delivered_level']})",
+           f"- status: **{L['status']}**, {dl}",
            *[f"  - not DONE because {r}" for r in L["status_reasons"]],
            f"- deliver_unconfirmed={L['deliver_unconfirmed']}; chain head {L['head']}, latest confirmed "
            f"{L['confirmed']}"
@@ -447,7 +478,10 @@ def ledger_markdown(g: Graph) -> str:
               if L["degraded"] else ""),
            "- requirements: " + ", ".join(f"{k} {v}" for k, v in c.items()),
            f"- submits: {len(L['submits'])}"
-           + (f" (last: {L['submits'][-1]['status']})" if L["submits"] else ""), "", "## Requirements", ""]
+           + (f" (last: {L['submits'][-1]['status']})" if L["submits"] else ""),
+           *([f"- not reviewed (the reviewer gave no answer, even when retried alone): {id_ranges(L['unreviewed'])}"]
+             if L["unreviewed"] else []),
+           "", "## Requirements", ""]
     for r in L["requirements"]:
         if r["kind"] != "actionable":
             continue
@@ -461,6 +495,12 @@ def ledger_markdown(g: Graph) -> str:
     if L["not_delivered"]:
         out += ["", f"Finished but not in the deliverable (finished after the delivered checkpoint): "
                     f"{', '.join(L['not_delivered'])}"]
+    notes = [(s["id"], n) for s in L["submits"] for n in s["notes"]]
+    if notes:
+        out += ["", "## Reviewer notes on unrequested behavior changes", "",
+                "Advice only: the submit was held once so the worker could look at them.", ""]
+        for sid, n in notes:
+            out.append(f"- {sid} {n.get('requirement')}: {n.get('note')}")
     if L["waived"]:
         out += ["", "## Waived regression checks", "",
                 "Existing tests taken out of the regression gate because the worker quoted task text asking for "

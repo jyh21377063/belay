@@ -8,11 +8,13 @@
   locate=False           前台存档被拒时不做快照二分定位
   diagnoser=False        不做 LLM 诊断，worker 只拿到规则定位的结果
   reviewer=False         不做收紧式复查（提交的需求直接按自述接受）
+  review_side_effects=False  复查者不报"需求没要求的原有行为改动"（报了也只提示：submit 软退回一次）
   background=handoff     后台只验证交接快照（v6）；off 不做后台验证
 压缩阈值按 Claude Code 的量级设定（只在真正接近上下文上限时才压缩），跑起来再调。
 
 三层：存（每次实际改动都拍快照，不打扰 worker）→ 验（后台空闲时验证最新的可测快照，新快照胜出；submit 与收尾在前台
-验证；没有基于时间的存档）→ 查（只有 worker 的提交被拒、或提交的存档被降级时，才在快照上二分定位并告诉 worker）。
+验证；没有基于时间的存档）→ 查（worker 的提交被拒、提交的存档被降级、或同一组回归在连续两个后台存档上被拒时，
+在快照上二分定位并告诉 worker）。
 """
 from __future__ import annotations
 
@@ -56,6 +58,7 @@ class BelayConfig:
     review_max_reopens: int = 1             # 每条需求最多被复查者重开这么多次，之后只记进账本
     review_batch: int = 5                   # 一次复查调用看几条需求
     review_input_chars: int = 60_000        # 一次复查的输入上限（相关改动按需求筛过）
+    review_side_effects: bool = True        # 复查者顺带列出需求没要求的原有行为改动；有就软退回一次（worker 自己决定）
     # ---- 提交（唯一的完成声明）
     submit_wait_sec: float = 1800           # submit 最多等这么久（存档验证 + 复查），超时就先把当前状态返回
     nudge_on_stop: bool = True              # 模型停下不调用工具：先追问一次，再次停下就当作提交
