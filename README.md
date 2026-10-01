@@ -1,135 +1,249 @@
 # Belay
 
-长程编码任务的任务状态图 runtime，以及配套的评测框架。runtime 的实现设计见 `docs/design.md`，选题见 `task_selection.md`。
+**一个让编码 agent 能可靠地完成长时间任务的运行时（runtime），以及一套用来验证它是否真的有用的对比评测框架。**
 
-## 目录
+---
 
-```
-<父目录>/
-├── benchmarks/        原始数据集（只读，不进 git）
-└── belay/             本仓库
-    ├── tasks.yaml     题目清单（冻结）
-    ├── runs.yaml      运行编排：agent 定义 + profile
-    ├── belay/         runtime 本体（开发中）
-    ├── eval/          评测框架，入口 python -m eval.run
-    ├── build/tasks/   eval.prepare 生成的 Pier 任务目录（gitignore）
-    └── results/       运行结果（gitignore）
-```
+## 背景：agent 在长任务里会怎么失败
 
-`runs.yaml` 和 `tasks.yaml` 中的相对路径都相对于文件自身所在目录解析，整个父目录放在服务器任意位置都可以。
+现在的编码 agent（如 Claude Code）在几分钟到十几分钟的任务上已经很强，但当任务变成"按一份几十条改动的发布说明，把一个开源项目从一个版本升级到下一个版本"这种需要几十分钟到数小时、跨越多次上下文压缩的工作时，失败方式会明显变化。我们在试跑中观察到的典型问题：
 
-## 环境准备
-
-服务器上只需要 Docker 和 Python，**不需要安装 Claude Code**：Pier 会在每道题的容器里自动安装，
-并通过 `runs.yaml` 中的环境变量把模型指向 DeepSeek。
-
-```bash
-cd belay
-python -m venv .venv && source .venv/bin/activate
-pip install datacurve-pier pyyaml anthropic pytest   # Pier 必须装在本 venv 里，自定义 agent 通过 import_path 加载
-export DEEPSEEK_API_KEY=...
-```
-
-然后填写 `runs.yaml` 中 claude-code 的 `model`（DeepSeek 模型名）和 `kwargs.version`（Claude Code 版本号，可先删掉这一行）。
-
-## 运行
-
-以下命令都在 `belay/` 下执行。
-
-```bash
-python -m eval.prepare --split dev                        # 生成任务目录（DeepSWE 可直接用）
-python -m eval.run --profile gold-check -y                # 环境验证：oracle 两次通过、nop 失败
-python -m eval.run --profile cc-pilot --tasks koota-query-predicates   # 先跑一道
-python -m eval.run --profile cc-pilot -y                  # 调试集全部
-python -m eval.run --profile cc-test -y                   # 评测集，A 组
-python -m eval.run --profile gold-check --split test      # 验证评测集题目环境
-python -m eval.run --profile regrade --source-run <run_id>  # 对已有补丁重新评分
-python -m eval.run --profile cc-pilot --dry-run           # 只打印计划与 Pier 配置
-python -m eval.report results/<run_id>                    # 重新生成汇总
-```
-
-- `--profile` 决定 agent、split、重复次数；`--tasks`、`--benchmarks`、`--agent`、`--model`、`--repeats` 可临时覆盖。
-- 结果写到 `results/<run_id>/<benchmark>/<id>/<repeat>/`，汇总在 `results/<run_id>/summary.md` 和 `summary.csv`。
-- 同一命令重跑即断点续跑，已完成的 trial 自动跳过。
-
-## 评测流程
-
-每个 trial 分两个阶段，以 `patch.diff` 为边界：
-
-1. **agent 阶段**：Pier 启动题目容器，运行 agent；结束时 `eval/agents/patch_capture.py` 导出补丁（超时也会导出）。
-2. **评分阶段**：在全新容器中用 `eval/agents/replay.py` 应用补丁，运行题目自带的 verifier。
-
-所有对比组走同一条评分路径。`inline_verify` 开启时，agent 结束后也会在原容器评分一次；两次结果不一致会在汇总表中标为 `inline≠replay`。
-
-防泄漏：`eval.prepare` 把所有任务设为 `allow_internet = false`，Pier 只放行 agent 声明的模型 API 域名；运行前检查会拒绝允许联网的任务。
-
-## eval 模块
-
-| 文件 | 职责 |
-|---|---|
-| `eval/run.py` | 命令行入口 |
-| `eval/config.py` | defaults ← profile ← 命令行 合并；选题与校验（纯函数） |
-| `eval/runner.py` | 运行前检查、trial 循环、断点续跑、agent 阶段与重放评分 |
-| `eval/pier_backend.py` | 唯一调用 Pier 的模块：生成 JobConfig、调用 `pier run -c`、解析 result.json |
-| `eval/prepare.py` | 生成 Pier 任务目录，强制不联网 |
-| `eval/report.py` | 生成 summary.csv / summary.md |
-| `eval/convert/` | ProMax、SWE-EVO 转 Pier 格式（待实现） |
-| `eval/agents/patch_capture.py` | 快照 + 导出 patch.diff |
-| `eval/agents/claude_code.py` | A 组：Pier 的 ClaudeCode + 补丁导出 |
-| `eval/agents/flat_agent.py` | B 组：自研执行器（骨架） |
-| `eval/agents/replay.py` | 评分用：在全新容器中应用补丁 |
-
-## belay 模块（v6：长程单 worker 的可靠性底座）
-
-设计见 [docs/design.md](docs/design.md)，目录与依赖规则见 [docs/architecture.md](docs/architecture.md)。
-一条只追加的事件日志是唯一真相；任务图、执行状态、存档链三个视图由纯函数从日志推出；runtime 是唯一写者。
-循环跑在宿主机进程里，工具经由 `Env` 在任务容器中执行；容器里只需要 bash、coreutils、git 与 python3。
-
-agent 只管写代码。存档分三层：**存**——runtime 在工具边界给每次实际改动拍快照，只存不测；**验**——只在语义节点
-（步骤完成、交接、手动存档、review、收尾）在验证槽位里用原始测试验证并推进一条两级存档链（related 通过是暂存点，
-全量通过是确认点，交付最新的确认点），没有基于时间的后台存档，后台节点被拒只是链头不动；**查**——只有 worker 声明完成的
-存档被拒或降级时，才在快照上二分定位、让诊断者解释并告诉 worker；需求账本与复查者防止漏做和提前结束；
-交接落在步骤边界，开场上下文分层且有界；全部状态以事件日志和 git bundle 保存在宿主机上，会话、runtime 进程、容器都可以
-随时被替换（内存重试、读盘重放、`resume --rebuild`）。
-
-| 路径 | 职责 |
+| 问题 | 实际表现 |
 | --- | --- |
-| `belay/core/` | **纯函数核心**：事件（`events`）、三个视图（`model`）、推导函数（`reduce`）、状态转换规则（`rules`）、验证规则（`verify`）、不变量（`invariants`）、调度建议（`suggest`）、上下文构建（`context`）、压缩规则 L0–L2（`compact`）、规划校验（`plan`）、副作用计划（`effects`）、文字渲染（`render`）、配置（`config`） |
-| `belay/runtime/` | **命令式外壳**：事件存储（`store`）、唯一写者（`runtime`）、影子仓库与 CAS（`gitops`）、作业与验证器（`verifier`）、会话循环与 L0–L4（`session`）、工具接口（`port`）、规划器（`planner`）、运行驱动（`driver`）、重启对账（`recovery`）、提示词（`prompts`） |
-| `belay/tools/` | 通用工具（文件、bash、todo、explore）与 Belay 工具（`belay.py`：board / task / claim / release / add_task / note / step_done / checkpoint / ready_for_review / report_blocked / run_check / wait / failure_log / revert_change / history / rollback） |
-| `belay/worker/` | B 组的 worker（同一套工具，不用图），也用来跑只读探索子 agent |
-| `belay/env.py`、`belay/llm.py` | 执行环境（Local / Docker / Pier）；模型客户端（重试、thinking、录制与回放、ScriptedLLM） |
-| `belay/container/runner.py` | 容器内的检查运行器（标准库）：把候选树增量导出到验证槽位（或降级时临时切换工作区）跑测试与命令检查、解析结果、导入隔离探针 |
-| `belay/cli.py` | 本地调试入口：`run` / `resume` / `ledger` / `flat` |
+| **漏做、提前宣布完成** | 一道 22 条改动的题，agent 做了 20 条就宣布完成；漏掉的 2 条恰好对应 8 个评分测试中的 7 个 |
+| **回归** | 修好 A 的同时弄坏了 B。"回归"指原本能通过的测试被新改动弄坏；同一道题里 1 个回归就让得分清零 |
+| **改测试来"通过"** | 为了让测试变绿，agent 直接修改测试文件、删除断言（一次试跑中改了 27 个测试文件） |
+| **压缩后忘事** | 上下文满了被压缩成摘要，之后不记得哪些做完了、哪些验证过、之前为什么这样改 |
+| **中断即前功尽弃** | 进程崩溃、容器丢失、超时被杀，工作区停在半成品状态，交不出任何可用结果 |
 
-```bash
-python -m pytest -q                                                    # 全部测试，不需要容器和模型
-python -m belay.cli run --workdir /path/to/repo --task-file task.md --gate gate.json --run-dir runs/x
-python -m belay.cli run --docker <容器> --workdir /testbed --task-file task.md --gate gate.json --run-dir runs/x
-python -m belay.cli run ... --replay runs/x/llm_record.jsonl            # 回放录制的模型回复，不调用模型
-python -m belay.cli resume --run-dir runs/x                             # runtime 崩溃后：重放 → 对账 → 继续
-python -m belay.cli resume --run-dir runs/x --rebuild [--docker <新容器>] # 容器 / 工作区丢了：从 git bundle 重建
-python -m belay.cli ledger --run-dir runs/x                             # 从事件库重放出账本
-python -m belay.cli flat --workdir /path/to/repo --task-file task.md    # B 组
+这些问题的共同根源是：**任务进度只存在于模型的上下文里，而"做完了没有"由模型自己说了算。**
+
+## 核心思路
+
+把任务进度从模型的上下文里搬出来，交给 agent 外部一个由程序维护的**任务状态图**：
+
+- agent 只管写代码，通过几个简单的工具向图汇报："我领了这个任务""这一步做完了""我认为这个任务完成了"。
+- **是否真的完成、哪个版本可以交付，由 runtime 跑测试判定，不由模型说了算。**
+- 进度、存档、验证结果都持久化在宿主机上，所以会话可以换、进程可以崩、容器可以丢，任务都能从最近的可靠点接着做。
+
+```mermaid
+flowchart LR
+  subgraph Host["宿主机"]
+    A["编码 agent<br/>（LLM + 工具循环）"]
+    R["Runtime<br/>唯一能修改状态的模块"]
+    L[("事件日志<br/>唯一的事实来源")]
+    G["任务图 / 执行状态 / 存档历史<br/>（由日志推导）"]
+  end
+  subgraph Box["任务容器"]
+    WS["工作目录<br/>agent 在这里改代码"]
+    GIT["影子 git 仓库<br/>保存快照与存档"]
+    VD["独立验证目录<br/>跑测试，不打扰 agent"]
+  end
+  A -- "读写文件、执行命令" --> WS
+  A -- "认领 / 步骤完成 / 申请验收" --> R
+  R -- "验收结果、失败原因、提醒" --> A
+  R --> L --> G --> R
+  R -- "拍快照" --> GIT
+  R -- "派发测试" --> VD
+  VD -- "测试结果" --> R
 ```
 
-运行目录：`events.sqlite`（事件与视图快照，唯一真相）、`events.jsonl`（同内容，便于阅读）、`sessions/S*.jsonl`
-（每个会话的完整对话与消息轨迹，用于审计与读盘重放）、`git/<m>.bundle`（影子仓库的增量镜像，用于重建）、`blobs/`
-（大工具输出、diff、压缩后的消息）、`checkpoints/<k>.diff`（里程碑存档的补丁镜像，给人看）、`deliverable.diff`
-（交付物 = 最新的确认点）、`worktree.diff`（结束时工作区的完整改动）、`ledger.json` / `ledger.md`（六类口径，以及不是 DONE 的原因）。
+## 主要设计
 
-评测接入（`eval/agents/belay_agent.py`）：setup 阶段调 `BelayRun.prepare`（影子仓库、基线双跑、导入隔离、规划，不占
-预算），run 阶段对同一个运行目录调 `run_prepared`（预算从这里开始计时）；被评测框架超时取消时 `emergency_deliver`
-把工作区检出为最新的确认点再导出补丁。运行目录在 trial 的 agent 日志目录下 `belay/`。
+### 1. 事件日志是唯一事实来源
 
-```bash
-python -m eval.run --profile belay-dev --tasks <一道题>                   # 调试集上先跑一道（保留容器）
-python -m eval.run --profile belay-dev --agent belay-no-locate --tasks <题>  # 消融
+所有状态变化（任务被认领、快照被拍、测试跑完、存档推进……）都作为事件追加到一条只增不改的日志里。任务图、执行状态、存档历史这三个视图都由纯函数从日志推导出来。
+
+- **可恢复**：崩溃后重放日志就能得到完全一致的状态。
+- **可审计**：每个结论都能追溯到是哪条事件、由谁（规则 / 观测 / 模型）产生的。
+- **好测试**：所有判断逻辑是纯函数，不做 IO、不调模型、不读时钟，用普通单元测试即可覆盖。
+
+### 2. 需求先拆清楚，最后逐条对账
+
+开工时，规划器（一次 LLM 调用）把任务原文拆成需求清单和初始任务。程序会校验：每条需求必须**逐字引用**原文、原文的每一部分都必须被覆盖、任务依赖不能成环。校验不过就让模型重做，几轮仍不过则退回按行机械切分。需求一旦冻结就不再改动，结束时按需求逐条核对，防止"做了 20 条就说做完了"。
+
+### 3. 模型只能"收紧"，不能"放行"
+
+系统里有几个辅助的 LLM 角色，例如**诊断者**（解释某个测试为什么失败）和**复查者**（检查一个没有测试覆盖的任务是不是真的做完了）。它们的结论只能用来记录信息或**重新打开**任务，永远不能把任务标记为完成、也不能推进存档。"完成"和"可交付"只来自测试结果和确定的规则。
+
+### 4. 存档分三层：存 → 验 → 查
+
+- **存**：agent 每次实际改动文件后，runtime 自动拍一张快照（git 提交），只保存、不测试。
+- **验**：只在有意义的节点（步骤完成、申请验收、会话交接、收尾）跑测试。测试在独立的验证目录里运行，不会和 agent 抢工作区；验证使用**原始测试文件**，agent 对测试的修改不算数。
+- **查**：只有当 agent **自己声明完成**的版本被测试拒绝时，才在快照之间二分查找，定位是哪一次改动引入了问题，连同失败原因和诊断一起告诉 agent，并提供一键撤回那段改动的工具。后台验证中间状态失败是常态，只记录，不打扰 agent。
+
+存档本身分两级：相关测试通过是**暂存点**；验证资源空闲时再跑全量测试，通过后升级为**确认点**。**最终交付的永远是最新的确认点**，所以即使超时被打断，交出去的也是一个经过完整验证的版本，而不是半成品。
+
+```mermaid
+flowchart TD
+  A["agent 改了文件"] --> B["拍快照<br/>只保存，不测试"]
+  B --> C{"是否到了<br/>有意义的节点？"}
+  C -- "否" --> T["留在时间线上<br/>供回退与排查使用"]
+  C -- "是：步骤完成 / 申请验收<br/>交接 / 收尾" --> D["在独立目录用原始测试验证<br/>（相关测试 + 原本就能通过的测试）"]
+  D -- "通过" --> E["暂存点"]
+  E -- "空闲时跑全量测试" --> F{"全量通过？"}
+  F -- "是" --> G["确认点<br/>交付候选"]
+  F -- "否，确认出现回归" --> H["降级，不再作为交付候选"]
+  D -- "出现回归" --> I{"是 agent 声明<br/>完成的版本吗？"}
+  I -- "否（中间状态）" --> J["只记录，不打扰 agent"]
+  I -- "是" --> K["在快照之间二分查找<br/>定位引入问题的改动"]
+  H --> K
+  K --> L["告诉 agent：哪个测试、哪段改动、诊断说明<br/>可一键撤回该段改动"]
 ```
 
-## 待办
+### 5. 任务怎么流转
 
-- [ ] `eval/convert/promax_to_harbor.py`、`sweevo_to_harbor.py`：instruction.md 只写 problem_statement；SWE-EVO 的单提交重建写进 Dockerfile；`tests/test.sh` 写 `/logs/verifier/reward.json`（`{"resolved": 0|1, "fix_rate": x}`）
-- [x] `eval/agents/belay_agent.py`：按 v6 的 `BelayRun` 重新接入
-- [ ] 多 worker（可选）：每个 worker 一个 worktree、存档 = 三方合并再验证
-- [ ] 填写 `task_selection.md` 4.3 节的实测难度
+每个任务在图里有明确的状态，状态只能按规则转换：
+
+```mermaid
+stateDiagram-v2
+  state "待办" as open
+  state "进行中" as active
+  state "待验收" as review
+  state "已完成（测试验证）" as done
+  state "已完成（无测试，已存档）" as unverified
+  state "受阻" as blocked
+  state "已拆分" as split
+
+  [*] --> open: 规划器生成
+  open --> active: agent 认领
+  active --> open: agent 放弃
+  active --> review: agent 声明做完
+  review --> done: 关联测试在存档上全部通过
+  review --> unverified: 没有关联测试，改动已进入存档
+  review --> active: 测试没过，带着失败原因打回
+  active --> blocked: agent 报告受阻
+  open --> split: 长期停滞时拆成子任务
+  unverified --> open: 复查者认为没做完
+  blocked --> open: 复查者给出了合理的理解方式
+  done --> open: 回退到它完成之前的版本
+```
+
+整个运行只有在以下条件都满足时才算**真正完成**：没有未解决的任务、每条需求都被满足、复查者没有发现漏做、所有完成的任务都包含在交付版本里、交付的是确认点。报告"受阻"是诚实的结束方式，会正常收尾交付，但不计为完成。
+
+### 6. 会话怎么流转
+
+一个长任务会经历很多次会话。会话结束不等于任务结束，runtime 决定下一步是开新会话、等待验证还是收尾交付。
+
+```mermaid
+flowchart TD
+  S["开始新会话<br/>开场上下文由任务图生成"] --> W["agent 工作"]
+  W --> X{"上下文用量"}
+  X -- "正常" --> W
+  X -- "偏高" --> P["清理旧的命令输出<br/>旧对话用任务图重写"]
+  P --> W
+  X -- "接近上限" --> Q["等当前步骤做完<br/>再交接，不在半路切换"]
+  Q --> H["结束会话"]
+  W -- "模型接口失败" --> M["退避后原样重试<br/>补上离开期间的变化"]
+  M --> W
+  H --> N{"下一步"}
+  N -- "还有未完成的任务" --> S
+  N -- "全部完成" --> RV["复查者检查"] --> F["收尾：交付最新确认点"]
+  N -- "时间快到 / 连续几个会话没有进展" --> F
+```
+
+新会话的开场上下文**由任务图生成，而不是靠模型写摘要**：任务原文、当前在做的任务与步骤、上次做到哪里（附部分改动的 diff）、待处理的问题（未解决的回归、定位结果）、离开期间发生了什么、整体进度。每部分都有长度上限，被折叠的内容留有查询入口，所以即使有几百条需求、上百次会话，开场也不会失控。
+
+### 7. 三种中断都能恢复
+
+| 中断 | 恢复方式 |
+| --- | --- |
+| 模型接口多次失败，runtime 还在 | 在内存里原样重试；上下文本身出问题则改开新会话 |
+| runtime 进程崩溃，容器还在 | 重放事件日志恢复状态，与 git 和正在运行的测试对账，能接上的测试进程直接接上，对话从磁盘记录恢复 |
+| 容器 / 工作区丢失 | 宿主机上持续保存着 git 增量备份，从原始代码重建全部快照和存档，再从最近的一张快照继续 |
+
+---
+
+## 评测：怎么证明它有用
+
+为了把"runtime 带来的收益"和"agent 本身的能力"分开，我们设计了一组对照，所有组使用同一个模型（DeepSeek）、同样的 90 分钟预算和同一套题目：
+
+| 组 | 说明 | 用来回答的问题 |
+| --- | --- | --- |
+| Claude Code | 原版 Claude Code | 现成的强 agent 能做到什么程度 |
+| Claude Code + 测试拦截 | agent 想结束时自动跑测试，有回归就打回去（最多 5 次） | 只加一个简单的测试门槛够不够 |
+| Claude Code + 三段流水线 | 规划 → 执行 → 评审 的常见多 agent 结构 | 常见的多 agent 拆分够不够 |
+| 自研 agent | 参照 Claude Code 自己实现，工具和压缩阈值对齐，**没有任务图** | 我们的基础 agent 是否和 Claude Code 相当 |
+| **Belay** | 自研 agent + 任务状态图 runtime | runtime 带来了多少收益 |
+| Belay 消融 | 分别关掉回归定位、图生成上下文、诊断者与复查者 | 每个机制各贡献多少 |
+
+**题目**：从 SWE-EVO（按发布说明完成一次版本升级）、SWE-Bench ProMax（大规模多文件重构，含 Rust / Go / Java）、LHTB（真实终端里的长程任务）中挑选预计需要几十分钟以上的题，共 16 道正式题 + 3 道调试题；另有 2 道 Claude Code 已能解出的简单题作为对照，确认 runtime 在简单任务上不会带来损失。选题依据和每道题的规模见 [`task_selection.md`](task_selection.md)。
+
+**评分**：agent 结束后导出补丁，在**全新容器**里应用补丁并运行题目隐藏的测试，所有组走同一条评分路径。主要指标是修复率：目标测试的通过比例，但只要有一个原本通过的测试被弄坏就记为 0。
+
+**防作弊与防泄漏**：题目容器断网，只放行模型 API；禁用 Claude Code 由服务端执行的网页搜索（试跑中它曾 51 次搜到其他 agent 在同一道题上的运行记录）；删除仓库中目标版本之后的 git 历史；评分时使用原始测试文件，agent 改动测试无效。
+
+> 正式评测的结果会在运行完成后补充。
+
+---
+
+## 快速开始
+
+### 环境
+
+需要 Python（开发与测试使用 3.12）；跑评测时还需要 Docker。
+
+```bash
+git clone https://github.com/jyh21377063/belay.git && cd belay
+python -m venv .venv && source .venv/bin/activate
+pip install datacurve-pier pyyaml anthropic pytest
+```
+
+### 运行测试（不需要 Docker 和模型）
+
+```bash
+python -m pytest -q
+```
+
+约 200 个测试，几分钟跑完。其中包括：随机生成事件序列、验证"重放日志得到的状态"与"实时运行的状态"完全一致；以及用预先录制的模型回复驱动完整运行，覆盖回归定位、步骤中途被杀、从备份重建容器等场景。
+
+### 在一个本地仓库上运行 Belay
+
+```bash
+export DEEPSEEK_API_KEY=...
+
+# task.md：任务描述原文；gate.json：测试配置（测试命令、结果解析方式等）
+python -m belay.cli run --workdir /path/to/repo --task-file task.md --gate gate.json --run-dir runs/demo
+
+python -m belay.cli resume --run-dir runs/demo                                # 进程崩溃后继续
+python -m belay.cli resume --run-dir runs/demo --rebuild --docker <新容器>     # 容器丢失后重建并继续
+python -m belay.cli ledger --run-dir runs/demo                                # 查看需求与任务的完成情况
+python -m belay.cli run ... --replay runs/demo/llm_record.jsonl               # 回放录制的模型回复，不调用模型
+```
+
+运行结束后，`runs/demo/` 下会有事件日志、每个会话的完整对话记录、交付补丁 `deliverable.diff` 和需求账本 `ledger.md`。
+
+### 跑评测
+
+评测基于 [Pier](https://pypi.org/project/datacurve-pier/)（一个在 Docker 里批量运行 agent 并评分的框架）。运行配置在 `runs.yaml`，题目清单在 `tasks.yaml`。
+
+```bash
+python -m eval.prepare --split dev                           # 生成题目目录（强制断网）
+python -m eval.run --profile gold-check -y                   # 先验证题目环境：参考答案能通过、空改动不能通过
+python -m eval.run --profile belay-dev --tasks <题目 id>       # 用 Belay 跑一道调试题
+python -m eval.run --profile cc-pilot -y                     # 用 Claude Code 跑全部调试题
+python -m eval.report results/<run_id>                       # 生成汇总表
+```
+
+同一条命令重复执行会自动跳过已完成的部分；加 `--dry-run` 只打印计划不实际运行。
+
+---
+
+## 目录结构
+
+```
+belay/
+├── core/        纯函数核心：事件、视图推导、状态转换规则、验证规则、上下文构建
+├── runtime/     外壳：事件存储、git 快照、测试调度、会话循环、规划器、恢复
+├── tools/       agent 可调用的工具（文件、命令行，以及向任务图汇报的工具）
+├── worker/      agent 主循环（自研 agent 与 Belay 共用同一份代码，对比才公平）
+├── container/   在容器内运行的测试执行脚本（只依赖标准库）
+└── cli.py       本地运行入口
+eval/            评测框架：题目转换、运行编排、补丁重放评分、汇总
+tests/           单元测试与端到端测试
+docs/            详细设计文档
+```
+
+## License
+
+[Apache-2.0](LICENSE)
