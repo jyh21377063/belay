@@ -475,19 +475,32 @@ def _imported_modules(path):
     return mods
 
 
+def _stdlib(mod):
+    """标准库模块（3.10 起有 sys.stdlib_module_names；更早的版本只能认出内建模块）。"""
+    top = mod.split(".")[0]
+    names = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names)
+    return top in names
+
+
 def _module_file(roots, mod, slot=None):
-    """模块对应的源文件：先在映射的路径里找，再在槽位里按路径后缀找（发现没被映射的源码目录）。"""
+    """模块对应的源文件：先在映射的路径里找，再在槽位里按路径后缀找（发现没被映射的源码目录）。
+
+    按后缀找时，找到的文件必须真能以这个名字被导入：它所在的目录（顶层模块的父目录）本身不是一个包
+    （没有 __init__.py）。否则 `import typing` 会被当成 pydantic/typing.py、`import utils` 会被当成
+    dask/utils.py，探针在槽位里导入时解析到标准库或别的包，把有效的隔离误判为无效（整个运行退化为降级模式）。"""
     rel = mod.replace(".", "/")
     for root in roots:
         for cand in (rel + ".py", rel + "/__init__.py"):
             full = os.path.join(root, cand)
             if os.path.isfile(full):
                 return full
-    if slot:
+    if slot and not _stdlib(mod):
         skip = {".git", "node_modules", "__pycache__", ".tox", ".venv", "venv", "build", "dist"}
         for dirpath, dirnames, filenames in os.walk(slot):
             depth = dirpath[len(slot):].count(os.sep)
             dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")] if depth < 4 else []
+            if dirpath != slot and "__init__.py" in filenames:
+                continue                                # 包里面的文件不是顶层模块
             for cand in (rel + ".py", rel + "/__init__.py"):
                 full = os.path.join(dirpath, cand)
                 if os.path.isfile(full):

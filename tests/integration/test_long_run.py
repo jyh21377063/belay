@@ -127,6 +127,17 @@ def test_mapped_sys_path_isolates_a_lib_layout(tmp_path):
     assert run.rt.graph.isolation["valid"] is True
 
 
+def test_probe_ignores_stdlib_names_shadowed_inside_a_package(tmp_path):
+    """测试先 import typing，而项目里有 pkg/typing.py（pydantic、dask 都是这样）：探针不能把标准库的 typing
+    当成项目的模块，否则有效的隔离会被误判为无效，整个运行退化为降级模式。"""
+    tests = "import typing\nimport json\n" + TESTS
+    h = H(tmp_path, repo_kw={"tests": tests, "extra": {"pkg/typing.py": "X = 1\n", "pkg/json.py": "Y = 2\n"}})
+    run = asyncio.run(setup_only(h))
+    g = run.rt.graph
+    assert g.isolation["valid"] is True and not g.degraded, g.isolation
+    assert g.isolation["probe"]["module"] == "pkg.mod"
+
+
 def test_probe_catches_imports_that_resolve_to_the_workspace(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     spec = VerifierSpec(test_cmd="python -m pytest -rA -p no:cacheprovider tests", timeout_sec=120,
