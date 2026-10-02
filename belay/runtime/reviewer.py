@@ -40,8 +40,10 @@ if TYPE_CHECKING:
 WRAPUP = ("Your time for this review is up. Call verdict now with what you have found (merge, the requirements you "
           "judged with their evidence levels, feedback). Do not call any other tool.")
 TRIGGER_TEXT = {
-    "auto": "a background check of the agent's latest snapshot (the agent keeps working meanwhile)",
-    "todo": "a background check right after the agent ticked off a todo item",
+    "auto": "a background check of the agent's latest snapshot, taken because no todo item was ticked off for a "
+            "while (it may be in the middle of a change; the agent keeps working meanwhile)",
+    "todo": "a background check of the snapshot taken when the agent ticked off a todo item (the agent may have "
+            "kept working since; this snapshot is what is checked)",
     "handoff": "a check at a session handoff",
     "session_end": "a check at the end of a session",
     "submit": "the agent called submit: it believes the requirements are done and waits for your verdict",

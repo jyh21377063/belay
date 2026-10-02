@@ -218,6 +218,333 @@ def test_background_gate_rejections_escalate_only_when_the_same_regression_persi
     s.check_log()
 
 
+# ======================================================================== 后台：边界快照（勾掉 todo、交接）优先
+
+def boundary_sim(**kw) -> Sim:
+    """复核手动给结论、作业手动完成：用来摆出“合并进行中又勾掉 todo”这类交错。兜底 900 s、勾掉 todo 60 s。"""
+    kw.setdefault("merge_min_interval_sec", 900)
+    kw.setdefault("merge_todo_interval_sec", 60)
+    kw.setdefault("confirm_regressions", False)
+    return sim(cfg=BelayConfig(**kw), reviewer=MANUAL, auto_jobs=False)
+
+
+def tick_todo(s: Sim, tree: str, done: list[str], doing: str | None = None, overrides: dict | None = None,
+              testable: bool = True) -> int:
+    """worker 勾掉 todo：driver 先强制拍一张锚点快照，再把列表镜像到图上。"""
+    s.world.define(tree, overrides or {})
+    n = s.snap(tree, reason="todo", testable=testable)
+    todos = [{"content": t, "status": "completed"} for t in done]
+    if doing:
+        todos.append({"content": doing, "status": "in_progress"})
+    s.do(R.update_todos, "w1", todos, n)
+    return n
+
+
+def edit(s: Sim, tree: str, overrides: dict | None = None, **kw) -> int:
+    s.world.define(tree, overrides or {})
+    return s.snap(tree, **kw)
+
+
+def bg_open(s: Sim):
+    return next((a for a in s.g.attempts.values() if a.lane == "bg" and a.status in ("pending", "advancing")), None)
+
+
+def finish(s: Sim, merge: bool = True) -> None:
+    """跑完进行中的后台请求（只跑它自己的作业）：回归门 → 复核结论。"""
+    aid = bg_open(s).id
+    while True:
+        running = [j for j in s.g.attempts[aid].jobs if s.g.jobs[j].state == "running"]
+        if not running:
+            break
+        s.finish_job(running[0])
+    vid = s.running_review()
+    if vid is not None:
+        s.review(vid, judge(merge, feedback="" if merge else "the parser is half done")(s, s.g.reviews[vid]))
+
+
+def bg_requests(s: Sim) -> list[tuple[str, str]]:
+    return [(a.tree, a.trigger) for a in sorted(s.g.attempts.values(), key=lambda a: a.created_seq)
+            if a.lane == "bg"]
+
+
+def test_todo_anchor_is_merged_even_after_the_worker_kept_editing():
+    s = boundary_sim()
+    edit(s, "a1")
+    assert bg_requests(s) == [("a1", "auto")]                              # 第一次：没有可比的复核，不节流
+    tick_todo(s, "t1", ["parse the header"], "parse the body")              # a1 还在合并
+    edit(s, "half1")
+    edit(s, "half2")                                                       # worker 接着改：中间态
+    assert len(s.g.attempts) == 1                                          # 进行中的不抢占、不排队
+    finish(s)
+    assert s.g.head == 1
+    s.advance(61)
+    s.tick()
+    assert bg_requests(s)[-1] == ("t1", "todo")                            # 选勾掉 todo 的那张，不是最新的 half2
+    assert bg_open(s).summary == "parse the header"
+    finish(s)
+    g = s.g
+    assert g.checkpoints[g.head].tree == "t1" and g.todos["P1"].status == "anchored"
+    s.advance(61)
+    s.tick()
+    assert bg_open(s) is None                                              # half2 只能等兜底间隔
+    s.advance(900)
+    s.tick()
+    assert bg_requests(s)[-1] == ("half2", "auto")
+    s.check_log()
+
+
+def test_todos_ticked_during_a_merge_coalesce_into_one_request_for_the_newest():
+    s = boundary_sim()
+    edit(s, "a1")
+    tick_todo(s, "t1", ["header"], "body")
+    edit(s, "mid")
+    tick_todo(s, "t2", ["header", "body"], "footer")
+    edit(s, "mid2")
+    tick_todo(s, "t3", ["header", "body", "footer"])
+    edit(s, "after")
+    finish(s)
+    s.advance(61)
+    s.tick()
+    reqs_ = bg_requests(s)
+    assert reqs_ == [("a1", "auto"), ("t3", "todo")]                       # 攒下的三个合成一次：t3 包含 t1、t2
+    assert bg_open(s).summary == "header; body; footer"
+    finish(s)
+    g = s.g
+    assert {t.title: t.status for t in g.todos.values()} == {"header": "anchored", "body": "anchored",
+                                                              "footer": "anchored"}
+    assert all(g.todos[t].checkpoint == g.head for t in g.todos)
+    s.check_log()
+
+
+def test_a_newer_todo_never_preempts_a_running_background_review():
+    s = boundary_sim()
+    edit(s, "a1")
+    finish(s)
+    s.advance(61)
+    tick_todo(s, "t1", ["one"], "two")
+    a = bg_open(s)
+    assert (a.tree, a.trigger) == ("t1", "todo")
+    for jid in a.jobs:
+        s.finish_job(jid)
+    vid = s.running_review()
+    assert vid is not None
+    for i in range(3):                                                     # worker 勾 todo 比复核快
+        s.advance(120)
+        tick_todo(s, f"t{i + 2}", ["one", "two"] + [f"x{k}" for k in range(i + 1)], f"x{i + 1}")
+        s.tick()
+    assert s.running_review() == vid and bg_open(s).id == a.id
+    assert not [e for e in s.log if e.type in ("merge_superseded", "review_cancelled")]
+    s.review(vid, APPROVE(s, s.g.reviews[vid]))
+    assert s.g.checkpoints[s.g.head].tree == "t1"                          # 链头前进了：没有饥饿
+    s.tick()
+    assert bg_requests(s)[-1] == ("t4", "todo")                            # 复核早已超过 60 s：马上接最新的 todo
+    s.check_log()
+
+
+def test_submit_still_preempts_background_and_older_todos_are_not_revisited():
+    s = boundary_sim()
+    edit(s, "a1")
+    finish(s)
+    s.advance(61)
+    tick_todo(s, "t1", ["one"], "two")
+    bg = bg_open(s)
+    for jid in bg.jobs:
+        s.finish_job(jid)
+    bg_review = s.running_review()
+    tick_todo(s, "t2", ["one", "two"], "three")
+    s.world.define("sub", {})
+    sid = s.submit("sub")
+    g = s.g
+    assert g.attempts[bg.id].status == "superseded" and g.reviews[bg_review].status == "cancelled"
+    fg_a = next(a for a in g.attempts.values() if a.lane == "fg")
+    assert fg_a.tree == "sub" and bg_open(s) is None                       # t2 早于 submit 的快照：归前台
+    for jid in fg_a.jobs:
+        s.finish_job(jid)
+    s.review(s.running_review(), APPROVE(s, s.g.reviews[s.running_review()]))
+    g = s.g
+    assert g.checkpoints[g.head].tree == "sub" and g.submits[sid].status != "pending"
+    assert {t.title: t.status for t in g.todos.values()} == {"one": "anchored", "two": "anchored",
+                                                              "three": "in_progress"}
+    s.advance(61)
+    s.tick()
+    assert bg_open(s) is None and [t for t, _ in bg_requests(s)].count("t2") == 0
+    tick_todo(s, "t3", ["one", "two", "three"])
+    assert bg_requests(s)[-1] == ("t3", "todo")                            # submit 之后的 todo 照常触发
+    s.check_log()
+
+
+def test_auto_is_only_a_fallback_after_a_long_stretch_without_todos():
+    s = boundary_sim()
+    edit(s, "a1")
+    finish(s)
+    edit(s, "w1")
+    s.advance(600)
+    s.tick()
+    assert bg_open(s) is None                                              # 旧的 600 s 不再触发
+    edit(s, "w2")
+    s.advance(299)
+    s.tick()
+    assert bg_open(s) is None
+    s.advance(2)
+    s.tick()
+    assert bg_requests(s)[-1] == ("w2", "auto")                            # 兜底：最新快照
+    finish(s)
+    edit(s, "w3")
+    s.advance(100)
+    tick_todo(s, "t1", ["done thing"])
+    assert bg_requests(s)[-1] == ("t1", "todo")                            # 兜底计时没到，勾掉 todo 照样马上合并
+    s.check_log()
+
+
+def test_todo_interval_only_guards_against_back_to_back_ticks():
+    s = boundary_sim()
+    edit(s, "a1")
+    finish(s)
+    s.advance(10)
+    tick_todo(s, "t1", ["trivial"])
+    assert bg_open(s) is None                                              # 距上一次复核开始不到 60 s
+    edit(s, "later")
+    s.advance(51)
+    s.tick()
+    assert bg_requests(s)[-1] == ("t1", "todo")                            # 时钟补发，选的仍是锚点
+    s.check_log()
+
+
+def test_rejected_todo_snapshot_is_not_retried_and_older_anchors_are_not_revisited():
+    s = boundary_sim()
+    edit(s, "a1")
+    tick_todo(s, "t1", ["one"], "two")
+    tick_todo(s, "t2", ["one", "two"], "three")
+    finish(s)
+    s.advance(61)
+    s.tick()
+    assert bg_requests(s)[-1] == ("t2", "todo")
+    finish(s, merge=False)                                                 # 复核不批准 t2
+    g = s.g
+    assert g.head == 1 and {t.title: t.status for t in g.todos.values()}["one"] == "completed"
+    s.advance(61)
+    s.tick()
+    assert bg_open(s) is None                                              # 不回退去试 t1（反馈已给 worker）
+    tick_todo(s, "t3", ["one", "two", "three"])
+    assert bg_requests(s)[-1] == ("t3", "todo")
+    finish(s)
+    assert all(t.status == "anchored" for t in s.g.todos.values())        # t3 包含 t1、t2 的锚点
+    s.check_log()
+
+
+def test_gate_rejected_todo_does_not_block_the_next_one_and_untestable_anchor_falls_back():
+    s = boundary_sim()
+    edit(s, "a1")
+    finish(s)
+    s.advance(61)
+    tick_todo(s, "t1", ["one"], "two", overrides={MUL: "FAILED"})
+    finish(s)
+    t1 = next(a for a in s.g.attempts.values() if a.tree == "t1")
+    assert t1.status == "rejected" and t1.reason == "regression" and s.g.todos["P1"].status == "completed"
+    tick_todo(s, "t2", ["one", "two"], "three")                            # 被回归门拒绝的锚点不挡后面的 todo
+    assert bg_requests(s)[-1] == ("t2", "todo")
+    finish(s)
+    assert s.g.todos["P1"].status == "anchored"                            # t2 包含 t1 的锚点
+    s.advance(61)
+    tick_todo(s, "t3", ["one", "two", "three"], "four")
+    a = bg_open(s)
+    for jid in a.jobs:
+        s.finish_job(jid)
+    tick_todo(s, "t4", ["one", "two", "three", "four"], "five", testable=False)   # 编译不过
+    s.review(s.running_review(), APPROVE(s, s.g.reviews[s.running_review()]))
+    tick_todo(s, "t5", ["one", "two", "three", "four", "five"], testable=False)
+    s.advance(61)
+    s.tick()
+    assert bg_open(s) is None                                              # t4、t5 都不可测，链头已含 t3
+    s.check_log()
+
+
+def test_untestable_newest_todo_falls_back_to_the_previous_anchor():
+    s = boundary_sim()
+    edit(s, "a1")
+    tick_todo(s, "t1", ["one"], "two")
+    tick_todo(s, "t2", ["one", "two"], "three", testable=False)
+    edit(s, "after")
+    finish(s)
+    s.advance(61)
+    s.tick()
+    assert bg_requests(s)[-1] == ("t1", "todo") and bg_open(s).summary == "one"
+    s.check_log()
+
+
+def test_a_revert_snapshot_is_a_barrier_for_older_anchors():
+    s = boundary_sim()
+    edit(s, "a1")
+    tick_todo(s, "t1", ["one"], "two", overrides={Z: "FAILED"})            # 带着坏改动勾掉了 todo
+    edit(s, "rv", reason="revert")                                         # worker 撤回了定位到的坏改动
+    edit(s, "after")
+    finish(s)
+    s.advance(61)
+    s.tick()
+    assert bg_open(s) is None                                              # 不合并 revert 之前的锚点
+    s.advance(900)
+    s.tick()
+    assert bg_requests(s)[-1] == ("after", "auto")
+    s.check_log()
+
+
+def test_handoff_is_a_boundary_too_and_the_newest_boundary_wins():
+    s = boundary_sim()
+    edit(s, "a1")
+    tick_todo(s, "t1", ["one"], "two")
+    edit(s, "h1", reason="handoff")
+    edit(s, "mid")
+    finish(s)
+    assert bg_requests(s)[-1] == ("h1", "handoff")                         # 交接不受间隔限制，且比 t1 新
+    finish(s)
+    assert s.g.todos["P1"].status == "anchored"
+    s.advance(5)
+    edit(s, "h2", reason="handoff")
+    tick_todo(s, "t2", ["one", "two"])
+    s.tick()
+    assert bg_requests(s)[-1] == ("h2", "handoff")                         # 间隔内：交接马上合并
+    finish(s)
+    s.advance(61)
+    s.tick()
+    assert bg_requests(s)[-1] == ("t2", "todo")                            # 更新的 t2 随后照常
+    s.check_log()
+
+
+def test_auto_does_not_fall_back_to_an_older_intermediate_state():
+    s = boundary_sim()
+    edit(s, "a1")
+    finish(s)
+    edit(s, "x")
+    s.snap("a1")                                                           # worker 又改回了链头
+    s.advance(901)
+    s.tick()
+    assert bg_open(s) is None                                              # 不合并中间的 x
+    s.check_log()
+
+
+def test_handoff_mode_ignores_todo_anchors():
+    s = boundary_sim(background="handoff")
+    edit(s, "a1")
+    tick_todo(s, "t1", ["one"])
+    s.advance(2000)
+    s.tick()
+    assert not s.g.attempts
+    edit(s, "h1", reason="session_end")
+    assert bg_requests(s) == [("h1", "handoff")]
+
+
+def test_without_a_reviewer_todos_still_win_over_newer_edits():
+    s = sim(cfg=bgc(reviewer=False, confirm_regressions=False), auto_jobs=False)
+    edit(s, "a1")
+    tick_todo(s, "t1", ["one"], "two")
+    edit(s, "mid", {MUL: "FAILED"})                                        # 中间态还带着回归
+    finish(s)
+    assert bg_requests(s)[-1] == ("t1", "todo")
+    finish(s)
+    assert s.g.checkpoints[s.g.head].tree == "t1"
+    s.check_log()
+
+
 # ======================================================================== 复核者：证据等级、单调、分数
 
 def test_evidence_levels_are_validated_and_downgraded():

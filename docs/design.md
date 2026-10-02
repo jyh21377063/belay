@@ -114,14 +114,27 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 
 | 触发 | 车道 | 节流 |
 | --- | --- | --- |
-| 后台：空闲时最新的可测快照（比链头新、这棵树在这一段还没请求过） | bg | 两次后台复核之间至少 `merge_min_interval_sec`（默认 600 s）；只按回归门被拒的请求没有复核，不计入 |
-| 勾掉 todo（锚点快照） | bg | `merge_todo_interval_sec`（默认 180 s） |
+| 勾掉 todo：最新的锚点快照（哪怕 worker 之后又改了别的） | bg | 距上一次后台复核开始至少 `merge_todo_interval_sec`（默认 60 s，只防连续勾掉琐碎条目） |
 | 交接 / 会话结束的快照 | bg | 不节流 |
+| 兜底（auto）：没有边界快照时的最新可测快照 | bg | 距上一次后台复核开始至少 `merge_min_interval_sec`（默认 900 s） |
 | submit | fg | 不节流；取代正在进行的后台请求（作业按树复用，复核取消） |
 | 收尾（最新快照还没合并） | fg | 在截止预留里做 |
 
-没有复核者时（`reviewer=False`）不节流：回归门只花 CPU。时钟（`tick`）会在间隔到了时补发后台请求。同一时刻每个
-worker 每条车道至多一个合并请求，整个运行同一时刻只有一个复核；前台需要复核者时取代正在复核的后台请求。
+只按回归门被拒的请求没有复核，不计入间隔。没有复核者时（`reviewer=False`）不节流：回归门只花 CPU。时钟（`tick`）
+会在间隔到了时补发后台请求。同一时刻每个 worker 每条车道至多一个合并请求，整个运行同一时刻只有一个复核；前台需要
+复核者时取代正在复核的后台请求。
+
+后台怎么挑快照（`rules._background_candidate`）：候选是这个 worker 同一段里、比链头新、比它最近一次合并请求的快照新、
+可测、树没请求过的快照。
+
+- **边界快照优先**：勾掉 todo 的锚点快照与交接 / 会话结束的快照是 worker 自己停下来的完整节点，取其中最新的一张；
+  没有边界快照才取最新的可测快照（auto），而且只取最新的那一张，它不能合并时不退回更早的中间状态。
+- **合并期间攒下的 todo 合成一次**：后台请求进行中时，新勾掉的 todo 不抢占、不排队；请求结束后重新挑候选，直接取最新
+  的边界。同一个 worker 的快照是累积的，较新的锚点包含较早的，所以合并它会一并锚定前面几个 todo（请求的标签列出它们）。
+  不抢占是为了不饥饿：worker 勾 todo 比复核快时，抢占会让链头永远不前进。submit 仍然取代后台请求。
+- **不回退**：不回到最近一次请求之前的快照（被拒的由 worker 按反馈接着改，下一个 todo 再来），也不越过 worker 撤回
+  定位到的坏改动的快照（revert），因为更早的快照里还带着那段改动。
+- `background=handoff` 与降级模式只取交接快照。
 
 ### 4.2 一个合并请求怎么走（`rules.advance_attempt`）
 
@@ -230,7 +243,8 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 | --- | --- |
 | 事件、推导、非法转换、v7 日志被拒 | `tests/unit/test_reduce.py`、`test_rules.py::test_v7_logs_are_refused_with_a_clear_error` |
 | 合并请求（节流、交接与 todo、回归门、复核）、证据等级校验、单调（已完成不退回、E3 测试、分数）、豁免由复核者裁决、复核失败的重试与降级、只判定的复核、受阻的裁决、没有回归门的路径、收尾、DONE 的条件 | `tests/unit/test_rules.py` |
-| 重放一致性（随机复核结论：失败、格式坏、豁免、分数、各种等级） | `tests/unit/test_replay.py` |
+| 后台挑快照：todo 锚点优先于之后的改动、合并期间攒下的 todo 合成一次、不抢占进行中的复核、submit 仍然取代、被拒不回退、revert 是屏障、auto 只是兜底 | `tests/unit/test_rules.py`（“边界快照”一节） |
+| 重放一致性（随机复核结论：失败、格式坏、豁免、分数、各种等级）；随机交错下后台总是挑最新的边界快照（性质检查） | `tests/unit/test_replay.py` |
 | 开场、等级与缺失项、board | `tests/unit/test_context.py` |
 | 端到端：复核会话（真实的复核目录与工具）、E2、复核失败、回归被拒、后台不批准的提醒、交接、恢复、截止 | `tests/integration/test_belay_run.py`、`test_long_run.py` |
 | 评测接入：没有 gate 时复核者与分数 | `tests/integration/test_flat_agent.py`（需要 pier） |

@@ -10,8 +10,9 @@
   reviewer=False         没有复核者：合并只看回归门；需求只由测试（E3）或 worker 的自述（E0）记下
   background=handoff     后台只在交接时发起合并请求；off 只在 submit 与收尾时合并
 
-v8 的节奏：快照照常拍（不打扰 worker）→ 后台空闲且到了间隔时，对最新的可测快照发起合并请求：回归门（全量）→
-复核者 → 合并点。submit、交接与收尾不受间隔限制。一个复核者会话的轮数与时间都有上限。
+v8 的节奏：快照照常拍（不打扰 worker）→ 后台空闲时，对最新的边界快照（勾掉 todo 的锚点、交接）发起合并请求，
+很久没有边界快照时才兜底合并最新的可测快照：回归门（全量）→ 复核者 → 合并点。submit、交接与收尾不受间隔限制。
+一个复核者会话的轮数与时间都有上限。
 """
 from __future__ import annotations
 
@@ -26,10 +27,11 @@ class BelayConfig:
     # ---- 合并
     confirm_regressions: bool = True
     protect_tests: bool = True
-    # 后台合并请求：latest = 空闲时对最新的可测快照发起；handoff = 只在交接时；off = 只有 submit 与收尾
+    # 后台合并请求：latest = 空闲时优先合并最新的边界快照（勾掉 todo / 交接），很久没有时兜底合并最新快照；
+    # handoff = 只在交接时；off = 只有 submit 与收尾
     background: str = "latest"
-    merge_min_interval_sec: float = 600     # 两次后台复核之间至少隔这么久（只按回归门被拒的请求不计）
-    merge_todo_interval_sec: float = 180    # 勾掉 todo 时的间隔（更短：是 worker 自己标出的完成点）
+    merge_min_interval_sec: float = 900     # 兜底（auto）：距上一次后台复核这么久还没有边界快照，才合并最新快照
+    merge_todo_interval_sec: float = 60     # 勾掉 todo：距上一次后台复核至少这么久（只防连续勾掉琐碎条目）
     # ---- 快照（模块 B）
     snapshot_bash_every: int = 5
     precheck_python: bool = True

@@ -5,7 +5,8 @@
 规则抛出 Rejected 时整个 Tx 被丢弃。
 
 v8：合并是唯一的正式关口，复核者是唯一的裁判。
-  - 合并请求（merge_requested）：后台空闲且到了间隔时对最新的可测快照发起；submit、交接、收尾时也发起。
+  - 合并请求（merge_requested）：后台空闲时优先对最新的边界快照（勾掉 todo、交接）发起，很久没有边界快照时才兜底
+    合并最新的可测快照；submit、收尾时也发起。
   - 回归门（有测试时，全量）：守护测试必须全过；回归只能由复核者裁决豁免（引文由规则逐字校验）。
   - 复核者：判定“不比上一个合并点差”，同一次复核里逐条判定需求并给出证据等级；规则校验证据等级
     （E3 要求引用的测试在这棵树上通过，E2 要求引用的命令确实执行过），并保证合并链单调：已完成的需求不退回、
@@ -276,37 +277,55 @@ def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
     return n
 
 
+def _todos_covered(g: Graph, snap: Snapshot) -> list:
+    """合并这张快照会一并锚定的、勾掉了还没锚定的 todo（锚点在链头之后、不晚于这张快照，同一段）。"""
+    head = g.head_cp
+    lo = head.snapshot if head.epoch == snap.epoch else 0
+    return sorted((t for t in g.todos.values() if t.status == TODO_COMPLETED and t.anchor_epoch == snap.epoch
+                   and t.anchor_snapshot is not None and lo < t.anchor_snapshot <= snap.n), key=lambda t: t.n)
+
+
 def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Snapshot, str, str]]:
-    """后台要合并的快照：这个 worker 同一段里最新的可测快照（比链头新、它的树在这一段还没请求过）。
+    """后台要合并的快照（这个 worker、同一段、可测、比链头新、比它最近一次合并请求的快照新、树没请求过）：
+    优先最新的边界快照——交接 / 会话结束的快照，或勾掉 todo 的锚点快照：worker 自己停下来的完整节点，哪怕它之后又改了
+    别的东西；没有边界快照时才取最新的快照（auto，间隔更长的兜底）。同一个 worker 的快照是累积的，较新的边界包含较早
+    的边界，所以合并期间攒下的几个 todo 合成一次请求。不回退到最近一次请求之前的快照（被拒的由 worker 按反馈接着改），
+    也不越过 worker 撤回定位到的坏改动的快照（revert）。auto 只取最新的可测快照，它不能合并时不退回更早的中间状态。
     mode=handoff 或降级模式只取交接 / 会话结束的快照。返回（快照, 触发, 标签）。"""
     head = g.head_cp
     only_handoff = g.degraded or mode == "handoff"
     tried = {a.tree for a in g.attempts.values() if a.epoch == g.epoch}
+    floor = max((a.snapshot for a in g.attempts.values() if a.worker == worker and a.epoch == g.epoch), default=0)
+    newest: Optional[Snapshot] = None
+    auto_ok = not only_handoff
     for n in sorted(g.snapshots, reverse=True):
         snap = g.snapshots[n]
         if snap.worker != worker or snap.epoch != g.epoch or snap.lost:
             continue
-        if head.epoch == snap.epoch and head.snapshot >= snap.n:
-            return None
+        if (head.epoch == snap.epoch and head.snapshot >= snap.n) or snap.n <= floor:
+            break
         if snap.reason in FOREGROUND_REASONS:
-            return None
-        if only_handoff and snap.reason not in HANDOFF_REASONS:
-            continue
-        if snap.tree == head.tree or snap.tree in tried:
-            return None
-        if not snap.testable:
-            continue
-        trig = "handoff" if snap.reason in HANDOFF_REASONS else "auto"
-        done = [t for t in g.todos.values() if t.status == TODO_COMPLETED and t.anchor_snapshot == snap.n]
-        if done and trig == "auto":
-            return snap, "todo", done[0].title
-        return snap, trig, ""
-    return None
+            break                                   # submit / 收尾的快照归前台处理
+        if snap.testable and snap.tree != head.tree and snap.tree not in tried:
+            if snap.reason in HANDOFF_REASONS:
+                return snap, "handoff", ""
+            if not only_handoff:
+                if any(t.status == TODO_COMPLETED and t.anchor_snapshot == snap.n and t.anchor_epoch == snap.epoch
+                       for t in g.todos.values()):
+                    return snap, "todo", "; ".join(t.title for t in _todos_covered(g, snap))
+                if auto_ok:
+                    newest = snap
+        if snap.testable:
+            auto_ok = False                         # auto 只取最新的可测快照，不退回更早的中间状态
+        if snap.reason == "revert":
+            break                                   # worker 撤回了定位到的坏改动：更早的快照里还带着它
+    return (newest, "auto", "") if newest is not None else None
 
 
 def _bg_due(g: Graph, cfg: BelayConfig, now: float, trigger: str) -> bool:
-    """后台复核的节流：两次后台复核之间至少隔 merge_min_interval_sec（勾掉 todo 时 merge_todo_interval_sec）；
-    交接不受限制。只按回归门被拒的请求没有复核，不计入间隔。没有复核者时不节流（回归门只花 CPU）。"""
+    """后台复核的节流：距上一次后台复核开始，勾掉 todo 至少 merge_todo_interval_sec（只防连续勾掉琐碎条目时反复请
+    复核者），兜底的 auto 至少 merge_min_interval_sec；交接不受限制。只按回归门被拒的请求没有复核，不计入间隔。
+    没有复核者时不节流（回归门只花 CPU）。"""
     if not cfg.reviewer or trigger == "handoff":
         return True
     last = last_bg_review_t(g)
@@ -317,7 +336,8 @@ def _bg_due(g: Graph, cfg: BelayConfig, now: float, trigger: str) -> bool:
 
 
 def schedule_background(tx: Tx) -> None:
-    """后台合并线：同一时刻每个 worker 最多一个合并请求；空闲且到了间隔时对最新的可测快照发起（新快照胜出）。"""
+    """后台合并线：同一时刻每个 worker 最多一个合并请求，后到的不抢占进行中的（否则 worker 勾 todo 比复核快时链头
+    永远不前进）；空闲时重新挑候选：最新的边界快照，没有时到了兜底间隔才取最新快照。submit 仍然取代后台请求。"""
     g, cfg = tx.g, tx.cfg
     if not _running_run(g) or g.run.finalizing or g.run.reserve or not g.baseline_ready or g.head_cp is None or \
             cfg.background == "off" or not g.frozen:

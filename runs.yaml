@@ -127,8 +127,8 @@ agents:
       finalize_margin_sec: 150          # 预算里留给收尾的余量（runtime 截止后还会等最后的验证最多 60 秒）
       runtime: &belay_runtime           # belay/core/config.py 的 BelayConfig；未知字段会报错；每个机制都可以关掉
         verify_slots: 1                 # 验证槽位数（并发验证作业数）；8 vCPU / 并发 2 题时建议 1
-        background: latest              # 后台空闲时对最新的可测快照发起合并请求（handoff = 只在交接时；off = 只在提交与收尾时）
-        merge_min_interval_sec: 600     # 两次后台复核之间至少隔 10 分钟（勾掉 todo 时 3 分钟；交接、submit、收尾不受限）
+        background: latest              # 后台空闲时优先合并最新的勾掉 todo / 交接的快照，很久没有才兜底合并最新快照（handoff = 只在交接时；off = 只在提交与收尾时）
+        merge_min_interval_sec: 900     # 兜底：距上一次后台复核 15 分钟还没有勾掉 todo 才合并最新快照（勾掉 todo 时 1 分钟；交接、submit、收尾不受限）
         diagnoser: true
         reviewer: true                  # 复核者：合并的裁判，逐条判定需求并给出证据等级（E3 测试 / E2 运行 / E1 审读）
         # 压缩阈值默认按 Claude Code 的量级（L1 50 万 / L2 70 万 / 硬交接 76 万 token），与 flat 的 clear / reset 对齐

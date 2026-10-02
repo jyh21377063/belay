@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -18,9 +19,9 @@ from belay.core import rules as R
 from belay.core.config import BelayConfig
 from belay.core.events import Event
 from belay.core.invariants import check, check_log, llm_effects
-from belay.core.model import graph_from_json, to_json
+from belay.core.model import TODO_COMPLETED, Graph, graph_from_json, to_json
 from belay.core.queries import chain
-from belay.core.reduce import replay
+from belay.core.reduce import apply, replay
 from belay.core.rules import Rejected
 from tests.sim import MANUAL, Sim
 
@@ -43,7 +44,8 @@ FILES = [[("pkg/mod.py", 3, 1)], [("pkg/other.py", 2, 2)], [("setup.py", 1, 0)],
 TODOS = ["read the code", "fix add (R1)", "mul negatives R2", "docstring", "speed up other (R4)"]
 
 
-def drive(seed: int, steps: int = 200):
+def drive(seed: int, steps: int = 200, boundaries: bool = False):
+    """boundaries=True：多勾 todo、偶尔撤回（revert），间隔取边界快照的默认量级——用来检查后台怎么挑快照。"""
     rnd = random.Random(seed)
     cfg = BelayConfig(stall_no_progress_sec=900, reserve_min_sec=60, confirm_regressions=rnd.random() < 0.7,
                       locate=rnd.random() < 0.9, locate_max_steps=rnd.choice([3, 8]),
@@ -51,6 +53,8 @@ def drive(seed: int, steps: int = 200):
                       reviewer=rnd.random() < 0.85, review_retries=rnd.choice([0, 1]),
                       merge_min_interval_sec=rnd.choice([0, 0, 300, 600]), merge_todo_interval_sec=rnd.choice([0, 100]),
                       waive_max_tests=rnd.choice([1, 20]), stall_same_failure=rnd.choice([2, 3]))
+    if boundaries:
+        cfg = replace(cfg, merge_min_interval_sec=rnd.choice([0, 900]), merge_todo_interval_sec=rnd.choice([0, 60]))
     s = Sim(BASE, cfg=cfg, auto_jobs=False, auto_located=rnd.random() < 0.8, reviewer=MANUAL)
     s.setup(TASK, PLAN, budget=rnd.choice([1500, 20000]))
     s.do(R.start_session, "w1", "first", {})
@@ -79,6 +83,10 @@ def drive(seed: int, steps: int = 200):
     ops = ["submit", "submit", "submit_head", "job", "job", "job", "job", "job", "job", "tick", "session", "rollback",
            "cas_fail", "snap", "snap", "snap", "snap", "todos", "todos", "diagnosis", "review", "review", "review",
            "locate_diff"]
+    reasons = ["writes", "writes", "model_test", "session_end", "handoff"]
+    if boundaries:
+        ops += ["todos", "todos", "todos", "tick", "review", "job", "job"]
+        reasons += ["writes", "revert"]
     for _ in range(steps):
         op = rnd.choice(ops)
         try:
@@ -98,11 +106,11 @@ def drive(seed: int, steps: int = 200):
                 s.do(R.request_submit, "w1", n, "on the head")
             elif op == "snap":
                 tree = new_tree() if rnd.random() < 0.85 else s.g.head_cp.tree
-                s.snap(tree, files=rnd.choice(FILES), testable=rnd.random() < 0.9,
-                       reason=rnd.choice(["writes", "writes", "model_test", "session_end", "handoff"]))
+                s.snap(tree, files=rnd.choice(FILES), testable=rnd.random() < 0.9, reason=rnd.choice(reasons))
             elif op == "todos":
                 todos = todo_list()
-                n = s.snap(new_tree(), reason="todo") if R.newly_completed(s.g, todos) else None
+                n = s.snap(new_tree(), reason="todo", testable=not boundaries or rnd.random() < 0.9) \
+                    if R.newly_completed(s.g, todos) else None
                 s.do(R.update_todos, "w1", todos, n)
             elif op == "job" and s.pending_jobs:
                 jid = rnd.choice(list(s.pending_jobs))
@@ -218,3 +226,85 @@ def test_fuzz_actually_exercises_the_rules():
             "requirement_regression"} <= reasons, reasons
     assert {"accepted", "returned"} <= statuses, statuses
     assert {"E0", "E1", "E2", "E3"} <= levels, levels
+
+
+# ======================================================================== 后台挑快照：边界快照优先（性质检查）
+
+def _bg_choice_problems(log, cfg: BelayConfig) -> tuple[list[str], dict]:
+    """逐个事件重放；每个后台合并请求发起前的那一刻检查它挑的快照：
+      - 不回退：比这个 worker 同一段里之前所有请求的快照都新；
+      - 只有一个：发起时这个 worker 没有别的进行中的请求（不抢占、不排队）；
+      - 边界优先：auto 发起时，链头 / 上次请求之后、撤回（revert）之后没有可合并的边界快照（勾掉 todo 的锚点、交接）；
+        todo / 交接发起时，它之后也没有更新的可合并边界；
+      - auto 只取最新的可测快照；交接模式与降级时只有交接。"""
+    problems, seen = [], {"auto": 0, "todo": 0, "handoff": 0, "coalesced": 0}
+    g = Graph()
+    for e in log:
+        if e.type == "merge_requested" and e.get("lane") == "bg":
+            w, n, trig = e.get("worker"), int(e.get("snapshot")), e.get("trigger")
+            seen[trig if trig in seen else "handoff"] += 1
+            mine = [a for a in g.attempts.values() if a.worker == w and a.epoch == g.epoch]
+            floor = max((a.snapshot for a in mine), default=0)
+            tried = {a.tree for a in g.attempts.values() if a.epoch == g.epoch}
+            head = g.head_cp
+            lo = max(floor, head.snapshot if head.epoch == g.epoch else 0)
+            where = f"seq {e.seq} {trig}@{n}"
+            if n <= floor:
+                problems.append(f"{where}: went back to or before snapshot {floor}")
+            if any(a.status in ("pending", "advancing") and a.lane == "bg" for a in mine):
+                problems.append(f"{where}: another background request was still open")
+            if (cfg.background == "handoff" or g.degraded) and trig != "handoff":
+                problems.append(f"{where}: only handoffs should merge in this mode")
+
+            def boundary(k: int) -> bool:
+                s = g.snapshots[k]
+                if not s.testable or s.tree == head.tree or s.tree in tried:
+                    return False
+                if cfg.background == "handoff" or g.degraded:
+                    return s.reason in R.HANDOFF_REASONS
+                return s.reason in R.HANDOFF_REASONS or any(
+                    t.status == TODO_COMPLETED and t.anchor_snapshot == k and t.anchor_epoch == s.epoch
+                    for t in g.todos.values())
+
+            later = sorted((k for k, s in g.snapshots.items() if s.worker == w and s.epoch == g.epoch and not s.lost
+                            and k > lo), reverse=True)
+            for k in later:                                          # 从最新往回，直到撤回或前台快照
+                s = g.snapshots[k]
+                if s.reason in R.FOREGROUND_REASONS:
+                    break
+                if k == n:
+                    if trig == "todo" and not boundary(k):
+                        problems.append(f"{where}: not a todo anchor")
+                    if trig == "todo" and len([t for t in g.todos.values() if t.status == TODO_COMPLETED
+                                               and t.anchor_epoch == s.epoch and lo < (t.anchor_snapshot or 0) <= k]) > 1:
+                        seen["coalesced"] += 1
+                    if trig == "auto" and s.reason != "revert":
+                        continue                                     # auto：更早的也不能是边界（撤回之前的除外）
+                    break
+                if boundary(k):
+                    problems.append(f"{where}: skipped the newer boundary snapshot {k} ({s.reason})")
+                    break
+                if trig == "auto" and s.testable and k > n:
+                    problems.append(f"{where}: snapshot {k} is newer and testable")
+                    break
+                if s.reason == "revert":
+                    break
+        g = apply(g, e)
+    return problems, seen
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_background_picks_the_newest_boundary_under_random_interleavings(seed):
+    s, _ = drive(1000 + seed, steps=250, boundaries=True)
+    problems, _ = _bg_choice_problems(s.log, s.cfg)
+    assert not problems, problems
+    assert not check_log(s.log) and replay(s.log) == s.g
+
+
+def test_boundary_fuzz_actually_coalesces_todos_and_falls_back_to_auto():
+    total = {"auto": 0, "todo": 0, "handoff": 0, "coalesced": 0}
+    for seed in range(60):
+        s, _ = drive(1000 + seed, steps=250, boundaries=True)
+        for k, v in _bg_choice_problems(s.log, s.cfg)[1].items():
+            total[k] += v
+    assert all(v >= 5 for v in total.values()), total
