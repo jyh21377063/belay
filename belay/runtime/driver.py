@@ -42,14 +42,12 @@ from belay.runtime.port import WorkerPort
 from belay.runtime.prompts import DIAGNOSE_SYSTEM, system_prompt
 from belay.runtime.reviewer import Reviewer
 from belay.runtime.runtime import Runtime
-from belay.runtime.session import BelaySession, ModelCallFailed, load_transcript_messages
+from belay.runtime.session import TEST_CMD, BelaySession, ModelCallFailed, load_transcript_messages
 from belay.runtime.store import EventStore
 from belay.runtime.verifier import RunnerVerifier, VerifierSpec
 from belay.tools import EXPLORE_TOOLS, Policy, get_belay_tools, get_tools
 from belay.worker.transcript import Transcript
 
-TEST_CMD = re.compile(r"\b(pytest|py\.test|nosetests|tox|cargo\s+test|go\s+test|mvn\s+(\S+\s+)*test|gradle\w*\s+test|"
-                      r"npm\s+(run\s+)?test|yarn\s+test|jest|mocha|make(\s+\S+)*\s+(test|check)|ctest|unittest)\b")
 
 
 def _reply_json(resp, key: Optional[str] = None) -> Optional[dict]:
@@ -143,6 +141,10 @@ class _Hooks:
 
     def has_active_todo(self) -> bool:
         return current_todo(self.run.rt.graph) is not None
+
+    def active_todo_title(self) -> Optional[str]:
+        t = current_todo(self.run.rt.graph)
+        return t.title if t is not None else None
 
     def has_todos(self) -> bool:
         return bool(self.run.rt.graph.todos)

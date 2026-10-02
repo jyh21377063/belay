@@ -136,6 +136,19 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
   定位到的坏改动的快照（revert），因为更早的快照里还带着那段改动。
 - `background=handoff` 与降级模式只取交接快照。
 
+勾掉 todo 决定了后台什么时候合并、合并哪一张，所以会话循环（`session._todo_notes`）在工具结果后附 system-reminder
+提醒 worker 勾选，但只按事件提醒、不强推（Claude Code 按空闲轮数重复提醒、每次重贴整份列表，被反馈过于频繁、诱导
+“表演式”地改 todo）：
+
+| 提醒 | 什么时候 | 上限 |
+| --- | --- | --- |
+| 做完了就勾掉（`todo_done_nudge`） | 这一轮跑了测试命令、有进行中的条目、上次更新 todo 之后成功改过文件、最近 `todo_done_nudge_quiet_turns`（3）轮没碰过 todo；只带上进行中那一条的标题 | 同一条目 `todo_done_nudge_max`（2）次，两次之间至少 `todo_done_nudge_gap_turns`（8）轮 |
+| 第一次改文件、还没有 todo | 一次 | 1 |
+| 很久没更新（`todo_reminder_turns`，30 轮） | 有进行中的条目时带上它的标题，并说明勾选会触发复核 | 每个会话 `todo_reminder_max`（3）次 |
+
+交接后的新会话里模型还没写过列表时，进行中的条目从图上取。提醒都写进会话轨迹（`notices`），以后可以统计“提醒 → 勾选”
+的转化。worker 不勾时 auto 兜底仍会合并进度，提醒失灵的代价只是合并点不够干净。
+
 ### 4.2 一个合并请求怎么走（`rules.advance_attempt`）
 
 1. 被链头超过（同一段、快照序号不大于链头）或就是链头的树 → `merge_superseded`。
@@ -234,7 +247,8 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 ## 10. 配置（`core/config.py`，新增与变化）
 
 `merge_min_interval_sec`、`merge_todo_interval_sec`、`review_max_turns`、`review_max_sec`、`review_run_timeout_sec`、
-`review_retries`、`review_input_chars`、`review_locate_wait_sec`、`score_tolerance`、`notify_misses`、`reserve_review_sec`。
+`review_retries`、`review_input_chars`、`review_locate_wait_sec`、`score_tolerance`、`notify_misses`、`reserve_review_sec`、
+`todo_done_nudge`、`todo_done_nudge_max`、`todo_done_nudge_gap_turns`、`todo_done_nudge_quiet_turns`。
 取消：`checkpoint_tier`、`deliver_unconfirmed`、`review_batch`、`review_max_reopens`、`labeler`、`label_every`。
 
 ## 11. 测试（`python -m pytest -q`，不需要容器和模型）
@@ -244,7 +258,8 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 | 事件、推导、非法转换、v7 日志被拒 | `tests/unit/test_reduce.py`、`test_rules.py::test_v7_logs_are_refused_with_a_clear_error` |
 | 合并请求（节流、交接与 todo、回归门、复核）、证据等级校验、单调（已完成不退回、E3 测试、分数）、豁免由复核者裁决、复核失败的重试与降级、只判定的复核、受阻的裁决、没有回归门的路径、收尾、DONE 的条件 | `tests/unit/test_rules.py` |
 | 后台挑快照：todo 锚点优先于之后的改动、合并期间攒下的 todo 合成一次、不抢占进行中的复核、submit 仍然取代、被拒不回退、revert 是屏障、auto 只是兜底 | `tests/unit/test_rules.py`（“边界快照”一节） |
+| todo 提醒的触发与节流（跑完测试、有进行中的条目、改过文件；同一条目上限与间隔；交接后从图上取条目） | `tests/unit/test_todo_reminders.py` |
 | 重放一致性（随机复核结论：失败、格式坏、豁免、分数、各种等级）；随机交错下后台总是挑最新的边界快照（性质检查） | `tests/unit/test_replay.py` |
 | 开场、等级与缺失项、board | `tests/unit/test_context.py` |
-| 端到端：复核会话（真实的复核目录与工具）、E2、复核失败、回归被拒、后台不批准的提醒、交接、恢复、截止 | `tests/integration/test_belay_run.py`、`test_long_run.py` |
+| 端到端：复核会话（真实的复核目录与工具）、E2、复核失败、回归被拒、后台不批准的提醒、跑完测试后提醒勾掉 todo、交接、恢复、截止 | `tests/integration/test_belay_run.py`、`test_long_run.py` |
 | 评测接入：没有 gate 时复核者与分数 | `tests/integration/test_flat_agent.py`（需要 pier） |

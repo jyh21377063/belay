@@ -9,6 +9,7 @@
   diagnoser=False        不做 LLM 诊断，worker 只拿到规则定位的结果
   reviewer=False         没有复核者：合并只看回归门；需求只由测试（E3）或 worker 的自述（E0）记下
   background=handoff     后台只在交接时发起合并请求；off 只在 submit 与收尾时合并
+  todo_done_nudge=False  跑完测试后不提醒“做完了就勾掉”（只留第一次与长时间没更新的 todo 提醒）
 
 v8 的节奏：快照照常拍（不打扰 worker）→ 后台空闲时，对最新的边界快照（勾掉 todo 的锚点、交接）发起合并请求，
 很久没有边界快照时才兜底合并最新的可测快照：回归门（全量）→ 复核者 → 合并点。submit、交接与收尾不受间隔限制。
@@ -87,6 +88,11 @@ class BelayConfig:
     handoff_soft_tokens: int = 0
     todo_reminder_turns: int = 30
     todo_reminder_max: int = 3
+    # 跑完测试、有进行中的 todo、上次更新 todo 之后改过文件时，提醒一句“做完了就勾掉”（勾掉是后台合并的时机）
+    todo_done_nudge: bool = True
+    todo_done_nudge_max: int = 2            # 同一条目最多提醒几次
+    todo_done_nudge_gap_turns: int = 8      # 两次提醒之间至少隔这么多轮
+    todo_done_nudge_quiet_turns: int = 3    # 最近这么多轮刚更新过 todo 时不提醒
     # ---- 上下文（模块 I）
     graph_context: bool = True
     opening_budget_tokens: int = 24_000

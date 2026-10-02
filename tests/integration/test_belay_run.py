@@ -318,6 +318,30 @@ def test_regression_rejected_and_test_changes_are_not_delivered(tmp_path):
     h.verify_log(run)
 
 
+# ======================================================================== 跑完测试：提醒“做完了就勾掉”
+
+def test_running_tests_with_an_item_in_progress_nudges_to_tick_it(tmp_path):
+    h = Harness(tmp_path)
+    todos = tu("t", "todo_write", todos=[{"content": "fix add (R2)", "status": "in_progress"},
+                                         {"content": "add sub (R3)", "status": "pending"}])
+    pytest_ = tu("pt", "bash", command="python -m pytest -q -p no:cacheprovider tests")
+    tick = tu("t2", "todo_write", todos=[{"content": "fix add (R2)", "status": "completed"},
+                                         {"content": "add sub (R3)", "status": "in_progress"}])
+    llm = ScriptedLLM([PLANNER, call(todos), call(READ), call(tu("rt", "read_file", file_path="tests/test_mod.py")),
+                       call(FIX_ADD), call(pytest_), call(tick), call(ADD_SUB), call(SUBMIT)])
+    run = h.make(llm)
+    res = asyncio.run(run.start(TASK))
+    assert res.status == "DONE", run.rt.graph.run.status_reasons
+    last = [json.dumps(r["messages"][-1]["content"]) for r in llm.requests]
+    hits = [i for i, x in enumerate(last) if "You just ran tests" in x]
+    assert len(hits) == 1 and '"tool_use_id": "pt"' in last[hits[0]]       # 只在跑完测试的那一轮之后
+    assert "fix add (R2)" in last[hits[0]] and "reviews and merges" in last[hits[0]]
+    g = run.rt.graph
+    p = next(t for t in g.todos.values() if t.title == "fix add (R2)")
+    assert p.status == "anchored" and p.checkpoint is not None              # 提醒之后勾掉的条目进了合并链
+    h.verify_log(run)
+
+
 # ======================================================================== 停下不调用工具：先追问，再当作提交
 
 def test_stopping_is_nudged_then_treated_as_a_submit(tmp_path):

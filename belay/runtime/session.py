@@ -7,7 +7,8 @@
     再交接；
   - 工具边界上的钩子：模型跑测试前拍快照、写类工具之后拍快照、todo 列表镜像到图上；
   - submit 被接受时会话结束；模型停下不调用工具时先追问一次，再次停下就当作提交（结果交还给它，会话继续）；
-  - todo 提醒（学 Claude Code）：第一次改文件时还没有 todo 提醒一次，之后长时间没更新再提醒，有上限；
+  - todo 提醒（学 Claude Code，但按事件）：第一次改文件时还没有 todo 提醒一次；刚跑完测试、有进行中的条目、之后改过
+    文件时提醒一句“做完了就勾掉”（勾掉是后台合并的时机；同一条目有上限）；之后长时间没更新再提醒，有上限；
   - 每条追加进对话的消息都写进轨迹（message 记录），整体替换时写 messages_checkpoint：runtime 崩溃后可以读盘重放；
   - 模型接口多次重试仍失败时抛 ModelCallFailed：驱动可以在内存里原样重试同一个会话。
 会话返回时给出结束原因：submitted（提交被接受）| done（模型不再调用工具，隐式提交用完）| handoff（L4 / 自然停顿点）|
@@ -18,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 
@@ -30,11 +32,20 @@ from belay.tools import Policy, Tool, ToolContext, ToolError
 from belay.worker.transcript import Transcript
 
 WRITE_TOOLS = ("edit_file", "write_file", "bash")
+# 模型自己跑测试 / 构建的命令：跑之前拍快照（driver），跑完之后可能提醒勾掉 todo（_todo_notes）
+TEST_CMD = re.compile(r"\b(pytest|py\.test|nosetests|tox|cargo\s+test|go\s+test|mvn\s+(\S+\s+)*test|gradle\w*\s+test|"
+                      r"npm\s+(run\s+)?test|yarn\s+test|jest|mocha|make(\s+\S+)*\s+(test|check)|ctest|unittest)\b")
 NUDGE = "If every requirement is done, call submit; otherwise continue working."
 TODO_FIRST = ("Keeping a todo list (todo_write) is how your progress survives a context reset; for a simple change "
               "you can skip it.")
 TODO_STALE = ("The todo list has not been updated recently. If it no longer matches what you are doing, update it; "
               "if it is not useful for this task, ignore this note.")
+TODO_STALE_ACTIVE = ("The todo list has not been updated recently. If \"{title}\" (in progress) is fully done, mark it "
+                     "completed: ticking an item is when the harness reviews and merges your work. If the list no "
+                     "longer matches what you are doing, update it; otherwise ignore this note.")
+TODO_DONE = ("You just ran tests while \"{title}\" is in progress. If it is now fully done, mark it completed with "
+             "todo_write: ticking an item is when the harness reviews and merges your work. If it is not done yet, "
+             "carry on and ignore this note.")
 
 
 class ModelCallFailed(RuntimeError):
@@ -61,6 +72,7 @@ class SessionHooks(Protocol):
     def write_guard(self): ...                          # 降级模式下写类工具与切换工作区的验证互斥（异步上下文管理器）
     def boundary_count(self) -> int: ...               # 自然停顿点计数：勾掉 todo、模型要跑测试、拿到提交结果
     def has_active_todo(self) -> bool: ...
+    def active_todo_title(self) -> Optional[str]: ...  # 图上进行中的 todo（会话刚开始、模型还没写过列表时用）
     def has_todos(self) -> bool: ...
     async def implicit_submit(self, summary: str) -> tuple[str, bool]: ...   # 模型停下不调用工具时当作提交
 
@@ -109,6 +121,9 @@ class BelaySession:
         self.implicit_submits = 0
         self._last_todo_turn = 0
         self._todo_reminders = 0
+        self._writes_since_todo = 0                    # 上次更新 todo 之后成功改文件的次数
+        self._done_nudges: dict[str, int] = {}         # 进行中的条目 → 已提醒“做完就勾掉”的次数
+        self._last_done_nudge = -10**9
 
     # ---------------------------------------------------------------- 主循环
     async def run(self) -> SessionOutcome:
@@ -215,26 +230,53 @@ class BelaySession:
             f"result:\n{reply}</system-reminder>")}]})
         return None
 
+    def _active_title(self) -> Optional[str]:
+        """进行中的 todo：先看模型这个会话写的列表；还没写过时看图（交接后新会话的开场里有列表）。"""
+        if self.ctx.todos:
+            return next((t["content"] for t in self.ctx.todos if t.get("status") == "in_progress"), None)
+        title = getattr(self.hooks, "active_todo_title", lambda: None)()
+        return title or None
+
     def _todo_notes(self, tool_uses: list[dict], results: list) -> list[str]:
-        """学 Claude Code 的 todo 提醒：第一次改文件时还没有 todo 提醒一次；之后长时间没更新再提醒；有上限。"""
+        """todo 提醒（学 Claude Code，但按事件而不是只按轮数）：
+          - 第一次改文件时还没有 todo，提醒一次；
+          - 刚跑完测试、有进行中的条目、上次更新 todo 之后改过文件：提醒一句“做完了就勾掉”——勾掉是后台合并的时机。
+            最近几轮刚更新过 todo 时不提醒；同一条目最多 todo_done_nudge_max 次，两次之间至少隔几轮；
+          - 很久没更新：再提醒（带上进行中的条目），有上限。"""
         if "todo_write" not in self.tools:
             return []
         if any(tu["name"] == "todo_write" for tu in tool_uses):
             self._last_todo_turn = self.turns
-            return []
-        if self._todo_reminders >= self.cfg.todo_reminder_max:
+            self._writes_since_todo = 0
             return []
         wrote = any(tu["name"] in ("edit_file", "write_file") and not err
                     for tu, (_out, err) in zip(tool_uses, results))
+        if wrote:
+            self._writes_since_todo += 1
+        cfg = self.cfg
+        tested = any(tu["name"] == "bash" and not err and TEST_CMD.search(str((tu.get("input") or {}).get("command") or ""))
+                     for tu, (_out, err) in zip(tool_uses, results))
+        if cfg.todo_done_nudge and tested and self._writes_since_todo > 0 and \
+                self.turns - self._last_todo_turn > cfg.todo_done_nudge_quiet_turns and \
+                self.turns - self._last_done_nudge >= cfg.todo_done_nudge_gap_turns:
+            title = self._active_title()
+            if title and self._done_nudges.get(title, 0) < cfg.todo_done_nudge_max:
+                self._done_nudges[title] = self._done_nudges.get(title, 0) + 1
+                self._last_done_nudge = self.turns
+                self._last_todo_turn = self.turns           # 很久没更新的提醒从这里重新计时
+                return [TODO_DONE.format(title=title[:200])]
+        if self._todo_reminders >= cfg.todo_reminder_max:
+            return []
         if wrote and self._todo_reminders == 0 and not self.ctx.todos and not self.hooks.has_todos():
             self._todo_reminders += 1
             self._last_todo_turn = self.turns
             return [TODO_FIRST]
-        if self.turns - self._last_todo_turn >= self.cfg.todo_reminder_turns and \
+        if self.turns - self._last_todo_turn >= cfg.todo_reminder_turns and \
                 (self.ctx.todos or self.hooks.has_todos() or self._todo_reminders > 0):
             self._todo_reminders += 1
             self._last_todo_turn = self.turns
-            return [TODO_STALE]
+            title = self._active_title()
+            return [TODO_STALE_ACTIVE.format(title=title[:200]) if title else TODO_STALE]
         return []
 
     async def _call(self, tool_choice: Optional[dict] = None, messages: Optional[list[dict]] = None,
