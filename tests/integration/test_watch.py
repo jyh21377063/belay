@@ -1,4 +1,4 @@
-"""eval.watch：两种日志格式（Claude Code 的 stream-json、自研 worker 的 transcript.jsonl）。"""
+"""eval.watch：Claude Code 的 stream-json、自研 worker 的 transcript.jsonl、Belay 的会话 / 复核轨迹与合并链。"""
 from __future__ import annotations
 
 import asyncio
@@ -64,3 +64,26 @@ def test_watch_still_renders_claude_code_logs(tmp_path, capsys):
     for phrase in ["会话开始  model=deepseek-flash", "💬 Looking at the code.", "🔧 Edit: /testbed/a.py",
                    "TodoWrite: 1/1 完成", "agent 结束：success", "改过 1 个文件"]:
         assert phrase in out, phrase
+
+
+def test_watch_shows_belay_merge_chain_and_reviewer(tmp_path, capsys):
+    from tests.integration.test_belay_run import (ADD_SUB, FIX_ADD, PLANNER, READ, SUBMIT, TASK, Harness, call)
+    h = Harness(tmp_path)
+    run = h.make(ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(ADD_SUB), call(SUBMIT)]))
+    assert asyncio.run(run.start(TASK)).status == "DONE"
+    d = h.run_dir()
+    vid = run.rt.graph.checkpoints[run.rt.graph.run.delivered].review
+
+    watch.main([str(d / "sessions" / "S1.jsonl"), "--no-follow"])            # 会话轨迹里穿插合并链
+    out = capsys.readouterr().out
+    for phrase in ["📦 合并请求 A", f"🔎 复核 {vid} 开始", f"🧑‍⚖️ 复核 {vid} 结论：建议合并",
+                   "规则校验通过", "🟢 合并点 #", "需求 R3 → done（E1），由复核者", "📦 交付合并点", "合并链：链头 #"]:
+        assert phrase in out, phrase
+
+    watch.main([str(d / "events.jsonl"), "--chain", "--no-follow"])          # 只看合并链
+    out = capsys.readouterr().out
+    assert "运行开始 Belay v8" in out and "需求 R2 → done（E3），由测试" in out and "已交付 #" in out and "🔧" not in out
+
+    watch.main([str(d / "reviews" / f"{vid}.jsonl"), "--no-follow"])        # 复核者的轨迹
+    out = capsys.readouterr().out
+    assert "🔧 verdict: 建议合并" in out and "复核会话结束" in out and "接下来是评分" not in out
