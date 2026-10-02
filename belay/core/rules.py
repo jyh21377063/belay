@@ -1,52 +1,52 @@
-"""状态转换规则：输入（worker 请求、观察、时钟）→ 事件。全部是纯函数。
+"""状态转换规则：输入（worker 请求、观察、复核结论、时钟）→ 事件。全部是纯函数。
 
 每个规则函数的第一个参数是 Tx：规则在 Tx 上 emit 事件，Tx 立刻把事件应用到自己的图副本上，
-所以同一个规则里后面的判断看到的是前面事件之后的状态（例如“存档创建后立即判定提交”）。
-runtime 在锁里调用规则，成功后把 tx.events 原样追加到日志；规则抛出 Rejected 时整个 Tx 被丢弃。
+所以同一个规则里后面的判断看到的是前面事件之后的状态。runtime 在锁里调用规则，成功后把 tx.events 原样追加到日志；
+规则抛出 Rejected 时整个 Tx 被丢弃。
 
-v7：worker 只做自然的事（读、改、跑测试、可选的 todo），唯一要求它做的声明是 submit。其余状态都由图从观察推出：
-  - 后台空闲时验证最新的可测快照（新快照胜出），通过就成为暂存点；
-  - 需求的证据检查（原始代码上不通过的已有测试）在链上存档里全部通过 → requirement_verified（rule）；
-  - submit：前台存档 → 逐条判定需求（verified / submitted / blocked / 证据失败）→ 复查者批量收紧 → 接受或交还清单。
-“验证通过”“存档”“提升”只能由观察到的证据完成；submitted / blocked 是自述，账本如实区分；
-LLM（诊断者、复查者）只能解释、只能收紧（重开需求），不能放宽。
+v8：合并是唯一的正式关口，复核者是唯一的裁判。
+  - 合并请求（merge_requested）：后台空闲且到了间隔时对最新的可测快照发起；submit、交接、收尾时也发起。
+  - 回归门（有测试时，全量）：守护测试必须全过；回归只能由复核者裁决豁免（引文由规则逐字校验）。
+  - 复核者：判定“不比上一个合并点差”，同一次复核里逐条判定需求并给出证据等级；规则校验证据等级
+    （E3 要求引用的测试在这棵树上通过，E2 要求引用的命令确实执行过），并保证合并链单调：已完成的需求不退回、
+    分数不下降。复核者不可用（失败重试后仍失败）时只按回归门合并，需求只由测试（E3）或自述（E0）记下。
+  - 交付的永远是链头。
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from belay.core.config import BelayConfig
 from belay.core.events import (COMPACTOR, DIAGNOSER, LLM, OBSERVED, PLANNER, REVIEWER, RULE, RUNTIME, SELF_REPORT,
                                VERIFIER, Event, worker_actor)
-from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_PENDING, ATT_REJECTED, CONFIRMED, JOB_CANCELLED,
-                              JOB_FINISHED, JOB_RUNNING, JOB_UNKNOWN, KIND_AUTO, KIND_FINAL, KIND_HANDOFF,
-                              KIND_SUBMIT, KIND_TODO, LANE_BG, LANE_FG, PROVISIONAL, REQ_BLOCKED, REQ_OPEN,
-                              REQ_SUBMITTED, REQ_VERIFIED, RUN_RUNNING, SUB_CHECKPOINTED, SUB_OPEN, SUB_PENDING,
-                              SUB_REVIEWING, TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED, TODO_PENDING, WHERE_LIVE,
-                              WHERE_SLOT, WHERE_WORKSPACE, Graph, Snapshot)
+from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, ATT_REJECTED, BY_CHECKS,
+                              BY_REVIEW, BY_ROLLBACK, BY_SELF, E0, E1, E2, E3, J_BLOCKED, J_DONE, J_NOT_DONE,
+                              J_PARTIAL, JOB_CANCELLED, JOB_FINISHED, JOB_RUNNING, JOB_UNKNOWN, LANE_BG, LANE_FG,
+                              LEVEL_RANK, LEVELS, REQ_BLOCKED, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_FAILED,
+                              REV_RECORDED, REV_RUNNING, RUN_RUNNING, SUB_PENDING, TODO_ACTIVE, TODO_ANCHORED,
+                              TODO_COMPLETED, TODO_PENDING, WHERE_LIVE, WHERE_SLOT, WHERE_WORKSPACE, Attempt, Graph,
+                              Review, Snapshot)
 from belay.core.plan import normalize_ws, quote_in_text
-from belay.core.queries import (actionable, chain, chain_ids, consecutive_crashes, current_todo, evidence_checks,
-                                is_ancestor, last_session, latest_milestone, latest_snapshot, latest_submit,
-                                mentioned_requirements, next_id, num, open_attempt, open_persistent, open_requirements,
-                                open_submit, remaining_sec, reserve_sec, reviews_running, sessions_without_progress,
-                                snapshot_contained, snapshots_in_epoch, submit_accepted, todos_in_order)
+from belay.core.queries import (actionable, broken_requirements, chain, chain_ids, consecutive_crashes,
+                                current_todo, delivery_checkpoint, evidence_checks, is_ancestor, judged_on_tree,
+                                last_bg_review_t, last_score, last_session, latest_snapshot, mentioned_requirements,
+                                next_id, num, open_attempt, open_persistent, open_requirements, open_submit,
+                                remaining_sec, reserve_sec, running_review, sessions_without_progress,
+                                snapshot_contained, snapshots_in_epoch, status_reasons, submit_accepted,
+                                todos_in_order)
 from belay.core.reduce import apply
-from belay.core.verify import (PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED, check_unit,
-                               classify_baseline, failure_signature, finished_covers, full_verified, jobs_by_tree,
-                               active_guard, guard_in_selection, guard_set, is_cmd, is_test_path, job_key,
-                               point_status, regression_ids, regressions, related_units, results_for_tree,
-                               running_covers, suite_layout, test_files_of, units)
+from belay.core.verify import (B_PASS, PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_UNTESTED, active_guard, check_unit,
+                               classify_baseline, failure_signature, full_verified, guard_set, is_cmd, job_key,
+                               jobs_by_tree, point_status, regression_ids, regressions, results_for_tree, units)
 
 BLOCK_KINDS = ("insufficient_info", "environment", "check_conflict")
-REVIEWED_BLOCK_KINDS = ("insufficient_info", "environment")     # 复查者会追问的受阻：有没有合理读法 / 能不能在仓库里做到
-TRIGGER_KIND = {"auto": KIND_AUTO, "todo": KIND_TODO, "submit": KIND_SUBMIT, "handoff": KIND_HANDOFF,
-                "session_end": KIND_HANDOFF, "deadline": KIND_FINAL, "final": KIND_FINAL}
 HANDOFF_REASONS = ("handoff", "session_end")
-# 为前台意图拍的快照：由发起者自己验证，后台不取
+# 为前台意图拍的快照：由发起者自己发起合并请求，后台不取
 FOREGROUND_REASONS = ("submit", "final", "deadline")
-# worker 声明“做完了”的存档：只有它们被拒或被降级时才定位、诊断并通知 worker
-DECLARED_KINDS = (KIND_SUBMIT,)
+# 有人在等结论的合并请求（被拒时定位、诊断并告诉 worker）
+DECLARED_TRIGGERS = ("submit",)
 
 
 class Rejected(Exception):
@@ -70,12 +70,12 @@ class Tx:
 @dataclass(frozen=True)
 class SnapObs:
     """外壳对工作区的一次快照（git 计算）。"""
-    tree: str                                   # 剔除测试路径改动后的候选树
-    raw_tree: str                               # 工作区原样的树
-    files: tuple = ()                           # 候选相对链头的改动 ((路径, 增, 删), ...)
-    dropped: tuple = ()                         # 被剔除的测试路径改动
-    testable: bool = True                       # 预检通过
-    commit: str = ""                            # 包住这张快照的提交
+    tree: str
+    raw_tree: str
+    files: tuple = ()
+    dropped: tuple = ()
+    testable: bool = True
+    commit: str = ""
     precheck: str = ""
     tool_seq: int = 0
     session: Optional[str] = None
@@ -86,7 +86,7 @@ def _running_run(g: Graph) -> bool:
 
 
 def _background_ok(g: Graph) -> bool:
-    """后台活动（语义节点的验证、提升、定位）只在正常运行、隔离有效时进行。"""
+    """后台活动（定位）只在正常运行、隔离有效时进行。"""
     return _running_run(g) and not g.run.finalizing and not g.run.reserve and g.baseline_ready and not g.degraded
 
 
@@ -94,18 +94,18 @@ def _background_ok(g: Graph) -> bool:
 
 def start_run(tx: Tx, run_id: str, task: str, budget_sec: float, workers: Iterable[str] = ("w1",),
               public_checks: Iterable[str] = (), verifier: bool = True) -> None:
+    from belay.core.model import VERSION
     tx.emit("run_started", RUNTIME, RULE, run_id=run_id, task=task, budget_sec=float(budget_sec),
             deadline_t=tx.now + float(budget_sec), workers=list(workers), public_checks=list(public_checks),
-            verifier=verifier)
+            verifier=verifier, version=VERSION)
 
 
 def start_clock(tx: Tx) -> None:
-    """预算从现在开始：deadline = 现在 + 预算。"""
     tx.emit("clock_started", RUNTIME, RULE, deadline_t=tx.now + tx.g.run.budget_sec)
 
 
 def create_base(tx: Tx, commit: str, tree: str) -> None:
-    tx.emit("checkpoint_created", RUNTIME, OBSERVED, checkpoint=0, commit=commit, tree=tree, trigger="baseline")
+    tx.emit("merged", RUNTIME, OBSERVED, checkpoint=0, commit=commit, tree=tree, trigger="baseline")
 
 
 def ensure_job(tx: Tx, tree: str, selection: Optional[Iterable[str]], purpose: str, actor: str = RUNTIME,
@@ -134,11 +134,7 @@ def ensure_job(tx: Tx, tree: str, selection: Optional[Iterable[str]], purpose: s
 
 def record_baseline(tx: Tx, job1: Optional[str], job2: Optional[str], reason: str = "",
                     confirm: Optional[str] = None, isolation: Optional[dict] = None) -> None:
-    """两次全量运行的结果归类（一次在工作区、一次在槽位；隔离无效时两次都在工作区）。
-
-    confirm：槽位里对“工作区通过、槽位没通过”的测试的确认重跑，结果覆盖槽位那一次。
-    没有验证器或两次都没跑出结果时，基线为空（所有存档都“未验证”）。
-    """
+    """两次全量运行的结果归类（一次在工作区、一次在槽位；隔离无效时两次都在工作区）。"""
     g = tx.g
     j1, j2 = g.jobs.get(job1) if job1 else None, g.jobs.get(job2) if job2 else None
     classes: dict[str, str] = {}
@@ -168,77 +164,19 @@ def propose_plan(tx: Tx, round_: int, proposal: dict, valid: bool, problems: lis
 
 
 def freeze_plan(tx: Tx, requirements: list[dict], source: str = LLM) -> None:
-    """需求一次性冻结（调用方已校验）。"""
     tx.emit("requirement_frozen", PLANNER, RULE,
             requirements=[{**r, "origin": "llm" if source == LLM else "rule"} for r in requirements])
 
 
-# ======================================================================== 回归门豁免
-
-def _observed_failing(g: Graph, test: str) -> bool:
-    """这个检查在 worker 的某个候选树上失败过：只看非 live 的作业（候选树已剔除测试改动，worker 改不了测试本身）。"""
-    base = g.checkpoints[0].tree if 0 in g.checkpoints else None
-    index = jobs_by_tree(g)
-    return any(tree != base and point_status(g, tree, test, index) == PT_FAIL for tree in index)
-
-
-def waive_checks(tx: Tx, worker: str, tests: Iterable[str], quote: str, reason: str,
-                 requirement: Optional[str] = None) -> list[str]:
-    """worker 声明一些现有测试与任务原文明确要求的行为冲突：规则校验后把它们从回归门里去掉（check_waived）。
-
-    校验：引文逐字出现在任务原文里（至少三个词）；每个检查都在守护集合里、不是公开检查（cmd:），并且确实在
-    worker 的某个候选树上失败过（不能预先豁免）；总数不超过 waive_max_tests。
-    豁免只改变门检查什么，不改变需求的检查项；每一条都写进账本。返回新豁免的检查。"""
-    g, cfg = tx.g, tx.cfg
-    if not cfg.waivers:
-        raise Rejected("Waivers are disabled for this run: keep the existing behaviour, or report the conflict in "
-                       "submit(blocked=[{requirement, kind: \"check_conflict\", reason, quote}]).")
-    if not g.baseline_ready:
-        raise Rejected("The harness is still setting up; try again shortly.")
-    if requirement is not None and requirement not in g.requirements:
-        raise Rejected(f"Unknown requirement {requirement}.")
-    if not (reason or "").strip():
-        raise Rejected("Give a reason: what the task asks for and how the test contradicts it.")
-    q = normalize_ws(quote or "")
-    if len(q.split()) < 3 or not quote_in_text(q, g.run.task):
-        raise Rejected("quote must be at least three words copied verbatim from the task text that ask for the new "
-                       "behaviour.")
-    tests = list(dict.fromkeys(str(t).strip() for t in tests if str(t).strip()))
-    if not tests:
-        raise Rejected("Name the checks to waive (tests=[...], full node ids as the gate reports them).")
-    guard = guard_set(g.baseline)
-    problems = []
-    for t in tests:
-        if is_cmd(t):
-            problems.append(f"{t}: public checks cannot be waived")
-        elif t in g.waived:
-            problems.append(f"{t}: already waived")
-        elif t not in guard:
-            problems.append(f"{t}: not in the regression gate")
-        elif not _observed_failing(g, t):
-            problems.append(f"{t}: the harness has not seen it fail on your changes; call submit first so that "
-                            "the gate runs on them")
-    if problems:
-        raise Rejected("Nothing was waived:\n" + "\n".join(f"- {p}" for p in problems[:20]))
-    if len(g.waived) + len(tests) > cfg.waive_max_tests:
-        raise Rejected(f"At most {cfg.waive_max_tests} checks can be waived in a run ({len(g.waived)} already are). "
-                       "If this many existing tests contradict the task, the change is probably broader than the "
-                       "task asks for.")
-    tx.emit("check_waived", worker_actor(worker), RULE, requirement=requirement, tests=tests, quote=q[:1000],
-            reason=reason.strip()[:2000])
-    _cascade(tx)
-    return tests
-
-
-# ======================================================================== todo（运行级步骤，模块 H）
+# ======================================================================== todo（模块 H）
 
 def _norm_title(s: str) -> str:
     return normalize_ws(s).lower()
 
 
 def update_todos(tx: Tx, worker: str, todos: list[dict], snapshot: Optional[int] = None) -> list[str]:
-    """todo_write 的列表镜像到图上（每次调用立即写入，按标题匹配保持 id 稳定）。新标为 completed 的条目记为
-    todo_completed，锚点是调用方为它强制拍下的快照（snapshot）。返回新完成的 todo id。"""
+    """todo_write 的列表镜像到图上（按标题匹配保持 id 稳定）。新标为 completed 的条目记为 todo_completed，
+    锚点是调用方为它强制拍下的快照。todo 只是线索：不改变任何需求的状态。返回新完成的 todo id。"""
     g = tx.g
     existing = todos_in_order(g)
     by_title = {_norm_title(t.title): t for t in existing}
@@ -282,7 +220,6 @@ def update_todos(tx: Tx, worker: str, todos: list[dict], snapshot: Optional[int]
 
 
 def newly_completed(g: Graph, todos: list[dict]) -> bool:
-    """这次 todo 更新里有没有新标为 completed 的条目（调用方据此先拍锚点快照）。"""
     by_title = {_norm_title(t.title): t for t in g.todos.values()}
     for item in todos:
         if item.get("status") == "completed":
@@ -301,39 +238,25 @@ def _complete_todo(tx: Tx, worker: str, tid: str, snapshot: int) -> None:
     head = g.head_cp
     anchor, epoch = snapshot, (snap.epoch if snap else g.epoch)
     if snap is not None and head is not None and snap.tree == head.tree:
-        anchor, epoch = head.snapshot, head.epoch      # 状态已经在链头上：锚点就是链头的快照
+        anchor, epoch = head.snapshot, head.epoch
     tx.emit("todo_completed", worker_actor(worker), SELF_REPORT, worker=worker, todo=tid, snapshot=anchor,
             anchor_epoch=epoch)
 
 
-def _mark(tx: Tx, cid: int, kind: str, label: str = "", worker: Optional[str] = None) -> None:
-    cp = tx.g.checkpoints.get(cid)
-    if cp is not None and cp.id != 0 and not cp.abandoned and cp.kind in (KIND_AUTO, KIND_HANDOFF, KIND_TODO) and \
-            kind in (KIND_TODO, KIND_SUBMIT) and cp.kind != kind:
-        tx.emit("checkpoint_marked", RUNTIME, RULE, checkpoint=cid, kind=kind, label=(label or "")[:300],
-                worker=worker)
-
-
-def mark_head(tx: Tx, worker: str, kind: str, label: str = "") -> None:
-    """worker 声明的单元已经是链头（后台已经存过）：把链头升级为里程碑并带上标签。"""
-    _mark(tx, tx.g.head, kind, label, worker)
-
-
 def refresh_anchors(tx: Tx) -> None:
-    """勾掉的 todo：锚点被链上某个同段存档包含时写 todo_anchored，并把那个存档标成 todo 存档（标签 = 条目）。"""
+    """勾掉的 todo：锚点被链上某个同段合并点包含时写 todo_anchored。"""
     for t in sorted(tx.g.todos.values(), key=lambda t: t.n):
         if t.status == TODO_COMPLETED:
             cid = snapshot_contained(tx.g, t.anchor_snapshot, t.anchor_epoch)
             if cid is not None:
                 tx.emit("todo_anchored", RUNTIME, RULE, todo=t.id, checkpoint=cid)
-                _mark(tx, cid, KIND_TODO, t.title)
 
 
-# ======================================================================== 快照（模块 B）
+# ======================================================================== 快照与后台合并请求（模块 B）
 
 def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
-    """记录一张快照；与这个 worker 上一张快照完全相同（同一段、同一链头）时不记，返回那一张的序号。
-    例外：交接 / 会话结束是按原因认出的验证节点，上一张不是这类快照时照样记一张（树相同），否则这个节点会漏验。"""
+    """记录一张快照；与这个 worker 上一张快照完全相同时不记，返回那一张的序号。
+    例外：交接 / 会话结束是要发起合并请求的节点，上一张不是这类快照时照样记一张（树相同）。"""
     g = tx.g
     last = latest_snapshot(g, worker)
     same = last is not None and last.tree == obs.tree and last.raw_tree == obs.raw_tree and last.epoch == g.epoch \
@@ -348,13 +271,14 @@ def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
             files=[list(x) for x in obs.files][:500], dropped=list(obs.dropped)[:200],
             todo=cur.id if cur else None, session=obs.session or (ws.session if ws else None),
             tool_seq=obs.tool_seq, precheck=obs.precheck[:1000])
-    schedule_background(tx)
+    if reason != "todo":                            # 勾掉 todo 的锚点快照：update_todos 记下完成之后再发起（触发是 todo）
+        schedule_background(tx)
     return n
 
 
 def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Snapshot, str, str]]:
-    """后台要验证的快照：这个 worker 同一段里最新的可测快照（比链头新、它的树在这一段还没尝试过）。
-    mode=handoff 或降级模式（验证要切换工作区）只验证交接 / 会话结束的快照。返回（快照, 触发, 标签）。"""
+    """后台要合并的快照：这个 worker 同一段里最新的可测快照（比链头新、它的树在这一段还没请求过）。
+    mode=handoff 或降级模式只取交接 / 会话结束的快照。返回（快照, 触发, 标签）。"""
     head = g.head_cp
     only_handoff = g.degraded or mode == "handoff"
     tried = {a.tree for a in g.attempts.values() if a.epoch == g.epoch}
@@ -363,15 +287,15 @@ def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Sn
         if snap.worker != worker or snap.epoch != g.epoch or snap.lost:
             continue
         if head.epoch == snap.epoch and head.snapshot >= snap.n:
-            return None                             # 更旧的快照已经被链头覆盖
+            return None
         if snap.reason in FOREGROUND_REASONS:
-            return None                             # 提交 / 收尾拍的快照由发起者在前台验证
+            return None
         if only_handoff and snap.reason not in HANDOFF_REASONS:
             continue
         if snap.tree == head.tree or snap.tree in tried:
-            return None                             # 最新的状态已经验证过（或正是链头）：等新的改动
+            return None
         if not snap.testable:
-            continue                                # 预检不过：往前找最近的可测快照
+            continue
         trig = "handoff" if snap.reason in HANDOFF_REASONS else "auto"
         done = [t for t in g.todos.values() if t.status == TODO_COMPLETED and t.anchor_snapshot == snap.n]
         if done and trig == "auto":
@@ -380,71 +304,63 @@ def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Sn
     return None
 
 
+def _bg_due(g: Graph, cfg: BelayConfig, now: float, trigger: str) -> bool:
+    """后台复核的节流：两次后台复核之间至少隔 merge_min_interval_sec（勾掉 todo 时 merge_todo_interval_sec）；
+    交接不受限制。只按回归门被拒的请求没有复核，不计入间隔。没有复核者时不节流（回归门只花 CPU）。"""
+    if not cfg.reviewer or trigger == "handoff":
+        return True
+    last = last_bg_review_t(g)
+    if last is None:
+        return True
+    gap = cfg.merge_todo_interval_sec if trigger == "todo" else cfg.merge_min_interval_sec
+    return now - last >= gap
+
+
 def schedule_background(tx: Tx) -> None:
-    """后台验证线：同一时刻每个 worker 最多一个后台尝试；空闲时验证最新的可测快照（新快照胜出）。
-    没有基于时间的存档。后台尝试被拒时链头不动，也不通知 worker、不定位：中间态测不过是常态。"""
-    g = tx.g
+    """后台合并线：同一时刻每个 worker 最多一个合并请求；空闲且到了间隔时对最新的可测快照发起（新快照胜出）。"""
+    g, cfg = tx.g, tx.cfg
     if not _running_run(g) or g.run.finalizing or g.run.reserve or not g.baseline_ready or g.head_cp is None or \
-            tx.cfg.background == "off":
+            cfg.background == "off" or not g.frozen:
         return
     for w in sorted(g.workers):
         g = tx.g
-        if open_attempt(g, w, LANE_BG) is not None:
+        if open_attempt(g, w) is not None or open_submit(g, w) is not None:
             continue
-        cand = _background_candidate(g, w, tx.cfg.background)
-        if cand is not None:
-            snap, trig, label = cand
-            request_checkpoint(tx, w, snap.n, trig, lane=LANE_BG, summary=label)
+        cand = _background_candidate(g, w, cfg.background)
+        if cand is None:
+            continue
+        snap, trig, label = cand
+        if not _bg_due(g, cfg, tx.now, trig):
+            continue
+        request_merge(tx, w, snap.n, trig, lane=LANE_BG, summary=label)
 
 
-# ======================================================================== 存档：验证后比较并交换
+# ======================================================================== 合并请求：回归门 → 复核 → 比较并交换
 
-def _selection(g: Graph, cfg: BelayConfig, tier: str, files: Iterable[str], extra_checks: Iterable[str]):
-    """返回 (档位, 选择)。related 找不到相关测试、改动可能影响全局或无从判断时升级为 full。"""
-    files = list(files)
-    if tier == "related" and files:
-        sel, _why = related_units(files, test_files_of(g.baseline), g.relations)
-        if sel is None:
-            return "full", None
-        cmd_guard = [c for c in active_guard(g) if is_cmd(c)]           # 公开检查通常便宜：总是带上
-        return "related", tuple(sorted(set(sel) | set(units(extra_checks)) | set(cmd_guard)))
-    return "full", None
-
-
-def _evidence_of_open(g: Graph) -> list[str]:
-    """还没完成的需求的证据检查：随每次存档尝试一起跑，需求验证通过不需要任何人声明。"""
-    return [c for r in open_requirements(g) for c in evidence_checks(g, r)]
-
-
-def request_checkpoint(tx: Tx, worker: str, snapshot: int, trigger: str, lane: str = LANE_FG,
-                       tier: Optional[str] = None, summary: str = "", submit: Optional[dict] = None) -> Optional[str]:
-    """对一张快照发起存档尝试；它与链头相同时返回 None（没有要存的东西）。
-    submit：随这次尝试判定的提交（submit_requested 的 payload），在尝试有结果之前写入。"""
+def request_merge(tx: Tx, worker: str, snapshot: int, trigger: str, lane: str = LANE_FG, summary: str = "",
+                  submit: Optional[dict] = None) -> Optional[str]:
+    """对一张快照发起合并请求；它与链头相同时返回 None（没有要合并的东西）。
+    submit：随这次请求判定的提交（submit_requested 的 payload），在请求有结果之前写入。"""
     g = tx.g
     if not g.baseline_ready or g.head is None:
         raise Rejected("The harness is still setting up; try again shortly.")
     if open_attempt(g, worker, lane) is not None:
         if lane == LANE_FG:
-            raise Rejected("A checkpoint of your work is already in progress.")
+            raise Rejected("A merge request of your work is already in progress.")
         return None
     snap = g.snapshots.get(snapshot)
     if snap is None:
         raise Rejected(f"Unknown snapshot {snapshot}.")
-    kind = TRIGGER_KIND.get(trigger, KIND_AUTO)
     if snap.tree == g.head_cp.tree:
-        mark_head(tx, worker, kind, summary)
         return None
-    tier, selection = _selection(g, tx.cfg, tier or tx.cfg.checkpoint_tier, [f[0] for f in snap.files],
-                                 _evidence_of_open(g))
     aid = next_id("A", g.attempts)
-    tx.emit("checkpoint_attempted", worker_actor(worker) if trigger == "submit" else RUNTIME, RULE,
+    tx.emit("merge_requested", worker_actor(worker) if trigger == "submit" else RUNTIME, RULE,
             attempt=aid, worker=worker, trigger=trigger, tree=snap.tree, raw_tree=snap.raw_tree, base=g.head,
-            tier=tier, selection=None if selection is None else list(selection),
-            summary=(summary or "")[:2000], snapshot=snap.n, lane=lane, kind=kind)
+            selection=None if g.baseline else [], summary=(summary or "")[:2000], snapshot=snap.n, lane=lane)
     if submit is not None:
         tx.emit("submit_requested", worker_actor(worker), RULE, **submit, attempt=aid)
     if not snap.testable:
-        tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=aid, regressions=[], reason="precheck",
+        tx.emit("merge_rejected", RUNTIME, RULE, attempt=aid, regressions=[], reason="precheck",
                 detail=snap.precheck[:1000] or "the changed files do not compile")
         schedule_background(tx)
         return aid
@@ -466,78 +382,135 @@ def _confirm_covers(g: Graph, tree: str, needed: list[str], state: str) -> bool:
                (j.selection is None or set(needed) <= set(j.selection)) for j in g.jobs.values())
 
 
-def _older_than_head(g: Graph, a) -> bool:
+def _older_than_head(g: Graph, a: Attempt) -> bool:
     h = g.head_cp
     return h.id != 0 and h.epoch == a.epoch and h.snapshot >= a.snapshot
 
 
-def advance_attempt(tx: Tx, aid: str) -> None:
-    """把一次存档尝试尽量往前推：已被更新的快照超过就标为 superseded；缺结果就起作业；有回归先确认；
-    然后决定推进或拒绝。"""
+def _has_gate(a: Attempt) -> bool:
+    """这个合并请求有回归门可跑（selection=None 表示全量）；没有测试配置时 selection=()。"""
+    return a.selection is None
+
+
+def _gate(tx: Tx, a: Attempt) -> tuple[str, tuple, tuple]:
+    """回归门（全量）：返回 ("wait"|"done", 回归, 不稳定)。没有测试可跑时直接通过。"""
     g, cfg = tx.g, tx.cfg
-    a = g.attempts[aid]
-    if a.status != ATT_PENDING:
-        return
-    if _older_than_head(g, a) or a.tree == g.head_cp.tree:
-        return supersede_attempt(tx, aid, "newer checkpoint")
-    needed = list(a.selection) if a.selection is not None else None
-    if needed is not None and not needed:
-        return _decide(tx, aid, (), ())
-    have = full_verified(g, a.tree) if needed is None else finished_covers(g, a.tree, needed)
-    if not have:
+    if not _has_gate(a):
+        return "done", (), ()
+    if not full_verified(g, a.tree):
         busy = any(j.tree == a.tree and j.state == JOB_RUNNING and not j.live and j.selection is None
-                   for j in g.jobs.values()) if needed is None else running_covers(g, a.tree, needed)
+                   for j in g.jobs.values())
         if not busy:
-            ensure_job(tx, a.tree, a.selection, "verify", attempt=aid)
-        return
-    expected = guard_in_selection(active_guard(g), a.selection)
+            ensure_job(tx, a.tree, None, "gate", attempt=a.id)
+        return "wait", (), ()
+    expected = sorted(active_guard(g))
     regs_raw = regressions(expected, _raw_results(g, a.tree))
     if regs_raw and cfg.confirm_regressions:
         cu = list(units(regression_ids(regs_raw)))
         if not _confirm_covers(g, a.tree, cu, JOB_FINISHED):
             if not _confirm_covers(g, a.tree, cu, JOB_RUNNING):
-                ensure_job(tx, a.tree, cu, "confirm", attempt=aid, tag="confirm")
-            return
+                ensure_job(tx, a.tree, cu, "confirm", attempt=a.id, tag="confirm")
+            return "wait", (), ()
     regs = regressions(expected, results_for_tree(g, a.tree))
     flaky = sorted(set(regression_ids(regs_raw)) - set(regression_ids(regs)))
-    _decide(tx, aid, regs, tuple(flaky))
+    return "done", regs, tuple(flaky)
 
 
-def _decide(tx: Tx, aid: str, regs: tuple, flaky: tuple) -> None:
+def _broken_regs(g: Graph, tree: str) -> tuple[str, ...]:
+    """已完成（E3）的需求依据的测试在这棵树上不再通过：按单调规则不能合并（写成回归的格式，带需求编号）。"""
+    res = results_for_tree(g, tree)
+    return tuple(f"{t} ({res.get(t)}) [{rid} was done]" for rid, tests in broken_requirements(g, tree) for t in tests)
+
+
+def advance_attempt(tx: Tx, aid: str) -> None:
+    """把一个合并请求尽量往前推：被链头超过就取代；回归门缺结果就起作业；然后复核；然后合并或拒绝。"""
+    g, cfg = tx.g, tx.cfg
+    a = g.attempts[aid]
+    if a.status != ATT_PENDING or not _running_run(g):
+        return
+    if _older_than_head(g, a) or a.tree == g.head_cp.tree:
+        return supersede_attempt(tx, aid, "newer merge point")
+    st, regs, flaky = _gate(tx, a)
+    if st == "wait":
+        return
+    broken = _broken_regs(tx.g, a.tree)
+    v = tx.g.reviews.get(a.review) if a.review else None
+    if v is not None and v.status in (REV_RUNNING, REV_RECORDED):
+        return
+    if v is not None and v.status == REV_DECIDED:
+        d = v.decision
+        if not d.get("merge"):
+            return _reject(tx, aid, "review", regs, flaky, detail="; ".join(d.get("reasons") or [])[:2000])
+        if regs or broken:
+            return _reject(tx, aid, "regression", regs + broken, flaky)
+        return _advance(tx, aid, flaky)
+    if broken:
+        return _reject(tx, aid, "requirement_regression", regs + broken, flaky)
+    failed = [x for x in a.reviews if tx.g.reviews[x].status == REV_FAILED]
+    reviewable = cfg.reviewer and len(failed) <= cfg.review_retries and not (failed and tx.g.run.finalizing)
+    if regs:
+        sub = tx.g.submits.get(a.submit) if a.submit else None
+        if reviewable and cfg.waivers and sub is not None and sub.waivers:
+            return _request_review(tx, a, regs, flaky)     # worker 认为这些测试与任务原文冲突：由复核者裁决
+        return _reject(tx, aid, "regression", regs, flaky)
+    if reviewable:
+        return _request_review(tx, a, regs, flaky)
+    if cfg.reviewer and failed and not _has_gate(a) and a.trigger != "submit":
+        # 复核者不可用、又没有回归门：没有任何东西能说明这张快照不比链头差（后台与截止时的快照常常改到一半），
+        # 不合并；worker 自己提交的除外（它声明做完了，按自述记下）
+        return _reject(tx, aid, "review", regs, flaky,
+                       detail="the reviewer gave no verdict and there is no regression gate to fall back on")
+    return _advance(tx, aid, flaky)                        # 没有复核者（或复核者不可用）：只按回归门合并
+
+
+def _advance(tx: Tx, aid: str, flaky: tuple) -> None:
+    g = tx.g
+    if any(x.status == ATT_ADVANCING for x in g.attempts.values()):
+        return                                             # 另一个正在推进：等它落地（ref_advanced 会再推进这一个）
+    tx.emit("merge_advancing", RUNTIME, RULE, attempt=aid, parent_commit=g.head_cp.commit, date=tx.now,
+            flaky=list(flaky))
+
+
+def _reject(tx: Tx, aid: str, reason: str, regs: tuple, flaky: tuple, detail: str = "") -> None:
     g = tx.g
     a = g.attempts[aid]
-    if regs:
-        errors = sorted({j.error[:300] for j in g.jobs.values() if j.tree == a.tree and j.error and not j.live})
-        tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=aid, regressions=list(regs), flaky=list(flaky),
-                reason="regression", detail="; ".join(errors)[:1000])
-        if a.lane == LANE_FG:                       # worker 的提交被拒：立即定位与诊断
-            loc = start_locate(tx, regression_ids(regs), {"tree": a.tree, "snapshot": a.snapshot}, "rejected",
-                               ref=aid)
+    if reason in ("regression", "requirement_regression") and not detail:
+        detail = "; ".join(sorted({j.error[:300] for j in g.jobs.values() if j.tree == a.tree and j.error
+                                   and not j.live}))[:1000]
+    tx.emit("merge_rejected", RUNTIME, RULE, attempt=aid, regressions=list(regs), flaky=list(flaky), reason=reason,
+            detail=detail)
+    if reason in ("regression", "requirement_regression") and regs:
+        tests = regression_ids(regs)
+        tests = [t.split(" [", 1)[0] for t in tests]
+        if a.lane == LANE_FG:                       # worker 在等的请求被拒：立即定位与诊断
+            loc = start_locate(tx, tests, {"tree": a.tree, "snapshot": a.snapshot}, "rejected", ref=aid)
             if loc is None:
-                maybe_diagnose(tx, "rejected", regression_ids(regs), None)
+                maybe_diagnose(tx, "rejected", tests, None)
             _repeated_diagnosis(tx, aid)
-        else:                                       # 后台的：链头不动；同一回归连续两个后台存档都在才定位与诊断
+        else:                                       # 后台的：同一回归连续两个后台请求都在才定位与诊断
             _background_persists(tx, aid)
-        schedule_background(tx)
-    elif not any(x.status == ATT_ADVANCING for x in g.attempts.values()):
-        tx.emit("checkpoint_advancing", RUNTIME, RULE, attempt=aid, parent_commit=g.head_cp.commit, date=tx.now,
-                flaky=list(flaky))
-    # 另一个尝试正在推进：等它落地（ref_advanced 会再推进这一个；那时它多半已被新存档取代）
 
 
 def supersede_attempt(tx: Tx, aid: str, reason: str) -> None:
-    """取代一个还在等结果的尝试。它带着的提交：链头已经包含它的快照时转到链头上判定，否则记为被拒（取消）。"""
+    """取代一个还在等结果的合并请求（包括正在复核的：复核随之取消）。它带着的提交：链头已经包含它的快照时转到
+    链头上判定，否则记为被拒（取消）。"""
     g = tx.g
     a = g.attempts[aid]
     if a.status != ATT_PENDING:
         return
     contained = _older_than_head(g, a) or a.tree == g.head_cp.tree
     sub = a.submit if a.submit is not None and g.submits[a.submit].status == SUB_PENDING else None
-    tx.emit("attempt_superseded", RUNTIME, RULE, attempt=aid, reason=reason,
+    tx.emit("merge_superseded", RUNTIME, RULE, attempt=aid, reason=reason,
             submit_checkpoint=tx.g.head if sub is not None and contained else None)
+    _cancel_review(tx, a.review, f"merge request {aid} was superseded ({reason})")
     if sub is not None and contained:
-        mark_head(tx, a.worker, KIND_SUBMIT, a.summary)
-        evaluate_submit(tx, sub)
+        _judge_on_head(tx, sub)
+
+
+def _cancel_review(tx: Tx, vid: Optional[str], reason: str) -> None:
+    v = tx.g.reviews.get(vid) if vid else None
+    if v is not None and v.status in (REV_RUNNING, REV_RECORDED):
+        tx.emit("review_cancelled", RUNTIME, RULE, review=vid, reason=reason[:500])
 
 
 def ref_advanced(tx: Tx, aid: str, ok: bool, commit: str = "", files: Iterable = (), detail: str = "") -> None:
@@ -547,118 +520,366 @@ def ref_advanced(tx: Tx, aid: str, ok: bool, commit: str = "", files: Iterable =
         return
     if ok:
         cid = max(tx.g.checkpoints) + 1
-        tx.emit("checkpoint_created", RUNTIME, OBSERVED, checkpoint=cid, attempt=aid, commit=commit, tree=a.tree,
+        tx.emit("merged", RUNTIME, OBSERVED, checkpoint=cid, attempt=aid, commit=commit, tree=a.tree,
                 files=[list(f) for f in files])
-        for other in list(tx.g.attempts.values()):             # 新快照胜出：更旧的尝试不再进链
-            if other.status == ATT_PENDING:
-                advance_attempt(tx, other.id)
+        _after_merge(tx, cid)
         refresh_anchors(tx)
-        auto_verify(tx)
-        for s in list(tx.g.submits.values()):
-            if s.status == SUB_CHECKPOINTED:
-                evaluate_submit(tx, s.id)
     else:
-        tx.emit("checkpoint_rejected", RUNTIME, OBSERVED, attempt=aid, regressions=[], reason="cas_conflict",
+        tx.emit("merge_rejected", RUNTIME, RULE, attempt=aid, regressions=[], reason="cas_conflict",
                 detail=detail[:1000])
-    schedule_promotion(tx)
-    schedule_background(tx)
+    _cascade(tx)
 
 
 def abort_attempts(tx: Tx, reason: str, lane: Optional[str] = None) -> None:
-    """收尾时仍在验证的尝试：拒绝（链不动；带着的提交也记为被拒）。正在 CAS 的尝试不能中止，由外壳做完。"""
+    """收尾时仍在进行的合并请求：拒绝（链不动；复核随之取消）。正在 CAS 的不能中止，由外壳做完。"""
     for a in list(tx.g.attempts.values()):
         if a.status == ATT_PENDING and (lane is None or a.lane == lane):
-            tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=a.id, regressions=[], reason=reason)
+            tx.emit("merge_rejected", RUNTIME, RULE, attempt=a.id, regressions=[], reason=reason)
+            _cancel_review(tx, a.review, reason)
 
 
-# ======================================================================== 两级存档链：提升与降级（模块 C）
+# ======================================================================== 复核（模块 F）
 
-def schedule_promotion(tx: Tx) -> None:
-    """验证队列有空闲时，取链上最新的、还没有全量结果的暂存点跑全量；更老的暂存点跳过。"""
-    g = tx.g
-    if not _background_ok(g) or not guard_set(g.baseline):
-        return
-    cands = []
-    for cp in chain(g):                             # 只看最新确认点与最近一次降级之后的暂存点
-        if cp.level == CONFIRMED or cp.demoted:
-            break
-        cands.append(cp)
-    if not cands:
-        return
-    target = cands[0]
-    if full_verified(g, target.tree):
-        return evaluate_promotion(tx, target.id)
-    running_full = [j for j in g.jobs.values() if j.state == JOB_RUNNING and j.selection is None and not j.live]
-    if any(j.tree == target.tree for j in running_full) or any(j.purpose == "promote" for j in running_full):
-        return
-    ensure_job(tx, target.tree, None, "promote", checkpoint=target.id)
+def _focus(g: Graph, submit_id: Optional[str] = None) -> list[str]:
+    """要求复核者判定的需求：还没完成的、只有自述的完成或受阻、worker 这次声明受阻的。"""
+    out = {r.id for r in actionable(g) if r.status == REQ_OPEN or r.level == E0 or r.by == BY_SELF}
+    s = g.submits.get(submit_id) if submit_id else None
+    if s is not None:
+        out |= {str(b.get("requirement")) for b in s.blocked}
+    return sorted((x for x in out if x in g.requirements), key=num)
 
 
-def promote_now(tx: Tx, cid: Optional[int] = None) -> bool:
-    """收尾时对链头（或给定的暂存点）做全量验证。返回 True 表示还在等作业。"""
-    g = tx.g
-    cid = g.head if cid is None else cid
-    cp = g.checkpoints.get(cid)
-    if cp is None or cp.level == CONFIRMED or cp.demoted or not guard_set(g.baseline):
-        return False
-    if not full_verified(g, cp.tree):
-        if not any(j.tree == cp.tree and j.state == JOB_RUNNING and j.selection is None and not j.live
-                   for j in g.jobs.values()):
-            ensure_job(tx, cp.tree, None, "promote", checkpoint=cp.id)
+def _review_slot(tx: Tx, lane: str) -> bool:
+    """同一时刻只有一个复核。前台（submit、收尾）需要复核者时取代正在复核的后台请求。"""
+    cur = running_review(tx.g)
+    if cur is None:
         return True
-    evaluate_promotion(tx, cid)
-    cp = tx.g.checkpoints[cid]
-    return cp.level != CONFIRMED and not cp.demoted
+    if lane == LANE_FG and cur.attempt is not None:
+        a = tx.g.attempts.get(cur.attempt)
+        if a is not None and a.lane == LANE_BG and a.status == ATT_PENDING:
+            supersede_attempt(tx, a.id, "the reviewer is needed for a foreground request")
+            return running_review(tx.g) is None
+    return False
 
 
-def evaluate_promotion(tx: Tx, cid: int) -> None:
-    g, cfg = tx.g, tx.cfg
-    cp = g.checkpoints.get(cid)
-    if cp is None or cp.level != PROVISIONAL or cp.demoted or cp.abandoned or not full_verified(g, cp.tree):
-        return
-    guard = active_guard(g)
-    regs_raw = regressions(sorted(guard), _raw_results(g, cp.tree))
-    if regs_raw and cfg.confirm_regressions:
-        cu = list(units(regression_ids(regs_raw)))
-        if not _confirm_covers(g, cp.tree, cu, JOB_FINISHED):
-            if not _confirm_covers(g, cp.tree, cu, JOB_RUNNING):
-                ensure_job(tx, cp.tree, cu, "confirm", tag="confirm", checkpoint=cid)
-            return
-    regs = regressions(sorted(guard), results_for_tree(g, cp.tree))
-    if not regs:
-        tx.emit("checkpoint_confirmed", VERIFIER, OBSERVED, checkpoint=cid)
-        schedule_promotion(tx)
-        return
-    tx.emit("checkpoint_demoted", RUNTIME, RULE, checkpoint=cid, regressions=list(regs)[:200],
-            n_regressions=len(regs))
-    if not _background_ok(tx.g) or cp.kind not in DECLARED_KINDS:
-        schedule_promotion(tx)                      # 后台、todo、交接等中间节点：只降级（不再交付），不追查、不通知
-        return
-    # 问题是否还在：对最新的可测快照只跑这几个失败的测试
-    ids = regression_ids(regs)
-    snap = latest_snapshot(tx.g, None, testable=True)
-    if snap is None or snap.tree == cp.tree or snap.epoch != tx.g.epoch:
-        _demotion_persists(tx, cid, ids, snap.n if snap else cp.snapshot)
-    else:
-        ensure_job(tx, snap.tree, units(ids), "recheck", tag=f"recheck:{cid}", checkpoint=cid)
-    schedule_promotion(tx)
-
-
-def _evaluate_recheck(tx: Tx, jid: str) -> None:
+def _request_review(tx: Tx, a: Attempt, regs: tuple, flaky: tuple) -> None:
+    if not _review_slot(tx, a.lane):
+        return                                     # 复核者在忙：复核结束时级联会再推进这个请求
     g = tx.g
-    j = g.jobs[jid]
-    cp = g.checkpoints.get(j.checkpoint) if j.checkpoint is not None else None
-    if cp is None or j.state != JOB_FINISHED or not j.results:
-        return
-    ids = regression_ids(cp.demote_regressions)
-    still = [t for t in ids if j.results.get(t) != PASSED and check_unit(t) in (j.selection or ())]
-    if still:
-        snap = next((s for s in g.snapshots.values() if s.tree == j.tree), None)
-        _demotion_persists(tx, cp.id, still, snap.n if snap else cp.snapshot)
+    prev = g.reviews.get(a.review) if a.review else None
+    vid = next_id("V", g.reviews)
+    tx.emit("review_started", RUNTIME, RULE, review=vid, trigger=a.trigger, attempt=a.id, tree=a.tree,
+            snapshot=a.snapshot, base=g.head, submit=a.submit, focus=_focus(g, a.submit),
+            gate={"regressions": list(regs)[:200], "flaky": list(flaky)[:50], "available": bool(g.baseline)},
+            retry_of=prev.id if prev is not None and prev.status == REV_FAILED else None)
 
+
+def _as_list(v, n: int = 20, width: int = 300) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, (str, int, float)):
+        v = [v]
+    if not isinstance(v, (list, tuple)):
+        return []
+    return [str(x)[:width] for x in v if x is not None and str(x).strip()][:n]
+
+
+_STATUS_WORDS = {"done": J_DONE, "complete": J_DONE, "completed": J_DONE, "implemented": J_DONE, "yes": J_DONE,
+                 "partial": J_PARTIAL, "partially": J_PARTIAL, "incomplete": J_PARTIAL,
+                 "not_done": J_NOT_DONE, "notdone": J_NOT_DONE, "no": J_NOT_DONE, "missing": J_NOT_DONE,
+                 "not_implemented": J_NOT_DONE, "open": J_NOT_DONE, "blocked": J_BLOCKED}
+
+
+def _num_or_none(x) -> Optional[float]:
+    if isinstance(x, bool):
+        return None
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _bool_or_none(x) -> Optional[bool]:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str) and x.strip().lower() in ("true", "yes", "merge"):
+        return True
+    if isinstance(x, str) and x.strip().lower() in ("false", "no", "reject"):
+        return False
+    return None
+
+
+def clean_verdict(raw) -> dict:
+    """复核者 verdict 的规整（格式，不判断真假）：截断、归一化状态与等级。"""
+    v = raw if isinstance(raw, dict) else {}
+    reqs = []
+    for item in v.get("requirements") or []:
+        if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+            continue
+        st = str(item.get("status") or "").strip().lower().replace(" ", "_").replace("-", "_")
+        lv = str(item.get("level") or "").strip().upper()
+        reqs.append({"id": str(item["id"]).strip()[:20], "status": _STATUS_WORDS.get(st),
+                     "level": lv if lv in LEVELS else None,
+                     "evidence": _as_list(item.get("evidence"), 10), "tests": _as_list(item.get("tests"), 20, 500),
+                     "runs": _as_list(item.get("runs"), 20, 20), "missing": _as_list(item.get("missing"), 10),
+                     "regressed": bool(item.get("regressed")), "reason": str(item.get("reason") or "")[:600]})
+    waivers = []
+    for w in v.get("waivers") or []:
+        if isinstance(w, dict):
+            waivers.append({"tests": _as_list(w.get("tests"), 50, 500), "quote": str(w.get("quote") or "")[:1000],
+                            "reason": str(w.get("reason") or "")[:1000],
+                            "requirement": str(w.get("requirement") or "").strip()[:20] or None})
+    return {"merge": _bool_or_none(v.get("merge")), "reason": str(v.get("reason") or "")[:1500],
+            "summary": str(v.get("summary") or "").strip().split("\n")[0][:300], "requirements": reqs[:300],
+            "waivers": waivers[:20], "score": _num_or_none(v.get("score")),
+            "score_note": str(v.get("score_note") or "")[:500], "feedback": str(v.get("feedback") or "")[:4000]}
+
+
+def _validated_level(g: Graph, r, item: dict, res: dict, run_ids: set[str]) -> tuple[str, list[str], list[str]]:
+    """证据等级的校验：E3 要求引用的测试在这棵树上有结果（完成：全部通过，且至少一个在原始代码上不通过，
+    否则证明不了新行为；没做完：至少一个没通过）；E2 要求引用的命令确实在这次复核里执行过。不够就降级。"""
+    level = item.get("level") or E1
+    tests = [t for t in item.get("tests") or [] if t in g.baseline]
+    runs = [x for x in item.get("runs") or [] if x in run_ids]
+    positive = item.get("status") == J_DONE
+    if level == E3:
+        if positive:
+            ok = bool(tests) and all(res.get(t) == PASSED for t in tests) and \
+                any(g.baseline.get(t) != B_PASS for t in tests)
+        else:
+            ok = any(t in res and res[t] != PASSED for t in tests)
+        if not ok:
+            level = E2
+    if level == E2 and not runs:
+        level = E1
+    return level, (tests if level == E3 else []), (runs if level in (E2, E3) else [])
+
+
+def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: list[dict]) -> dict:
+    """复核者结论的校验（纯函数）。返回 {merge, reasons, notes, judgements, mentioned, waivers, score, ...}。
+
+    合并标准：回归门全过（复核者批准、规则校验过的豁免除外）；复核者认为没有破坏性改动；已完成的需求没有被
+    这次改动弄坏（需要 E2 / E3 的证据）；分数不比链上最近一次测到的低（容差 score_tolerance）。
+    合并不要求任何需求已经完成。"""
+    task = g.run.task if g.run else ""
+    res = results_for_tree(g, v.tree)
+    run_ids = {str(x.get("id")) for x in runs}
+    reasons: list[str] = []
+    notes: list[str] = []
+    # ---- 豁免
+    granted: list[dict] = []
+    regs = set(regression_ids(v.gate.get("regressions") or ())) if v.attempt else set()
+    if regs:
+        guard = guard_set(g.baseline)
+        budget = cfg.waive_max_tests - len(g.waived)
+        taken: set[str] = set()
+        for w in verdict.get("waivers") or []:
+            if not cfg.waivers:
+                notes.append("waivers are disabled for this run")
+                break
+            q = normalize_ws(w.get("quote") or "")
+            if len(q.split()) < 3 or not quote_in_text(q, task):
+                notes.append(f"waiver of {', '.join(w['tests'][:3])} ignored: the quote is not verbatim task text")
+                continue
+            tests = [t for t in w.get("tests") or [] if t in regs and t in guard and not is_cmd(t)
+                     and t not in g.waived and t not in taken]
+            if len(tests) > budget:
+                notes.append(f"at most {cfg.waive_max_tests} checks can be waived in a run")
+                tests = tests[:max(0, budget)]
+            if tests:
+                rid = w.get("requirement") if w.get("requirement") in g.requirements else None
+                granted.append({"tests": tests, "quote": q[:1000], "reason": (w.get("reason") or "")[:2000],
+                                "requirement": rid})
+                taken.update(tests)
+                budget -= len(tests)
+        left = sorted(regs - taken)
+        if left:
+            reasons.append(f"{len(left)} regression(s) are not waived: " + ", ".join(left[:8]))
+    # ---- 需求
+    judgements: list[dict] = []
+    mentioned: list[str] = []
+    declared: dict[str, dict] = {}
+    s = g.submits.get(v.submit) if v.submit else None
+    if s is not None:
+        declared = {str(b.get("requirement")): dict(b) for b in s.blocked}
+    for item in verdict.get("requirements") or []:
+        r = g.requirements.get(item["id"])
+        if r is None or r.kind != ACTIONABLE or item.get("status") is None or r.id in mentioned:
+            continue
+        mentioned.append(r.id)
+        status = item["status"]
+        level, tests, used_runs = _validated_level(g, r, item, res, run_ids)
+        missing = list(item.get("missing") or [])
+        evidence = list(item.get("evidence") or [])
+        if status == J_DONE and level == E0:
+            status, missing = J_PARTIAL, missing + ["no evidence beyond the agent's own claim"]
+        if status == J_BLOCKED and r.id not in declared and r.status != REQ_BLOCKED:
+            # 受阻要由 worker 声明、复核者认可：复核者自己认为做不了的，只告诉 worker（它可以在 submit 里声明）
+            status = J_NOT_DONE
+            missing = missing + [f"the reviewer thinks it cannot be done here: {(item.get('reason') or '')[:300]}"]
+            notes.append(f"{r.id}: judged blocked without the agent declaring it; recorded as not done")
+        base = {"requirement": r.id, "evidence": evidence, "missing": missing}
+        if r.status == REQ_DONE and status != J_DONE:
+            strong = level in (E2, E3)
+            if r.level == E0 or strong:
+                if item.get("regressed") and strong and v.attempt is not None:
+                    reasons.append(f"{r.id} was done (merge point {r.checkpoint}) and this change breaks it"
+                                   + (f": {'; '.join(missing[:3])}" if missing else ""))
+                    continue
+                judgements.append({**base, "status": REQ_OPEN, "judgement": status, "reason": "reassessed",
+                                   "level": level, "runs": used_runs, "tests": tests})
+            else:
+                notes.append(f"{r.id} was judged {status} by reading only; it stays done ({r.level}, merge point "
+                             f"{r.checkpoint}): changing a finished requirement needs a test or a command that "
+                             "shows the problem")
+            continue
+        if r.status == REQ_DONE:                   # 仍然完成：证据等级只升不降
+            if LEVEL_RANK[level] > LEVEL_RANK.get(r.level or E0, 0):
+                judgements.append({**base, "status": REQ_DONE, "judgement": J_DONE, "level": level, "tests": tests,
+                                   "runs": used_runs, "reason": "stronger evidence"})
+            continue
+        if status == J_DONE:
+            judgements.append({**base, "status": REQ_DONE, "judgement": J_DONE, "level": level, "tests": tests,
+                               "runs": used_runs, "reason": "review"})
+        elif status == J_BLOCKED:
+            d = declared.get(r.id) or {}
+            judgements.append({**base, "status": REQ_BLOCKED, "judgement": J_BLOCKED, "reason": "review",
+                               "blocked_kind": d.get("kind") or r.blocked_kind or "reviewer",
+                               "blocked_reason": (item.get("reason") or d.get("reason") or "; ".join(missing))[:2000],
+                               "blocked_quote": d.get("quote")})
+        else:
+            if r.id in declared and not missing and item.get("reason"):
+                missing = [item["reason"]]
+            judgements.append({**base, "missing": missing, "status": REQ_OPEN, "judgement": status,
+                               "reason": "blocked_not_accepted" if r.id in declared or r.status == REQ_BLOCKED
+                               else "review"})
+    # ---- 分数
+    score = verdict.get("score") if run_ids else None
+    if verdict.get("score") is not None and not run_ids:
+        notes.append("the score was not used: no command was run in this review")
+    prev, prev_note, prev_cp = last_score(g)
+    if v.attempt is not None and score is not None and prev is not None and \
+            score < prev - cfg.score_tolerance * abs(prev):
+        reasons.append(f"the score dropped from {prev:g} (merge point {prev_cp}) to {score:g}")
+    # ---- 合并
+    merge = None
+    if v.attempt is not None:
+        if not verdict.get("merge"):
+            reasons.insert(0, "the reviewer did not approve the merge: " + (verdict.get("reason") or "no reason given"))
+        merge = not reasons
+    return {"merge": merge, "reasons": reasons, "notes": notes, "judgements": judgements, "mentioned": mentioned,
+            "waivers": granted, "score": score, "score_note": verdict.get("score_note") or "",
+            "label": verdict.get("summary") or "", "feedback": verdict.get("feedback") or ""}
+
+
+def record_review(tx: Tx, vid: str, verdict: Optional[dict], runs: Iterable[dict] = (), failed: bool = False,
+                  error: str = "", transcript: Optional[str] = None) -> None:
+    """复核者会话结束（llm）：原样记下结论，再由规则校验，写豁免与决定；然后推进合并请求或判定提交。"""
+    g = tx.g
+    v = g.reviews.get(vid)
+    if v is None or v.status != REV_RUNNING or not _running_run(g):
+        return
+    clean = clean_verdict(verdict) if verdict is not None and not failed else {}
+    if not failed:
+        if v.attempt is not None and clean.get("merge") is None:
+            failed, error = True, error or "the verdict does not say whether to merge"
+        elif v.attempt is None and not clean.get("requirements"):
+            failed, error = True, error or "the verdict judges no requirement"
+    runs = [{"id": str(x.get("id")), "cmd": str(x.get("cmd") or "")[:500],
+             "rc": int(x["rc"]) if isinstance(x.get("rc"), int) else None} for x in runs or ()][:200]
+    tx.emit("merge_reviewed", REVIEWER, LLM, review=vid, verdict=clean, runs=runs, failed=failed,
+            error=(error or "")[:2000], transcript=transcript)
+    if not failed:
+        d = decide_review(tx.g, tx.cfg, tx.g.reviews[vid], clean, runs)
+        waivers = d.pop("waivers")
+        tx.emit("review_decided", RUNTIME, RULE, review=vid, waived=[t for w in waivers for t in w["tests"]], **d)
+        for w in waivers:
+            tx.emit("waiver_granted", REVIEWER, RULE, review=vid, **w)
+        if v.attempt is None:                       # 只判定：判定落在被判定的合并点上
+            _apply_judgements(tx, vid, v.checkpoint)
+            if v.submit is not None:
+                finish_submit(tx, v.submit)
+    _cascade(tx)
+
+
+def _apply_judgements(tx: Tx, vid: str, cid: int) -> None:
+    g = tx.g
+    if not _running_run(g) or cid not in g.checkpoints or not is_ancestor(g, cid, g.head):
+        return
+    for j in tx.g.reviews[vid].decision.get("judgements") or []:
+        r = tx.g.requirements.get(j["requirement"])
+        if r is None:
+            continue
+        if j["status"] == REQ_DONE and j.get("level") == E3:   # E3 的测试必须在这个合并点上通过
+            res = results_for_tree(tx.g, tx.g.checkpoints[cid].tree)
+            if not all(res.get(t) == PASSED for t in j.get("tests") or ()):
+                continue
+        tx.emit("requirement_judged", REVIEWER, RULE, requirement=r.id, status=j["status"],
+                judgement=j.get("judgement"), level=j.get("level") if j["status"] == REQ_DONE else None,
+                evidence=j.get("evidence") or [], tests=j.get("tests") or [], runs=j.get("runs") or [],
+                missing=j.get("missing") or [], checkpoint=cid, review=vid, by=BY_REVIEW, reason=j.get("reason"),
+                blocked_kind=j.get("blocked_kind"), blocked_reason=j.get("blocked_reason"),
+                blocked_quote=j.get("blocked_quote"))
+
+
+def _auto_checks(tx: Tx, cid: int) -> None:
+    """规划器关联的证据检查（原始代码上不通过的已有测试）在合并点上全部通过 → 完成（E3，规则）。"""
+    g = tx.g
+    res = results_for_tree(g, g.checkpoints[cid].tree)
+    for r in actionable(g):
+        ev = evidence_checks(g, r)
+        if not ev or not all(res.get(c) == PASSED for c in ev):
+            continue
+        if r.status == REQ_DONE and r.level == E3:
+            continue
+        tx.emit("requirement_judged", RUNTIME, RULE, requirement=r.id, status=REQ_DONE, judgement=J_DONE, level=E3,
+                tests=ev, evidence=[f"{c} passes" for c in ev][:10], missing=[], checkpoint=cid, by=BY_CHECKS,
+                reason="checks")
+
+
+def _self_report(tx: Tx, sid: str, cid: int) -> None:
+    """没有复核者（关闭或不可用）时的提交：受阻的声明记为自述受阻；证据检查没过的仍未完成；其余记为自述完成（E0）。"""
+    g = tx.g
+    s = g.submits[sid]
+    declared = {str(b.get("requirement")): b for b in s.blocked}
+    res = results_for_tree(g, g.checkpoints[cid].tree)
+    w = worker_actor(s.worker)
+    for r in open_requirements(g):
+        ev = evidence_checks(g, r)
+        if r.id in declared:
+            b = declared[r.id]
+            tx.emit("requirement_judged", w, SELF_REPORT, requirement=r.id, status=REQ_BLOCKED, judgement=J_BLOCKED,
+                    checkpoint=cid, by=BY_SELF, reason="self_report", blocked_kind=b.get("kind"),
+                    blocked_reason=b.get("reason"), blocked_quote=b.get("quote"), evidence=[], missing=[])
+        elif ev and not all(res.get(c) == PASSED for c in ev):
+            tx.emit("requirement_judged", RUNTIME, RULE, requirement=r.id, status=REQ_OPEN, judgement=J_NOT_DONE,
+                    checkpoint=cid, by=BY_CHECKS, reason="checks fail",
+                    missing=[f"{c} ({res.get(c, 'MISSING')})" for c in ev if res.get(c) != PASSED][:10])
+        else:
+            tx.emit("requirement_judged", w, SELF_REPORT, requirement=r.id, status=REQ_DONE, judgement=J_DONE,
+                    level=E0, checkpoint=cid, by=BY_SELF, reason="self_report",
+                    evidence=["the agent's submit summary (not verified)"], missing=[])
+
+
+def _after_merge(tx: Tx, cid: int) -> None:
+    """合并点落地：复核者的判定、测试的判定写进账本；提交得到结论。"""
+    g = tx.g
+    cp = g.checkpoints[cid]
+    a = g.attempts[cp.attempt]
+    if cp.review is not None:
+        _apply_judgements(tx, cp.review, cid)
+    _auto_checks(tx, cid)
+    if a.submit is not None and tx.g.submits[a.submit].status == SUB_PENDING:
+        if cp.review is None:
+            _self_report(tx, a.submit, cid)
+        finish_submit(tx, a.submit)
+
+
+# ======================================================================== 持续性回归
 
 def _background_persists(tx: Tx, aid: str) -> None:
-    """后台存档被拒，且上一个被拒的后台存档（另一棵树、同一段）也有同样的回归：不是改到一半的临时状态，
+    """后台合并请求被拒，且上一个被拒的后台请求（另一棵树、同一段）也有同样的回归：不是改到一半的临时状态，
     记为持续性回归，定位并诊断（结果在 worker 的下一轮作为提示送达，不打断它）。同一组测试只做一次。"""
     g = tx.g
     a = g.attempts[aid]
@@ -666,12 +887,13 @@ def _background_persists(tx: Tx, aid: str) -> None:
     if snap is None or not _running_run(g) or g.run.finalizing:
         return
     prev = [x for x in g.attempts.values() if x.lane == LANE_BG and x.status == ATT_REJECTED and x.id != aid
-            and x.created_seq < a.created_seq and x.tree != a.tree and x.snapshot in g.snapshots
+            and x.regressions and x.created_seq < a.created_seq and x.tree != a.tree and x.snapshot in g.snapshots
             and g.snapshots[x.snapshot].epoch == snap.epoch]
     if not prev:
         return
     p = max(prev, key=lambda x: x.created_seq)
     common = sorted(set(regression_ids(a.regressions)) & set(regression_ids(p.regressions)))
+    common = [t.split(" [", 1)[0] for t in common]
     common = [t for t in common if not is_cmd(t) and not open_persistent(g, t)]
     if not common:
         return
@@ -682,20 +904,9 @@ def _background_persists(tx: Tx, aid: str) -> None:
         maybe_diagnose(tx, "background", common, None)
 
 
-def _demotion_persists(tx: Tx, cid: int, tests: list[str], latest_n: int) -> None:
-    cp = tx.g.checkpoints[cid]
-    tx.emit("persistent_regression", RUNTIME, RULE, tests=list(tests)[:50], trigger="demoted", checkpoint=cid,
-            since=cp.snapshot, epoch=cp.epoch, latest=latest_n)
-    loc = start_locate(tx, tests, {"tree": cp.tree, "snapshot": cp.snapshot, "checkpoint": cid}, "demoted",
-                       ref=f"cp:{cid}")
-    if loc is None:
-        maybe_diagnose(tx, "demoted", tests, None)
-
-
 # ======================================================================== 快照二分定位（模块 D3）
 
 def locate_points(g: Graph, lid: str) -> list[dict]:
-    """区间内的点：段起点存档 + 同一段内坏端之前的可测快照（连续相同的树只取一张）+ 坏端。"""
     loc = g.locates[lid]
     base = g.checkpoints[loc.lower]
     pts = [{"kind": "checkpoint", "id": base.id, "tree": base.tree, "snapshot": base.snapshot if base.id else 0}]
@@ -717,14 +928,13 @@ def locate_points(g: Graph, lid: str) -> list[dict]:
 
 
 def _test_interval(g: Graph, pts: list[dict], test: str, index: Optional[dict] = None) -> dict:
-    """一个测试在区间上的状态：最后一次已知通过（好端）与之后第一次已知失败（坏端）；中间还没测过的点。"""
     last = len(pts) - 1
     sts = []
     for i, p in enumerate(pts):
         if i == last:
             sts.append(PT_FAIL)
         elif i == 0 and p["kind"] == "checkpoint" and p["id"] == 0 and test in guard_set(g.baseline):
-            sts.append(PT_PASS)                      # 守护测试在原始代码上两次都通过
+            sts.append(PT_PASS)
         else:
             sts.append(point_status(g, p["tree"], test, index))
     passes = [i for i in range(last) if sts[i] == PT_PASS]
@@ -738,7 +948,7 @@ def _test_interval(g: Graph, pts: list[dict], test: str, index: Optional[dict] =
     between = [i for i in range(gi + 1, bi) if sts[i] in (PT_UNTESTED, PT_RUNNING)]
     if any(sts[i] == PT_RUNNING for i in between):
         return {"state": "wait", "gi": gi, "bi": bi}
-    if not between:                                 # 中间只剩跑不出结果的点：给出区间
+    if not between:
         return {"state": "done", "gi": gi, "bi": bi, "exact": bi == gi + 1}
     mid = between[len(between) // 2]
     return {"state": "need", "mid": mid, "gi": gi, "bi": bi, "running": False}
@@ -748,14 +958,14 @@ def start_locate(tx: Tx, tests: Iterable[str], bad: dict, trigger: str, ref: Opt
     """按规则定位：从“最后一次已知通过”到坏端二分。返回定位 id；不做定位时返回 None。"""
     g, cfg = tx.g, tx.cfg
     tests = sorted(set(t for t in tests if not is_cmd(t)))
-    if not cfg.locate or not _background_ok(g) or not tests or not guard_set(g.baseline):
+    if not cfg.locate or not _background_ok(g) or not tests or not g.baseline:
         return None
     bad_n = bad.get("snapshot")
     snap = g.snapshots.get(bad_n) if bad_n is not None else None
     epoch = snap.epoch if snap is not None else g.epoch
     if epoch != g.epoch:
         return None
-    for loc in g.locates.values():                  # 已有定位覆盖这些测试：复用
+    for loc in g.locates.values():
         if loc.epoch == epoch and set(tests) <= set(loc.tests):
             if loc.status == "running":
                 return loc.id
@@ -771,7 +981,7 @@ def start_locate(tx: Tx, tests: Iterable[str], bad: dict, trigger: str, ref: Opt
 
 
 def advance_locate(tx: Tx, lid: str) -> None:
-    for _ in range(64):                             # 复用已完成的作业时立即重算，直到需要等作业
+    for _ in range(64):
         g, cfg = tx.g, tx.cfg
         loc = g.locates.get(lid)
         if loc is None or loc.status != "running" or not _running_run(g):
@@ -794,10 +1004,8 @@ def advance_locate(tx: Tx, lid: str) -> None:
                (v["mid"] == mid or ((v["gi"] if v["gi"] is not None else -1) < mid < v["bi"])) and
                point_status(g, pts[mid]["tree"], t) == PT_UNTESTED]
         jid = ensure_job(tx, pts[mid]["tree"], units(run or [first]), "locate", locate=lid, tag="locate")
-        if tx.g.jobs[jid].state == JOB_RUNNING and tx.g.jobs[jid].locate == lid:
-            return
         if tx.g.jobs[jid].state == JOB_RUNNING:
-            return                                  # 同一个作业正被别的定位使用：等它结束
+            return
 
 
 def _attribution(g: Graph, p: dict) -> dict:
@@ -812,7 +1020,7 @@ def _conclude_locate(tx: Tx, lid: str, pts: list[dict], iv: dict) -> None:
     for t, v in sorted(iv.items()):
         if v["state"] == "done":
             gi, bi, exact = v["gi"], v["bi"], v["exact"]
-        else:                                       # 超出上限：给出已缩小的区间
+        else:
             gi = v["gi"] if v.get("gi") is not None else 0
             bi, exact = v["bi"], False
         key = (gi, bi)
@@ -824,7 +1032,6 @@ def _conclude_locate(tx: Tx, lid: str, pts: list[dict], iv: dict) -> None:
 
 
 def record_located(tx: Tx, lid: str, group: int, files: Iterable, diff: Optional[str]) -> None:
-    """外壳算出“好 → 坏”之间的改动之后的观察；随后学习相关性、请求诊断。"""
     g = tx.g
     loc = g.locates.get(lid)
     if loc is None or loc.status != "concluded" or group >= len(loc.groups) or not _running_run(g):
@@ -836,13 +1043,7 @@ def record_located(tx: Tx, lid: str, group: int, files: Iterable, diff: Optional
     tx.emit("regression_located", VERIFIER, OBSERVED, locate=lid, group=group, tests=grp["tests"],
             good=grp["good"], bad=grp["bad"], exact=bool(grp["exact"]), files=files, diff=diff,
             attribution=grp.get("attribution") or {})
-    if loc.trigger == "demoted" and grp["exact"]:
-        pairs = sorted({(f[0], check_unit(t)) for f in files for t in grp["tests"]
-                        if not is_test_path(f[0], suite_layout(tx.g)) and not is_cmd(t)})
-        pairs = [p for p in pairs if p not in tx.g.relations]
-        if pairs:
-            tx.emit("relation_learned", RUNTIME, RULE, pairs=[list(p) for p in pairs][:100], locate=lid)
-    if _running_run(tx.g) and not tx.g.run.finalizing:
+    if _running_run(tx.g) and not tx.g.run.finalizing and loc.trigger != "review":
         maybe_diagnose(tx, loc.trigger, grp["tests"], lid, group)
 
 
@@ -872,7 +1073,6 @@ def maybe_diagnose(tx: Tx, trigger: str, tests: Iterable[str], locate: Optional[
 
 
 def _repeated_diagnosis(tx: Tx, aid: str) -> None:
-    """同一回归签名第二次被拒：再诊断一次，带上前一次的结论。"""
     g = tx.g
     a = g.attempts[aid]
     sig = failure_signature(regression_ids(a.regressions))
@@ -880,8 +1080,7 @@ def _repeated_diagnosis(tx: Tx, aid: str) -> None:
             x.lane == LANE_FG and failure_signature(regression_ids(x.regressions)) == sig]
     if len(same) != 2:
         return
-    prev = [d for d in g.diagnoses.values() if d.status == "recorded" and
-            failure_signature(d.tests) == sig]
+    prev = [d for d in g.diagnoses.values() if d.status == "recorded" and failure_signature(d.tests) == sig]
     if prev:
         maybe_diagnose(tx, "repeated", regression_ids(a.regressions), prev[-1].locate, None, previous=prev[-1].id)
 
@@ -901,31 +1100,7 @@ def record_diagnosis(tx: Tx, did: str, result: dict, failed: bool = False) -> No
     tx.emit("diagnosis_recorded", DIAGNOSER, LLM, diagnosis=did, result=result, failed=failed)
 
 
-# ======================================================================== 需求的自动验证
-
-def auto_verify(tx: Tx) -> None:
-    """还没完成的需求：证据检查在链上最新的、有结果的存档里全部通过 → requirement_verified（不需要任何人声明）。"""
-    g = tx.g
-    if not _running_run(g):
-        return
-    on_chain = chain(g)
-    for r in open_requirements(g):
-        ev = evidence_checks(g, r)
-        if not ev:
-            continue
-        for cp in on_chain:
-            if cp.id == 0:
-                break
-            res = results_for_tree(g, cp.tree)
-            if all(res.get(c) == PASSED for c in ev):
-                tx.emit("requirement_verified", RUNTIME, RULE, requirement=r.id, checkpoint=cp.id,
-                        evidence={c: res[c] for c in ev})
-                break
-            if all(c in res for c in ev):
-                break                               # 最新的有结果的存档上没过：不往回找（那是被后来的改动弄坏的）
-
-
-# ======================================================================== 提交（唯一的完成声明）与复查（模块 F）
+# ======================================================================== 提交（请求立即复核）
 
 def _check_blocked(g: Graph, blocked: Iterable[dict]) -> list[dict]:
     out, problems = [], []
@@ -946,7 +1121,7 @@ def _check_blocked(g: Graph, blocked: Iterable[dict]) -> list[dict]:
             problems.append(f"{rid}: give a reason")
         elif kind == "check_conflict" and (not quote or not quote_in_text(str(quote), g.run.task)):
             problems.append(f"{rid}: a check_conflict must quote the task text verbatim (quote=...); for specific "
-                            "gate tests that fail on your change, use waive_check instead")
+                            "gate tests that fail on your change, propose waivers instead")
         else:
             out.append({"requirement": rid, "kind": kind, "reason": reason[:2000],
                         "quote": normalize_ws(str(quote))[:1000] if quote else None})
@@ -955,147 +1130,120 @@ def _check_blocked(g: Graph, blocked: Iterable[dict]) -> list[dict]:
     return out
 
 
+def _check_waivers(g: Graph, cfg: BelayConfig, waivers: Iterable[dict]) -> list[dict]:
+    """worker 提议的豁免：只校验格式（引文逐字、测试在回归门里），是否采纳由复核者裁决。"""
+    waivers = list(waivers or ())
+    if not waivers:
+        return []
+    if not cfg.waivers:
+        raise Rejected("Waivers are disabled for this run: keep the existing behaviour, or report the conflict in "
+                       "submit(blocked=[{requirement, kind: \"check_conflict\", reason, quote}]).")
+    out, problems = [], []
+    guard = guard_set(g.baseline)
+    for w in waivers:
+        if not isinstance(w, dict):
+            problems.append("each waiver is an object {tests, quote, reason}")
+            continue
+        tests = [str(t).strip() for t in (w.get("tests") or []) if str(t).strip()]
+        q = normalize_ws(str(w.get("quote") or ""))
+        reason = str(w.get("reason") or "").strip()
+        bad = [t for t in tests if t not in guard or is_cmd(t)]
+        if not tests:
+            problems.append("name the tests (tests=[...], full ids as the gate reports them)")
+        elif bad:
+            problems.append(f"not in the regression gate: {', '.join(bad[:5])}")
+        elif len(q.split()) < 3 or not quote_in_text(q, g.run.task):
+            problems.append("quote must be at least three words copied verbatim from the task text that ask for the "
+                            "new behaviour")
+        elif not reason:
+            problems.append("give a reason: how each test contradicts the task text")
+        else:
+            rid = str(w.get("requirement") or "").strip() or None
+            out.append({"tests": tests[:50], "quote": q[:1000], "reason": reason[:2000],
+                        "requirement": rid if rid in g.requirements else None})
+    if problems:
+        raise Rejected("Nothing was submitted:\n" + "\n".join(f"- {p}" for p in problems[:20]))
+    return out
+
+
 def request_submit(tx: Tx, worker: str, snapshot: int, summary: str = "", blocked: Iterable[dict] = (),
-                   implicit: bool = False) -> str:
-    """worker 声明做完了：对调用方刚强制拍下的快照发起前台存档；存档有了就逐条判定需求、请复查者收紧。"""
+                   implicit: bool = False, waivers: Iterable[dict] = ()) -> str:
+    """worker 请求立即复核：对调用方刚强制拍下的快照发起前台合并请求（取代后台的）；快照就是链头时只判定需求。"""
     g = tx.g
     if not g.baseline_ready or g.head is None or not g.frozen:
         raise Rejected("The harness is still setting up; try again shortly.")
     if open_submit(g, worker) is not None:
-        raise Rejected("Your previous submit is still being checked; wait for its result.")
+        raise Rejected("Your previous submit is still being reviewed; wait for its result.")
     if open_attempt(g, worker, LANE_FG) is not None:
-        raise Rejected("A checkpoint of your work is already in progress.")
+        raise Rejected("A merge request of your work is already in progress.")
     snap = g.snapshots.get(snapshot)
     if snap is None:
         raise Rejected("No snapshot of your working tree yet.")
     clean = _check_blocked(g, blocked)
+    props = _check_waivers(g, tx.cfg, waivers)
     sid = next_id("U", g.submits)
     payload = dict(submit=sid, worker=worker, snapshot=snap.n, summary=(summary or "")[:4000], blocked=clean,
-                   implicit=implicit)
-    if snap.tree == g.head_cp.tree:                  # 后台已经存过这棵树：直接在链头上判定
-        mark_head(tx, worker, KIND_SUBMIT, summary)
+                   waivers=props, implicit=implicit)
+    for a in list(g.attempts.values()):              # 新的前台请求胜出：后台的请求让路（作业结果按树复用）
+        if a.worker == worker and a.lane == LANE_BG and a.status == ATT_PENDING:
+            supersede_attempt(tx, a.id, "a submit")
+    if snap.tree == tx.g.head_cp.tree:
         tx.emit("submit_requested", worker_actor(worker), RULE, **payload, checkpoint=tx.g.head)
+        _judge_on_head(tx, sid)
     else:
-        request_checkpoint(tx, worker, snap.n, "submit", summary=(summary or "").strip().split("\n")[0][:300],
-                           submit=payload)
-    evaluate_submit(tx, sid)
+        request_merge(tx, worker, snap.n, "submit", summary=(summary or "").strip().split("\n")[0][:300],
+                      submit=payload)
     return sid
 
 
-def evaluate_submit(tx: Tx, sid: str) -> None:
-    """提交的存档有了：先等证据检查的结果，再逐条判定 actionable 需求，然后请复查者批量收紧。"""
-    g = tx.g
+def _judge_on_head(tx: Tx, sid: str) -> None:
+    """提交的快照就是链头（没有新的改动）：还没有在这棵树上判定过的需求请复核者看一眼（只判定、不合并）；
+    都判定过了就直接按账本回答。没有复核者（或复核者不可用）时按自述记下。"""
+    g, cfg = tx.g, tx.cfg
     s = g.submits.get(sid)
-    if s is None or s.status != SUB_CHECKPOINTED or not _running_run(g):
+    if s is None or s.status != SUB_PENDING or s.attempt is not None and g.attempts[s.attempt].status == ATT_PENDING:
         return
-    cp = g.checkpoints[s.checkpoint]
-    opens = open_requirements(g)
-    need = sorted({c for r in opens for c in evidence_checks(g, r)})
-    res = results_for_tree(g, cp.tree)
-    missing = [c for c in need if c not in res]
-    if missing:
-        u = list(units(missing))
-        if not finished_covers(g, cp.tree, u):
-            if not running_covers(g, cp.tree, u):
-                ensure_job(tx, cp.tree, u, "evidence")
+    head = g.head_cp
+    prev = g.reviews.get(s.review) if s.review else None
+    if prev is not None and prev.status in (REV_RUNNING, REV_RECORDED):
+        return
+    failed = [v for v in g.reviews.values() if v.submit == sid and v.attempt is None and v.status == REV_FAILED]
+    declared = [str(b["requirement"]) for b in s.blocked if g.requirements[str(b["requirement"])].status != REQ_BLOCKED
+                or g.requirements[str(b["requirement"])].by == BY_SELF]
+    opens = [r.id for r in open_requirements(g)]
+    if not opens and not declared:
+        return finish_submit(tx, sid)
+    if cfg.reviewer and len(failed) <= cfg.review_retries and not (failed and g.run.finalizing):
+        judged = judged_on_tree(g, head.tree)
+        need = [r for r in opens if r not in judged] + declared      # 新的受阻声明总要复核者看一眼
+        if head.id == 0 or head.review is None:
+            need = opens + declared
+        if need:
+            if not _review_slot(tx, LANE_FG):
+                return                              # 复核者在忙：复核结束时级联会再来
+            vid = next_id("V", tx.g.reviews)
+            tx.emit("review_started", RUNTIME, RULE, review=vid, trigger="judge", checkpoint=tx.g.head, tree=head.tree,
+                    snapshot=s.snapshot, base=tx.g.head, submit=sid, focus=_focus(tx.g, sid), gate={},
+                    retry_of=failed[-1].id if failed else None)
             return
-    auto_verify(tx)
-    blocked = {b["requirement"]: b for b in s.blocked}
-    failing: dict[str, list[str]] = {}
-    for r in open_requirements(tx.g):
-        ev = evidence_checks(tx.g, r)
-        if r.id in blocked:
-            b = blocked[r.id]
-            tx.emit("requirement_blocked", worker_actor(s.worker), SELF_REPORT, requirement=r.id, kind=b["kind"],
-                    reason=b["reason"], quote=b.get("quote"), submit=sid)
-        elif ev:
-            failing[r.id] = [f"{c} ({res.get(c, 'MISSING')})" for c in ev if res.get(c) != PASSED]
-        else:
-            tx.emit("requirement_submitted", worker_actor(s.worker), SELF_REPORT, requirement=r.id,
-                    checkpoint=cp.id, submit=sid)
-    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status=SUB_REVIEWING, failing=failing)
-    _start_reviews(tx, sid)
+        return finish_submit(tx, sid)
+    _self_report(tx, sid, g.head)
     finish_submit(tx, sid)
 
 
-def _review_eligible(g: Graph, cfg: BelayConfig, rid: str, phase: str) -> bool:
-    r = g.requirements[rid]
-    if not cfg.reviewer or r.review is not None or r.review_reopens >= cfg.review_max_reopens:
-        return False
-    if phase == "done":
-        return r.status == REQ_SUBMITTED
-    return r.status == REQ_BLOCKED and r.blocked_kind in REVIEWED_BLOCK_KINDS
-
-
-def _start_reviews(tx: Tx, sid: Optional[str]) -> int:
-    """还没复查过的已提交需求、以 insufficient_info / environment 受阻的需求：分批复查（每批 review_batch 条）。"""
-    g, cfg = tx.g, tx.cfg
-    s = g.submits.get(sid) if sid else None
-    n = 0
-    for phase in ("done", "blocked"):
-        rids = [r.id for r in actionable(tx.g) if _review_eligible(tx.g, cfg, r.id, phase)]
-        for i in range(0, len(rids), max(1, cfg.review_batch)):
-            vid = next_id("V", tx.g.reviews)
-            tx.emit("review_started", RUNTIME, RULE, review=vid, phase=phase,
-                    requirements=rids[i:i + max(1, cfg.review_batch)],
-                    checkpoint=s.checkpoint if s is not None else tx.g.head, submit=sid)
-            n += 1
-    return n
-
-
 def finish_submit(tx: Tx, sid: str) -> None:
-    """复查都结束了：还有没完成的 actionable 需求 → 交还清单（returned）；没有 → 接受（运行可以收尾）。"""
+    """提交的结论：合并（或只判定）之后还有没完成的 actionable 需求 → 交还清单；没有 → 接受（运行可以收尾）。"""
     g = tx.g
     s = g.submits.get(sid)
-    if s is None or s.status != SUB_REVIEWING:
+    if s is None or s.status != SUB_PENDING:
         return
-    if any(v.submit == sid and v.status == "running" for v in g.reviews.values()):
+    if s.attempt is not None and g.attempts[s.attempt].status != ATT_CREATED and s.checkpoint is None:
+        return
+    if s.review is not None and g.reviews[s.review].status in (REV_RUNNING, REV_RECORDED):
         return
     left = [r.id for r in open_requirements(g)]
-    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned" if left else "accepted", open=left)
-
-
-def record_review(tx: Tx, vid: str, results: dict) -> None:
-    """复查者（llm）只能收紧：no / partial → 重开；受阻的需求给出合理读法 → 重开；yes 什么都不做。"""
-    g = tx.g
-    v = g.reviews.get(vid)
-    if v is None or v.status != "running" or not _running_run(g):
-        return
-    clean: dict[str, dict] = {}
-    for rid in v.requirements:
-        r = dict((results or {}).get(rid) or {})
-        if v.phase == "blocked":
-            impl = "reading" if str(r.get("reading") or "").strip() else ("none" if r else "failed")
-        else:
-            impl = r.get("implemented")
-            if impl not in ("yes", "partial", "no"):
-                impl = "failed"
-        clean[rid] = {"implemented": impl, "missing": [str(x)[:300] for x in (r.get("missing") or [])][:20],
-                      "evidence": [str(x)[:300] for x in (r.get("evidence") or [])][:20],
-                      "reading": str(r.get("reading") or "")[:1500] or None}
-    tx.emit("review_recorded", REVIEWER, LLM, review=vid, results=clean)
-    if tx.g.run.reserve or tx.g.run.finalizing:
-        return                                     # 截止收尾时已经没有时间再做：只进账本
-    if v.retry_of is None:                         # 没拿到结论的条目（输出截断、格式坏了）各自单条重试一次
-        want = REQ_SUBMITTED if v.phase == "done" else REQ_BLOCKED
-        for rid, res in clean.items():
-            if res["implemented"] == "failed" and tx.g.requirements[rid].status == want:
-                tx.emit("review_started", RUNTIME, RULE, review=next_id("V", tx.g.reviews), phase=v.phase,
-                        requirements=[rid], checkpoint=v.checkpoint, submit=v.submit, retry_of=vid)
-    for rid, res in clean.items():
-        r = tx.g.requirements[rid]
-        if v.phase == "done" and res["implemented"] in ("no", "partial") and r.status == REQ_SUBMITTED:
-            tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_missing",
-                    failures=res["missing"] or [f"review: implemented={res['implemented']}"])
-        elif v.phase == "blocked" and res["implemented"] == "reading" and r.status == REQ_BLOCKED:
-            if r.blocked_kind == "environment":
-                tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_workaround",
-                        failures=[f"a way to do it in this repository: {res['reading']}"[:1500]])
-            else:
-                tx.emit("requirement_reopened", RUNTIME, RULE, requirement=rid, reason="review_reading",
-                        failures=[f"a reasonable reading: {res['reading']}"[:1500]])
-    if v.submit is not None:
-        finish_submit(tx, v.submit)
+    tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned" if left else "accepted", open=left,
+            checkpoint=s.checkpoint if s.checkpoint is not None else g.head)
 
 
 # ======================================================================== 作业
@@ -1108,7 +1256,7 @@ def job_preempted(tx: Tx, job_id: str) -> None:
 
 def job_finished(tx: Tx, job_id: str, state: str, results: dict, sec: float = 0.0, error: str = "",
                  reasons: Optional[dict] = None) -> None:
-    """作业结果（观察）→ 级联：重跑丢失的作业、推进在等结果的尝试、判定证据、提升与降级、定位。"""
+    """作业结果（观察）→ 级联：重跑丢失的作业、推进在等结果的合并请求、定位。"""
     job = tx.g.jobs.get(job_id)
     if job is None or job.state != JOB_RUNNING:
         return
@@ -1120,61 +1268,58 @@ def job_finished(tx: Tx, job_id: str, state: str, results: dict, sec: float = 0.
         return
     if state == JOB_CANCELLED:
         if tx.g.run.finalizing or tx.g.run.reserve:
-            for a in list(tx.g.attempts.values()):  # 收尾时取消的作业：依赖它的尝试直接拒绝（链不动）
+            for a in list(tx.g.attempts.values()):
                 if a.status == ATT_PENDING and job_id in a.jobs:
-                    tx.emit("checkpoint_rejected", RUNTIME, RULE, attempt=a.id, regressions=[], reason="cancelled")
+                    tx.emit("merge_rejected", RUNTIME, RULE, attempt=a.id, regressions=[], reason="cancelled")
+                    _cancel_review(tx, a.review, "cancelled at the deadline")
             return
     elif state == JOB_UNKNOWN and not job.live:
         att = job.attempt if job.attempt and tx.g.attempts[job.attempt].status == ATT_PENDING else None
         ensure_job(tx, job.tree, job.selection, job.purpose, attempt=att, tag=job.tag, where=job.where,
                    locate=job.locate, checkpoint=job.checkpoint)
-    _cascade(tx, job_id)
+    _cascade(tx)
 
 
-def _cascade(tx: Tx, job_id: Optional[str] = None) -> None:
+def _cascade(tx: Tx) -> None:
     for a in list(tx.g.attempts.values()):
         if a.status == ATT_PENDING:
             advance_attempt(tx, a.id)
-    job = tx.g.jobs.get(job_id) if job_id else None
-    if job is not None and job.state == JOB_FINISHED and not job.live:
-        for cp in chain(tx.g):
-            if cp.tree == job.tree and cp.level == PROVISIONAL and not cp.demoted:
-                evaluate_promotion(tx, cp.id)
-        if job.tag.startswith("recheck:"):
-            _evaluate_recheck(tx, job_id)
-        auto_verify(tx)
-    for s in list(tx.g.submits.values()):
-        if s.status == SUB_CHECKPOINTED:
-            evaluate_submit(tx, s.id)
+    for s in list(tx.g.submits.values()):            # 只判定的提交：复核者空出来了、或复核失败要重试
+        if s.status != SUB_PENDING:
+            continue
+        a = tx.g.attempts.get(s.attempt) if s.attempt else None
+        if a is None or (a.status not in (ATT_PENDING, ATT_ADVANCING, ATT_CREATED) and s.checkpoint is not None):
+            _judge_on_head(tx, s.id)
+        elif a.status == ATT_CREATED:
+            finish_submit(tx, s.id)
     for lid in [l.id for l in tx.g.locates.values() if l.status == "running"]:
         advance_locate(tx, lid)
-    schedule_promotion(tx)
     schedule_background(tx)
 
 
 # ======================================================================== 回退
 
 def rollback(tx: Tx, worker: str, to: Optional[int] = None) -> int:
-    """回退（只由恢复流程使用：容器重建后丢了链上的存档）：默认退到最近的里程碑。先取消后台尝试；
-    有前台尝试、有尝试正在推进或有提交在判定时拒绝。"""
+    """回退（只由恢复流程使用：容器重建后丢了链上的合并点）。"""
     g = tx.g
-    to = latest_milestone(g) if to is None else int(to)
+    to = g.head if to is None else int(to)
     ids = chain_ids(g)
     if to not in ids:
-        raise Rejected(f"Checkpoint {to} is not on the checkpoint chain ({', '.join(map(str, ids))}).")
+        raise Rejected(f"Merge point {to} is not on the chain ({', '.join(map(str, ids))}).")
     if open_attempt(g, None, LANE_FG) is not None or any(a.status == ATT_ADVANCING for a in g.attempts.values()):
-        raise Rejected("A checkpoint is in progress; roll back after it finishes.")
+        raise Rejected("A merge is in progress; roll back after it finishes.")
     if open_submit(g) is not None:
-        raise Rejected("A submit is being checked; roll back after it finishes.")
+        raise Rejected("A submit is being reviewed; roll back after it finishes.")
     for a in list(g.attempts.values()):
         if a.status == ATT_PENDING and a.lane == LANE_BG:
             supersede_attempt(tx, a.id, "rollback")
     g = tx.g
     abandoned = ids[:ids.index(to)]
     for r in actionable(g):
-        if r.status in (REQ_VERIFIED, REQ_SUBMITTED) and r.checkpoint in abandoned:
-            tx.emit("requirement_reopened", worker_actor(worker), RULE, requirement=r.id, reason="rolled_back",
-                    failures=[f"checkpoint {r.checkpoint} was rolled back"])
+        if r.status in (REQ_DONE, REQ_BLOCKED) and r.checkpoint in abandoned:
+            tx.emit("requirement_judged", worker_actor(worker), RULE, requirement=r.id, status=REQ_OPEN,
+                    judgement=None, by=BY_ROLLBACK, reason="rolled_back", checkpoint=to,
+                    missing=[f"merge point {r.checkpoint} was rolled back"])
     keep = [c for c in chain(tx.g) if c.id not in abandoned]
     for t in sorted(tx.g.todos.values(), key=lambda t: t.n):
         if t.status not in (TODO_COMPLETED, TODO_ANCHORED):
@@ -1200,6 +1345,21 @@ def tick(tx: Tx) -> None:
         detect_stalls(tx)
     for lid in [l.id for l in tx.g.locates.values() if l.status == "running"]:
         advance_locate(tx, lid)
+    schedule_background(tx)                          # 到了间隔的后台合并请求
+
+
+def _review_rejections_in_row(g: Graph, worker: str) -> list[Attempt]:
+    """最近一次合并之后，连续被复核者拒绝的合并请求。"""
+    out = []
+    for a in sorted((a for a in g.attempts.values() if a.worker == worker and a.status in (ATT_REJECTED, ATT_CREATED)
+                     and a.reason != "cancelled"), key=lambda a: a.created_seq, reverse=True):
+        if a.status == ATT_CREATED:
+            break
+        if a.reason == "review":
+            out.append(a)
+        elif a.lane == LANE_FG:
+            break
+    return out
 
 
 def detect_stalls(tx: Tx) -> None:
@@ -1213,9 +1373,8 @@ def detect_stalls(tx: Tx) -> None:
             tx.emit("stall_detected", RUNTIME, RULE, kind="no_progress", action="hint", worker=w,
                     detail=f"no progress for {int((tx.now - idle_since) / 60)} min")
             return
-        mine = sorted((a for a in g.attempts.values() if a.worker == w and a.status in (ATT_REJECTED, "created")
-                       and a.lane == LANE_FG),
-                      key=lambda a: a.created_seq)[-cfg.stall_same_failure:]
+        mine = sorted((a for a in g.attempts.values() if a.worker == w and a.status in (ATT_REJECTED, ATT_CREATED)
+                       and a.lane == LANE_FG), key=lambda a: a.created_seq)[-cfg.stall_same_failure:]
         if len(mine) == cfg.stall_same_failure and all(a.status == ATT_REJECTED and a.regressions for a in mine):
             sigs = {failure_signature(a.regressions) for a in mine}
             if len(sigs) == 1:
@@ -1225,6 +1384,15 @@ def detect_stalls(tx: Tx) -> None:
                             detail=f"signature {sig}: the same {len(mine[-1].regressions)} regression(s) "
                                    f"rejected {len(mine)} submits in a row")
                     return
+        rej = _review_rejections_in_row(g, w)
+        if len(rej) >= cfg.stall_same_failure:
+            last_merge = max((c.created_seq for c in g.checkpoints.values()), default=0)
+            if not any(x.kind == "review_rejections" and x.seq > last_merge for x in g.stalls):
+                latest = rej[0]
+                tx.emit("stall_detected", RUNTIME, RULE, kind="review_rejections", action="hint", worker=w,
+                        detail=f"{len(rej)} merge requests in a row were not approved by the reviewer; latest "
+                               f"({latest.id}): {latest.detail[:600]}")
+                return
 
 
 # ======================================================================== 会话
@@ -1279,16 +1447,10 @@ def suspend(tx: Tx, reason: str = "suspend") -> None:
     tx.emit("run_suspended", RUNTIME, RULE, reason=reason)
 
 
-def label_checkpoint(tx: Tx, cid: int, label: str) -> None:
-    if cid in tx.g.checkpoints and label.strip():
-        tx.emit("checkpoint_labeled", COMPACTOR, LLM, checkpoint=cid, label=label.strip()[:300])
-
-
 # ======================================================================== 运行的结束
 
 def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str, str]:
-    """会话结束不等于运行结束。返回 (动作, 理由)：stop | finalize | start_session | resume_session | wait。
-    运行在提交被接受（没有未完成的 actionable 需求）时收尾；会话结束了但没有提交，就开新会话接着做。"""
+    """会话结束不等于运行结束。返回 (动作, 理由)：stop | finalize | start_session | resume_session | wait。"""
     if g.run is None or g.run.status != RUN_RUNNING:
         return "stop", "delivered"
     if g.run.finalizing:
@@ -1301,9 +1463,9 @@ def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str,
     if ws is not None and ws.session is not None:
         return "resume_session", ws.session
     if open_attempt(g, None, LANE_FG) is not None:
-        return "wait", "checkpoint in progress"
+        return "wait", "merge in progress"
     if g.degraded and open_attempt(g, None, LANE_BG) is not None:
-        return "wait", "checkpoint in progress"     # 降级模式：切换工作区的验证结束前不能开会话
+        return "wait", "merge in progress"
     if open_submit(g, worker) is not None:
         return "wait", "submit in progress"
     if submit_accepted(g, worker):
@@ -1316,37 +1478,36 @@ def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str,
 
 
 def begin_finalize(tx: Tx, reason: str) -> None:
-    """收尾开始：不再开新的后台验证；取消后台尝试。"""
+    """收尾开始：不再发起后台合并请求；取代正在进行的后台请求（复核随之取消）。"""
     if tx.g.run is None or tx.g.run.status != RUN_RUNNING or tx.g.run.finalizing:
         return
     tx.emit("finalize_started", RUNTIME, RULE, reason=reason)
     for a in list(tx.g.attempts.values()):
         if a.status == ATT_PENDING and a.lane == LANE_BG:
             supersede_attempt(tx, a.id, "finalize")
+    _cascade(tx)                                    # 复核者空出来了：在等它的前台请求（submit）接着走
 
 
 def final_status(g: Graph, delivered: Optional[int]) -> str:
-    """DONE 的条件见 queries.status_reasons。"""
-    from belay.core.queries import status_reasons
     return "INCOMPLETE" if status_reasons(g, delivered) else "DONE"
 
 
 def deliver(tx: Tx, reason: str, checkpoint: Optional[int] = None, lag: Optional[dict] = None) -> str:
-    from belay.core.queries import delivery_checkpoint, done_not_delivered
+    """交付链头（合并链单调，链头就是最好的结果）。"""
     abort_attempts(tx, "cancelled")
+    v = running_review(tx.g)
+    if v is not None:
+        _cancel_review(tx, v.id, "the run was delivered")
     g = tx.g
-    cid = delivery_checkpoint(g, tx.cfg) if checkpoint is None else int(checkpoint)
+    cid = delivery_checkpoint(g) if checkpoint is None else int(checkpoint)
     if not is_ancestor(g, cid, g.head):
-        cid = delivery_checkpoint(g, tx.cfg)
-    from belay.core.queries import status_reasons
+        cid = delivery_checkpoint(g)
     reasons = status_reasons(g, cid)
     status = "INCOMPLETE" if reasons else "DONE"
     cp = g.checkpoints[cid]
-    behind = chain_ids(g).index(cid)
-    tx.emit("delivered", RUNTIME, RULE, checkpoint=cid, status=status, reason=reason, level=cp.level,
-            head=g.head, behind_head=behind, unconfirmed_policy=tx.cfg.deliver_unconfirmed,
-            not_delivered=[t.id for t in done_not_delivered(g, cid)], lag=dict(lag or {}),
-            full_verified=full_verified(g, cp.tree), status_reasons=reasons)
+    tx.emit("delivered", RUNTIME, RULE, checkpoint=cid, status=status, reason=reason, head=g.head,
+            behind_head=chain_ids(g).index(cid), score=cp.score, lag=dict(lag or {}),
+            status_reasons=reasons)
     return status
 
 

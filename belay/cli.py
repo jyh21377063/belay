@@ -6,10 +6,12 @@
   python -m belay.cli resume --run-dir runs/x --rebuild [--docker <新容器>]
                                                               # 容器 / 工作区 / 影子仓库丢了：从 git bundle 重建
   python -m belay.cli ledger --run-dir runs/x                 # 从事件库重放出账本
+  python -m belay.cli handoff --run-dir runs/x                # 随时导出交接上下文：新会话开场会看到的内容（账本 + todo
+                                                              # + 交接摘要 + 待处理的问题），可以直接交给下一个会话
   python -m belay.cli flat   --workdir /path/to/repo --task-file task.md   # B 组：同一个 worker，不用图
 
 模型配置从环境变量读取：DEEPSEEK_API_KEY（或 ANTHROPIC_API_KEY）、ANTHROPIC_BASE_URL、BELAY_MODEL；
-诊断者、复查者、存档标签可以用较便宜的模型（--aux-model / BELAY_AUX_MODEL，默认与 worker 相同）。
+复核者与诊断者可以单独指定模型（--aux-model / BELAY_AUX_MODEL，默认与 worker 相同）。
 --gate 兼容 eval 的 gate.json（test_cmd / parser / prelude / commands / timeout_sec，可加 public_checks）。
 """
 from __future__ import annotations
@@ -46,7 +48,7 @@ def _common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--record", help="把模型回复录制到该文件")
     ap.add_argument("--replay", help="回放录制的模型回复，不调用模型")
     ap.add_argument("--aux-model", default=os.environ.get("BELAY_AUX_MODEL"),
-                    help="诊断者、复查者、存档标签用的模型（默认与 worker 相同）")
+                    help="复核者与诊断者用的模型（默认与 worker 相同）")
 
 
 def _run_belay(args, resume: bool, rebuild: bool = False) -> None:
@@ -84,7 +86,7 @@ def _run_belay(args, resume: bool, rebuild: bool = False) -> None:
         if not task:
             raise SystemExit("需要 --task 或 --task-file")
         res = asyncio.run(run.start(task, run_id=run_dir.name))
-    print(f"\nstatus={res.status} delivered checkpoint={res.checkpoint}\nledger: {run_dir / 'ledger.md'}\n"
+    print(f"\nstatus={res.status} delivered merge point={res.checkpoint}\nledger: {run_dir / 'ledger.md'}\n"
           f"deliverable: {run_dir / 'deliverable.diff'}")
 
 
@@ -94,6 +96,23 @@ def _ledger(args) -> None:
     from belay.runtime.store import EventStore
     store = EventStore(args.run_dir)
     print(ledger_markdown(replay(store.events())))
+
+
+def _handoff(args) -> None:
+    """不需要容器：只从事件库重放出图，生成新会话开场会看到的上下文（不含需要 git 的改动 diff）。"""
+    from belay.core.config import BelayConfig
+    from belay.core.context import build_context
+    from belay.core.reduce import replay
+    from belay.runtime.store import EventStore
+    store = EventStore(args.run_dir)
+    try:
+        g = replay(store.events())
+    finally:
+        store.close()
+    cfg = BelayConfig()
+    worker = args.worker or (next(iter(g.workers)) if g.workers else "w1")
+    ctx = build_context(g, worker, cfg.opening_budget_tokens, time.time(), cfg, mode="resume")
+    print(ctx.text)
 
 
 def _flat(args) -> None:
@@ -131,6 +150,9 @@ def main() -> None:
     _common(res)
     led = sub.add_parser("ledger", help="从事件库重放出账本")
     led.add_argument("--run-dir", required=True)
+    hand = sub.add_parser("handoff", help="导出交接上下文（新会话的开场）")
+    hand.add_argument("--run-dir", required=True)
+    hand.add_argument("--worker")
     flat = sub.add_parser("flat", help="B 组：只有 worker，不用图")
     flat.add_argument("--workdir", required=True)
     flat.add_argument("--docker")
@@ -147,6 +169,8 @@ def main() -> None:
         _run_belay(args, resume=True, rebuild=args.rebuild)
     elif args.cmd == "ledger":
         _ledger(args)
+    elif args.cmd == "handoff":
+        _handoff(args)
     else:
         _flat(args)
 

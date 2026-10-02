@@ -1,8 +1,8 @@
-"""复查者的输入：需求原文 + 按需求筛过的相关改动 + 全部改动文件的列表（纯文本处理，不做 IO）。
+"""复核者开场里的 diff：按需求预排序（纯文本处理，不做 IO）。
 
-在 SWE-EVO 这类题上，需求大多没有可用的测试，提交时由复查者判断“这条需求在改动里有没有做”。整个 diff 往往很大
-（几十个文件），直接截断会让排在后面的需求看不到自己的改动。所以先按每条需求原文里的名字（标识符、带点的名字、
-反引号里的代码、文件路径、PR 号）给 diff 的每个 hunk 打分，把最相关的 hunk 放在前面；剩下的预算再给完整 diff 的开头。
+整个 diff 往往很大（几十个文件），直接截断会让排在后面的需求看不到自己的改动。所以先按每条需求原文里的名字
+（标识符、带点的名字、反引号里的代码、文件路径、PR 号）给 diff 的每个 hunk 打分，把最相关的 hunk 放在前面；剩下的
+预算再给完整 diff 的开头。复核者可以随时 read_file / grep_search 看全文，这里只是让它先看到最可能相关的部分。
 """
 from __future__ import annotations
 
@@ -76,34 +76,24 @@ def _score(path: str, hunk: str, words: Iterable[str]) -> int:
     return score
 
 
-def review_input(reqs, diff: str, files: list, summary: str = "", todos: Iterable[str] = (), notes: str = "",
-                 budget: int = 60_000) -> str:
-    """reqs：Requirement 列表（有 id、quote）；files：[(路径, 增, 删)]。返回给复查者的整段文字（不超过 budget）。"""
-    parts = ["Requirements to review:"]
-    for r in reqs:
-        parts.append(f"- {r.id}: \"{r.quote}\"")
-    if summary.strip():
-        parts.append("The agent's submit summary (self-reported):\n" + summary.strip()[:3000])
-    todos = [t for t in todos if t.strip()]
-    if todos:
-        parts.append("The agent's todo items (self-reported):\n" + "\n".join(f"- {t[:200]}" for t in todos[:60]))
-    if notes.strip():
-        parts.append("The agent's notes from its last handoff (self-reported):\n" + notes.strip()[:2000])
+def diff_digest(reqs, diff: str, files: list, budget: int = 60_000) -> str:
+    """reqs：Requirement 列表（有 id、quote）；files：[(路径, 增, 删)]。返回给复核者的改动摘要（不超过 budget）。"""
+    parts = []
     if files:
-        parts.append("All changed files (+added -deleted lines):\n" + "\n".join(
+        parts.append("Changed files (+added -deleted lines):\n" + "\n".join(
             f"  {p} (+{a} -{d})" for p, a, d in files[:200]) + (f"\n  ... {len(files) - 200} more" if
                                                                 len(files) > 200 else ""))
     else:
-        parts.append("The changes are empty: nothing outside test paths was changed.")
+        return "The changes are empty: nothing outside test paths differs from the previous merge point."
     head = "\n\n".join(parts)
     left = max(2000, budget - len(head))
     hunks = split_hunks(diff) if diff else []
-    per_req = max(1500, int(left * 0.7) // max(1, len(reqs)))
+    per_req = max(1500, int(left * 0.6) // max(1, len(reqs)))
     used: set[int] = set()
     sections = []
     for r in reqs:
         words = keywords(r.quote)
-        scored = sorted(((_score(p, h, words), i) for i, (p, h) in enumerate(hunks)), reverse=True)
+        scored = sorted(((_score(p, h, words), i) for i, (p, h) in enumerate(hunks) if i not in used), reverse=True)
         picked, size = [], 0
         for sc, i in scored:
             if sc <= 0:
@@ -116,17 +106,15 @@ def review_input(reqs, diff: str, files: list, summary: str = "", todos: Iterabl
         if picked:
             body = "".join(hunks[i][1][:per_req] for i in sorted(picked))
             used.update(picked)
-            sections.append(f"## Changes that look related to {r.id} (matched names: {', '.join(words[:8])})\n"
+            sections.append(f"### Changes that look related to {r.id} (matched names: {', '.join(words[:8])})\n"
                             f"```diff\n{body}\n```")
-        else:
-            sections.append(f"## {r.id}: no part of the diff mentions the names in its text "
-                            f"({', '.join(words[:8]) or 'no code-like names'}); judge from the file list and the "
-                            "rest of the diff.")
-    text = head + "\n\n" + "\n\n".join(sections)
+    text = head + ("\n\n" + "\n\n".join(sections) if sections else "")
     rest = "".join(h for i, (_p, h) in enumerate(hunks) if i not in used)
     room = budget - len(text) - 200
     if rest and room > 1000:
         clipped = rest[:room]
-        text += "\n\n## The rest of the diff" + (" (truncated)" if len(rest) > room else "") + \
-            f"\n```diff\n{clipped}\n```"
+        text += "\n\n### " + ("The rest of the diff" if sections else "The diff") + \
+            (" (truncated; read the files for the rest)" if len(rest) > room else "") + f"\n```diff\n{clipped}\n```"
+    elif rest:
+        text += "\n\n(The rest of the diff is not shown: read the changed files.)"
     return text[:budget]

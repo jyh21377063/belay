@@ -127,7 +127,7 @@ def guard_set(baseline: dict[str, str]) -> frozenset[str]:
 
 
 def active_guard(g: Graph) -> frozenset[str]:
-    """回归门实际检查的集合：守护集合去掉被豁免的检查（check_waived）。"""
+    """回归门实际检查的集合：守护集合去掉被豁免的检查（waiver_granted，复核者裁决）。"""
     guard = guard_set(g.baseline)
     return guard - frozenset(g.waived) if g.waived else guard
 
@@ -266,7 +266,7 @@ def tree_regressions(g: Graph, tree: str) -> tuple[str, ...]:
 
 
 def checkpoint_full_ok(g: Graph, cid: Optional[int]) -> bool:
-    """这个存档的树有全量结果且没有回归；没有任何可用检查时视为通过（账本里会注明未验证）。"""
+    """这个合并点的树有全量结果且没有回归；没有任何可用检查时视为通过（账本里会注明未验证）。"""
     cp = g.checkpoints.get(cid) if cid is not None else None
     if cp is None:
         return False
@@ -326,7 +326,7 @@ def point_status(g: Graph, tree: str, test: str, index: Optional[dict[str, list[
 # ---------------------------------------------------------------- 验证队列的四档优先级
 
 def job_priority(g: Graph, job: Job) -> int:
-    """1 收尾与交付 / 基线；2 worker 在等的（submit 与证据、定位）；3 后台：最新快照的验证、提升；
+    """1 收尾与基线；2 有人在等的（submit 的回归门、复核者要的测试、定位）；3 后台合并请求的回归门；
     4 已被取代但还在跑的后台作业。"""
     if job.purpose == "baseline" or (g.run is not None and g.run.finalizing):
         return 1
@@ -337,9 +337,7 @@ def job_priority(g: Graph, job: Job) -> int:
         if a.lane == LANE_FG:
             return 2
         return 3 if a.status in ("pending", "advancing") else 4
-    if job.purpose in ("promote",):
-        return 3
-    if job.purpose == "verify":             # 尝试已经结束（被取代）但作业还在
+    if job.purpose in ("gate", "confirm"):  # 合并请求已经结束（被取代）但作业还在
         return 4
     return 2
 

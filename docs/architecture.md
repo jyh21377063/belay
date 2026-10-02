@@ -9,40 +9,42 @@
 belay/
 ├── core/            纯函数核心：不做 IO、不调模型、不读时钟（now 作为参数传入）
 │   ├── events.py    事件类型、必需字段、允许的来源
-│   ├── model.py     三个视图（需求账本 + todo + 提交 / 执行状态 + 快照时间线 / 两级存档链）的不可变数据模型；快照序列化
+│   ├── model.py     三个视图（需求账本 + todo + 提交 + 复核 / 执行状态 + 快照时间线 / 合并链）的不可变数据模型；快照序列化
 │   ├── reduce.py    apply(graph, event) / replay(events)：视图的推导函数，也是状态机的最后一道防线
-│   ├── rules.py     状态转换规则：输入（worker 请求 / 快照 / 观察 / 时钟 / LLM 结果）→ 事件：后台验证最新快照、前台
-│   │                提交（判定需求、复查收紧）、需求随检查项自动验证、todo、提升与降级、快照二分定位（提交被拒、降级、后台连续两次同一回归）、
-│   │                诊断；next_step（会话结束 ≠ 运行结束，提交被接受才收尾）
-│   ├── verify.py    基线归类、守护集合、相关测试选择（含学到的相关性）、回归判定、按树合并作业结果、定位点状态、优先级
-│   ├── queries.py   只读查询（需求与证据检查、提交、存档链、交付点、快照时间线、todo、恢复点、DONE 的条件……）
+│   ├── rules.py     状态转换规则：输入（worker 请求 / 快照 / 观察 / 时钟 / 复核结论）→ 事件：合并请求（后台节流、submit、
+│   │                交接、收尾）→ 回归门 → 复核 → 合并；复核结论的校验（证据等级、豁免引文、单调：完成不退回、分数不降）；
+│   │                需求随检查项（E3）记下、todo、快照二分定位（提交被拒、后台连续两次同一回归）、诊断；
+│   │                next_step（会话结束 ≠ 运行结束，提交被接受才收尾）；交付链头
+│   ├── verify.py    基线归类、守护集合、相关测试选择、回归判定、按树合并作业结果、定位点状态、优先级
+│   ├── queries.py   只读查询（需求与证据检查、提交、复核、合并链、交付点、快照时间线、todo、恢复点、DONE 的条件……）
 │   ├── context.py   build_context：分层开场上下文（受保护段 + 各段上限 + 折叠与查询入口）；resume_reminder
 │   ├── compact.py   L0 落盘 / L1 清理 / L2 用图重建（消息列表的纯变换）
 │   ├── plan.py      规划提议的校验（逐字引文、覆盖、actionable / context、检查项存在）与机械切分
 │   ├── invariants.py 不变量
 │   ├── effects.py   事件 → 副作用计划
-│   └── render.py    board、需求详情、提交结果、定位与诊断、账本
+│   └── render.py    board、需求详情、提交结果与复核结论、定位与诊断、账本
 ├── runtime/         命令式外壳
 │   ├── store.py     SQLite 事件表 + 视图快照 + 附件
 │   ├── runtime.py   Runtime.submit：锁内“规则 → 追加事件 → 更新视图 → 检查不变量”，之后执行副作用
-│   ├── gitops.py    影子仓库：快照与快照提交、剔除测试改动、确定的提交、CAS、检出、增量 bundle、只撤销一段改动
+│   ├── gitops.py    影子仓库：快照与快照提交、剔除测试改动、确定的提交、CAS、检出、导出到复核目录、增量 bundle、只撤销一段改动
 │   ├── verifier.py  作业：验证槽位池 + 可抢占的优先级队列、setsid 进程组、完成标记、重新接上、导入隔离探针
 │   ├── session.py   会话循环：工具执行与快照钩子、提交结束会话、停下时追问与隐式提交、todo 提醒、L0–L4（自然停顿点
 │   │                交接）、消息轨迹（读盘重放）、ModelCallFailed
-│   ├── port.py      WorkerPort：Belay 工具与 runtime 之间的接口，通知（只推能据此行动的）
-│   ├── planner.py   规划器（LLM 提议需求清单 + 校验 + 重试 + 机械兜底）
-│   ├── review.py    复查者的输入：按需求原文里的名字筛出相关 hunk
+│   ├── port.py      WorkerPort：Belay 工具与 runtime 之间的接口，通知（只推能据此行动的：复核不通过、持续回归……）
+│   ├── planner.py   规划器（LLM 提议需求清单与验收方法 + 校验 + 重试 + 机械兜底）
+│   ├── reviewer.py  复核者：每个复核一个带工具的短会话（读文件、run、run_tests、run_gate、locate、verdict）
+│   ├── review.py    复核者开场里的 diff：按需求原文里的名字预排序
 │   ├── driver.py    BelayRun：准备（基线双跑）、快照、会话（内存重试 / 读盘重放）、收尾与交付、镜像、挂起、副作用
-│   ├── recovery.py  重启对账：CAS、重新接上作业、会话接续、容器重建
-│   └── prompts.py   系统提示、L3 / 规划器 / 复查者 / 诊断者提示词
-├── tools/           模型能调用的工具（通用工具 + belay.py：submit、board、failure_log、revert_change、waive_check）
+│   ├── recovery.py  重启对账：CAS、重新接上作业、会话接续、复核重开、容器重建
+│   └── prompts.py   系统提示、L3 / 规划器 / 复核者 / 诊断者提示词
+├── tools/           模型能调用的工具（通用工具 + belay.py：submit、board、failure_log、revert_change）
 ├── worker/          B 组的 worker 循环（也跑只读探索子 agent）
 ├── container/       上传到容器里执行的脚本（只用标准库）：runner.py（槽位导出、种子、sys.path、隔离探针、检查运行）
 ├── env.py  llm.py  cli.py
 tests/
-├── sim.py           纯核心的模拟器（假的作业与 git），单元测试与重放一致性测试共用
+├── sim.py           纯核心的模拟器（假的作业、git 与复核者），单元测试与重放一致性测试共用
 ├── unit/            纯逻辑：推导、规则、重放一致性、上下文、压缩、规划、分层
-└── integration/     LocalEnv + ScriptedLLM + 真实 git / pytest 的端到端场景
+└── integration/     LocalEnv + ScriptedLLM + 真实 git / pytest 的端到端场景（fakes.py：复核者、诊断者的替身）
 ```
 
 ## 依赖规则

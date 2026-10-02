@@ -7,12 +7,11 @@ from belay.core import rules as R
 from belay.core.config import BelayConfig
 from belay.core.context import build_context
 from belay.core.invariants import check_log, llm_effects
-from belay.core.model import REQ_BLOCKED, REQ_OPEN, REQ_SUBMITTED, REQ_VERIFIED
-from belay.core.queries import delivery_checkpoint, resume_point, suspect
+from belay.core.model import REQ_BLOCKED, REQ_DONE, REQ_OPEN
+from belay.core.queries import delivery_checkpoint, resume_point
 from belay.core.render import ledger, ledger_markdown, render_board, render_submit
 from belay.core.rules import Rejected
-from belay.core.verify import related_units
-from tests.sim import Sim
+from tests.sim import APPROVE, MANUAL, Sim, judge
 
 ADD, MUL, Z = "tests/test_mod.py::test_add", "tests/test_mod.py::test_mul", "tests/test_other.py::test_z"
 BASE = {ADD: "FAILED", MUL: "PASSED", Z: "PASSED"}
@@ -21,29 +20,42 @@ TASK = ("# Notes for version 2.0\n"
         "Also make mul handle negative numbers correctly.\n"
         "Document the new behaviour in the module docstring please.")
 PLAN = {"requirements": [{"id": "a", "quote": "Fix the add function so that it returns the sum.", "summary": "add",
-                          "checks": [ADD]},
+                          "checks": [ADD], "acceptance": "tests/test_mod.py::test_add passes"},
                          {"id": "b", "quote": "Also make mul handle negative numbers correctly.", "summary": "mul",
                           "checks": [MUL]},                               # 基线上本来就通过：不是证据
                          {"id": "c", "quote": "Document the new behaviour in the module docstring please.",
-                          "summary": "docs"}]}
+                          "summary": "docs", "acceptance": "read the module docstring"}]}
 MOD = [("pkg/mod.py", 1, 1)]
 OTHER = [("pkg/other.py", 1, 1)]
+MUL_QUOTE = "make mul handle negative numbers correctly"
+RUN = [{"id": "X1", "cmd": "python -c 'import pkg'", "rc": 0}]
 
 
-def sim(**kw) -> Sim:
-    s = Sim(BASE, **kw)
+def sim(cfg: BelayConfig | None = None, reviewer=APPROVE, **kw) -> Sim:
+    s = Sim(BASE, cfg=cfg or BelayConfig(merge_min_interval_sec=0, merge_todo_interval_sec=0), reviewer=reviewer,
+            **kw)
     s.setup(TASK, PLAN)
     s.do(R.start_session, "w1", "first", {})
     return s
 
 
 def fg(**kw) -> BelayConfig:
-    """关掉后台验证，只看前台（submit）规则。"""
+    """关掉后台合并，只看前台（submit）规则。"""
     return BelayConfig(background="off", **kw)
 
 
+def bgc(**kw) -> BelayConfig:
+    kw.setdefault("merge_min_interval_sec", 0)
+    kw.setdefault("merge_todo_interval_sec", 0)
+    return BelayConfig(**kw)
+
+
 def reqs(s: Sim) -> dict:
-    return {r.id: r.status for r in s.g.requirements.values()}
+    return {r.id: (r.status, r.level) for r in s.g.requirements.values()}
+
+
+def last_review(s: Sim):
+    return max(s.g.reviews.values(), key=lambda v: v.seq)
 
 
 # ======================================================================== 准备
@@ -53,45 +65,103 @@ def test_setup_baseline_and_plan():
     g = s.g
     assert g.baseline == {ADD: "fail", MUL: "pass", Z: "pass"}
     assert g.frozen and set(g.requirements) == {"R1", "R2", "R3"}
-    assert g.requirements["R1"].checks == (ADD,) and g.requirements["R2"].checks == (MUL,)
-    assert all(r.kind == "actionable" and r.status == REQ_OPEN for r in g.requirements.values())
-    assert g.head == 0 and g.checkpoints[0].tree == "t0" and g.confirmed == 0
-    assert not g.degraded and g.isolation["valid"] is True
+    assert g.requirements["R1"].checks == (ADD,) and g.requirements["R1"].acceptance.startswith("tests/test_mod")
+    assert all(r.status == REQ_OPEN and r.level is None for r in g.requirements.values())
+    assert g.head == 0 and g.checkpoints[0].tree == "t0" and g.run.version == 8
+    assert not g.degraded
 
 
-# ======================================================================== 后台：持续验证最新快照，不需要任何声明
+def test_v7_logs_are_refused_with_a_clear_error():
+    from belay.core.events import Event, EventError
+    from belay.core.reduce import apply
+    from belay.core.model import Graph
+    old = Event(1, 0.0, "run_started", "runtime", "rule", {"run_id": "r", "task": "t", "budget_sec": 1,
+                                                            "deadline_t": 1, "workers": ["w1"]})
+    with pytest.raises(EventError, match="before Belay v8"):
+        apply(Graph(), old)
+    with pytest.raises(EventError, match="v7 code"):
+        apply(Graph(), Event(1, 0.0, "checkpoint_created", "runtime", "observed", {}))
 
-def test_background_verifies_the_latest_snapshot_and_requirements_follow_their_checks():
-    s = sim(cfg=BelayConfig(confirm_regressions=False))
-    s.world.define("w1", {})
+
+# ======================================================================== 后台：回归门 → 复核 → 合并点
+
+def test_background_merge_runs_the_gate_then_the_reviewer():
+    s = sim(reviewer=judge(True, {"R3": {"status": "done", "level": "E2", "runs": ["X1"],
+                                         "evidence": ["the docstring mentions sums"]}}, summary="fix add, docs"))
+    s.world.define("w1", {ADD: "PASSED"})
     s.snap("w1")
     g = s.g
-    assert g.head == 1 and g.checkpoints[1].kind == "auto" and g.checkpoints[1].trigger == "auto"
-    assert reqs(s) == {"R1": REQ_OPEN, "R2": REQ_OPEN, "R3": REQ_OPEN}
-    assert not g.sessions["S1"].progress                                 # 存档本身不算进展
-    s.world.define("w2", {ADD: "PASSED"})
-    s.snap("w2")
-    g = s.g
-    assert g.head == 2 and g.requirements["R1"].status == REQ_VERIFIED and g.requirements["R1"].checkpoint == 2
-    assert g.requirements["R2"].status == REQ_OPEN                       # MUL 在基线上就通过：证明不了 R2
-    assert g.sessions["S1"].progress                                     # 需求验证通过算进展
-    sel = g.attempts["A2"].selection
-    assert "tests/test_mod.py" in sel                                    # 证据检查随尝试一起跑
+    a = next(iter(g.attempts.values()))
+    assert a.lane == "bg" and a.trigger == "auto" and a.selection is None          # 全量回归门
+    assert g.jobs[a.jobs[0]].purpose == "gate"
+    v = g.reviews["V1"]
+    assert v.attempt == a.id and v.status == "decided" and v.focus == ("R1", "R2", "R3")
+    assert g.head == 1 and g.checkpoints[1].review == "V1" and g.checkpoints[1].label == "fix add, docs"
+    assert reqs(s) == {"R1": (REQ_DONE, "E3"), "R2": (REQ_OPEN, None), "R3": (REQ_DONE, "E2")}
+    assert g.requirements["R1"].by == "checks" and g.requirements["R1"].tests == (ADD,)
+    assert g.requirements["R3"].by == "review" and g.requirements["R3"].runs == ("X1",)
+    assert g.sessions["S1"].progress                                       # 需求完成算进展；合并本身不算
+    assert [e.type for e in s.log if e.type in ("merge_reviewed", "review_decided")] == \
+        ["merge_reviewed", "review_decided"]
+    assert not llm_effects(s.log)
     s.check_log()
 
 
-def test_only_the_latest_snapshot_is_verified_and_tried_trees_are_not_retried():
-    s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False))
+def test_merge_itself_is_not_progress():
+    s = sim()
+    s.world.define("w1", {})
+    s.snap("w1")
+    assert s.g.head == 1 and not s.g.sessions["S1"].progress
+
+
+def test_background_reviews_are_throttled_but_handoffs_and_todos_are_not():
+    cfg = BelayConfig(merge_min_interval_sec=600, merge_todo_interval_sec=180)
+    s = sim(cfg=cfg)
+    for t in ("a1", "a2", "a3", "a4"):
+        s.world.define(t, {})
+    s.snap("a1")
+    assert s.g.head == 1
+    s.snap("a2")
+    assert len(s.g.attempts) == 1                                          # 间隔内不发起后台合并请求
+    s.advance(599)
+    s.tick()
+    assert len(s.g.attempts) == 1
+    s.advance(2)
+    s.tick()
+    assert s.g.head == 2                                                   # 到了间隔：时钟触发
+    s.do(R.update_todos, "w1", [{"content": "x", "status": "in_progress"}])
+    n = s.snap("a3", reason="todo")
+    s.do(R.update_todos, "w1", [{"content": "x", "status": "completed"}], n)
+    assert s.g.head == 2
+    s.advance(181)
+    s.tick()
+    assert s.g.head == 3 and s.g.checkpoints[3].trigger == "todo"          # 勾掉 todo：更短的间隔
+    s.snap("a4", reason="handoff")
+    assert s.g.head == 4 and s.g.checkpoints[4].trigger == "handoff"       # 交接不受间隔限制
+
+
+def test_gate_only_rejections_do_not_count_against_the_interval():
+    s = sim(cfg=BelayConfig(merge_min_interval_sec=600, confirm_regressions=False))
+    s.world.define("bad", {MUL: "FAILED"})
+    s.snap("bad")
+    assert not s.g.reviews and s.g.head == 0                               # 回归门拒绝：没有复核
+    s.world.define("ok", {})
+    s.snap("ok")
+    assert s.g.head == 1                                                   # 马上可以再请求
+
+
+def test_only_the_latest_snapshot_is_merged_and_tried_trees_are_not_retried():
+    s = sim(auto_jobs=False, cfg=bgc(confirm_regressions=False))
     for t in ("a1", "a2", "a3"):
         s.world.define(t, {})
     s.snap("a1")
     a1 = next(a for a in s.g.attempts.values() if a.lane == "bg")
     s.snap("a2")
     s.snap("a3")
-    assert len(s.g.attempts) == 1                                        # 同一时刻最多一个后台尝试
+    assert len(s.g.attempts) == 1
     s.finish_job(a1.jobs[0])
     nxt = [a for a in s.g.attempts.values() if a.status == "pending"]
-    assert [a.tree for a in nxt] == ["a3"]                               # 跳过 a2：最新的胜出
+    assert [a.tree for a in nxt] == ["a3"]                                 # 跳过 a2：最新的胜出
     s.world.define("bad", {MUL: "FAILED"})
     s.snap("bad")
     s.finish_job(nxt[0].jobs[0])
@@ -100,7 +170,7 @@ def test_only_the_latest_snapshot_is_verified_and_tried_trees_are_not_retried():
     assert s.g.attempts[bad.id].status == "rejected" and s.g.head == 2
     n = len(s.g.attempts)
     s.do(R.schedule_background)
-    assert len(s.g.attempts) == n                                        # 被拒的树不再重试，等新的改动
+    assert len(s.g.attempts) == n
 
 
 def test_untestable_latest_falls_back_to_the_previous_testable_snapshot():
@@ -110,111 +180,279 @@ def test_untestable_latest_falls_back_to_the_previous_testable_snapshot():
     first = next(iter(s.g.attempts.values()))
     s.snap("broken", testable=False)
     s.finish_job(first.jobs[0])
-    assert s.g.head == 1 and len(s.g.attempts) == 1                      # 不可测的快照不进队列
+    assert s.g.head == 1 and len(s.g.attempts) == 1
 
 
-def test_degraded_mode_and_handoff_mode_only_verify_handoffs():
+def test_degraded_mode_and_handoff_mode_only_merge_at_handoffs():
     for kw in ({"isolation": {"valid": False, "reason": "x"}}, {}):
-        cfg = BelayConfig() if kw else BelayConfig(background="handoff")
+        cfg = bgc() if kw else bgc(background="handoff")
         s = Sim(BASE, cfg=cfg)
         s.setup(TASK, PLAN, **kw)
         s.do(R.start_session, "w1", "first", {})
         s.world.define("h1", {})
         s.snap("h1")
         assert not s.g.attempts
-        s.snap("h1", reason="session_end")                               # 树没变也记一张：否则这个节点会漏验
-        assert s.g.head == 1 and s.g.checkpoints[1].kind == "handoff"
+        s.snap("h1", reason="session_end")
+        assert s.g.head == 1 and s.g.checkpoints[1].trigger == "handoff"
 
 
-def test_background_rejections_escalate_only_when_the_same_regression_persists():
-    """后台验证被拒是常态（中间态测不过）：链头不动、不算停滞；一次被拒什么都不做。
-    同一回归在连续两个后台存档（不同的树）上都在：记为持续性回归，定位并诊断，结果作为提示送达。"""
-    s = sim(cfg=BelayConfig(confirm_regressions=False, stall_same_failure=3))
+def test_background_gate_rejections_escalate_only_when_the_same_regression_persists():
+    s = sim(cfg=bgc(confirm_regressions=False, stall_same_failure=3))
     s.world.define("y0", {Z: "FAILED"})
     s.snap("y0", files=OTHER)
     g = s.g
     assert [a.status for a in g.attempts.values()] == ["rejected"] and g.head == 0
     assert g.wips["w1"].last_rejection is None
-    assert not g.persistent and not g.locates and not g.diagnoses       # 一次：可能只是改到一半
+    assert not g.persistent and not g.locates and not g.diagnoses
     s.world.define("y1", {Z: "ERROR"})
     s.snap("y1", files=OTHER)
     g = s.g
-    rejected = [a for a in g.attempts.values() if a.status == "rejected"]
-    assert len(rejected) == 2 and all(a.lane == "bg" for a in rejected) and g.head == 0
     assert set(g.persistent) == {Z} and g.persistent[Z].trigger == "background"
     assert [l.trigger for l in g.locates.values()] == ["background"]
     assert [(d.trigger, d.status) for d in g.diagnoses.values()] == [("background", "requested")]
     assert "two background snapshots in a row" in build_context(g, "w1", 50_000, s.now, s.cfg, mode="resume").text
-    for i in (2, 3):                                                     # 同一组测试只处理一次
+    for i in (2, 3):
         s.world.define(f"y{i}", {Z: "FAILED"})
         s.snap(f"y{i}", files=OTHER)
     assert len(s.g.locates) == 1 and len([e for e in s.log if e.type == "persistent_regression"]) == 1
-    s.do(R.tick)
-    assert not any(x.kind == "repeated_failure" for x in s.g.stalls)
     s.check_log()
-    # 两次被拒的回归不一样：不升级
-    s = sim(cfg=BelayConfig(confirm_regressions=False))
-    s.world.define("y0", {Z: "FAILED"})
-    s.snap("y0", files=OTHER)
-    s.world.define("y1", {MUL: "FAILED"})
-    s.snap("y1", files=OTHER)
-    assert not s.g.persistent and not s.g.locates
 
 
-@pytest.mark.parametrize("order", ["bg_first", "fg_first"])
-def test_new_snapshot_wins_between_background_and_submit(order):
-    s = sim(auto_jobs=False, cfg=BelayConfig(reviewer=False))
-    s.world.define("old", {})
-    s.world.define("new", {})
-    s.snap("old")
-    bg = next(a for a in s.g.attempts.values() if a.lane == "bg")
-    sid = s.submit("new")
-    fa = s.g.submits[sid].attempt
-    fg_job, bg_job = s.g.attempts[fa].jobs[0], s.g.attempts[bg.id].jobs[0]
-    if order == "bg_first":
-        s.finish_job(bg_job)
-        assert s.g.head == 1 and s.g.checkpoints[1].snapshot == bg.snapshot
-        s.finish_job(fg_job)
-        assert s.g.head == 2 and s.g.checkpoints[2].parent == 1 and s.g.checkpoints[2].kind == "submit"
-    else:
-        s.finish_job(fg_job)
-        assert s.g.head == 1
-        assert s.g.attempts[bg.id].status == "superseded"
-    assert s.g.checkpoints[s.g.head].tree == "new"
-    assert s.g.submits[sid].status == "accepted" or s.g.submits[sid].open
+# ======================================================================== 复核者：证据等级、单调、分数
+
+def test_evidence_levels_are_validated_and_downgraded():
+    verdict = judge(True, {
+        "R1": {"status": "done", "level": "E3", "tests": [ADD]},           # 原始代码上失败、现在通过：E3
+        "R2": {"status": "done", "level": "E3", "tests": [MUL]},           # 原始代码上就通过：证明不了 → E2 → E1
+        "R3": {"status": "done", "level": "E2", "runs": ["X9"]},           # 引用了不存在的命令 → E1
+    })
+    s = sim(reviewer=verdict, cfg=bgc(), runs=RUN)
+    s.world.define("w1", {ADD: "PASSED"})
+    s.snap("w1")
+    assert reqs(s) == {"R1": (REQ_DONE, "E3"), "R2": (REQ_DONE, "E1"), "R3": (REQ_DONE, "E1")}
+    s = sim(reviewer=judge(True, {"R3": {"status": "done", "level": "E0"}}))
+    s.world.define("w1", {})
+    s.snap("w1")
+    r3 = s.g.requirements["R3"]
+    assert r3.status == REQ_OPEN and r3.judgement == "partial" and "own claim" in r3.missing[-1]
+    s = sim(reviewer=judge(True, {"R3": {"status": "done", "level": "E2", "runs": ["X1"]}}), runs=[])
+    s.world.define("w1", {})
+    s.snap("w1")
+    assert reqs(s)["R3"] == (REQ_DONE, "E1")                               # 这次复核没有执行任何命令
 
 
-# ======================================================================== 提交：判定需求、复查收紧、接受或交还清单
+def test_done_requirements_are_sticky_and_breaking_one_blocks_the_merge():
+    s = sim(reviewer=judge(True, {"R3": ("done", "E1")}))
+    s.world.define("w1", {})
+    s.snap("w1")
+    assert reqs(s)["R3"] == (REQ_DONE, "E1")
+    # 只凭阅读说“没做完”：不改变已完成的需求，照常合并
+    s.reviewer = judge(True, {"R3": {"status": "partial", "level": "E1", "missing": ["no example"]}})
+    s.world.define("w2", {})
+    s.snap("w2")
+    assert s.g.head == 2 and reqs(s)["R3"] == (REQ_DONE, "E1")
+    assert any("by reading only" in n for n in last_review(s).decision["notes"])
+    # 有运行证据、且是这次改动弄坏的：不合并
+    s.reviewer = judge(True, {"R3": {"status": "not_done", "level": "E2", "runs": ["X1"], "regressed": True,
+                                     "missing": ["the docstring was deleted"]}})
+    s.world.define("w3", {})
+    s.snap("w3")
+    a = max(s.g.attempts.values(), key=lambda a: a.created_seq)
+    assert a.status == "rejected" and a.reason == "review" and s.g.head == 2
+    assert "this change breaks it" in a.detail and reqs(s)["R3"] == (REQ_DONE, "E1")
+    assert s.g.wips["w1"].last_rejection["reason"] == "review"             # 复核不通过：告诉 worker
+    # 有运行证据、但不是这次改动弄坏的（重新评估）：合并，需求退回
+    s.reviewer = judge(True, {"R3": {"status": "partial", "level": "E2", "runs": ["X1"], "missing": ["mul"]}})
+    s.world.define("w4", {})
+    s.snap("w4")
+    r3 = s.g.requirements["R3"]
+    assert s.g.head == 3 and r3.status == REQ_OPEN and r3.reason == "reassessed" and r3.missing == ("mul",)
+    s.check_log()
 
-def test_submit_classifies_requirements_reviews_and_returns_the_list():
-    s = sim(cfg=fg(review_batch=5))
+
+def test_tests_behind_an_e3_requirement_must_keep_passing():
+    s = sim(cfg=bgc(confirm_regressions=False))
+    s.world.define("w1", {ADD: "PASSED"})
+    s.snap("w1")
+    assert reqs(s)["R1"] == (REQ_DONE, "E3")
+    s.world.define("w2", {})                                               # ADD 又失败了
+    sid = s.submit("w2")
+    sub = s.g.submits[sid]
+    assert sub.status == "rejected" and sub.reason == "requirement_regression" and s.g.head == 1
+    assert "R1 was done" in render_submit(s.g, sid)
+    assert any(l.trigger == "rejected" and ADD in l.tests for l in s.g.locates.values())
+
+
+def test_score_never_drops_along_the_merge_chain():
+    s = sim(reviewer=judge(True, score=0.50, score_note="python bench.py"), runs=RUN)
+    s.world.define("w1", {})
+    s.snap("w1")
+    assert s.g.checkpoints[1].score == 0.5 and s.g.checkpoints[1].score_note == "python bench.py"
+    s.reviewer = judge(True, score=0.40)
+    s.world.define("w2", {})
+    s.snap("w2")
+    a = max(s.g.attempts.values(), key=lambda a: a.created_seq)
+    assert a.status == "rejected" and "score dropped from 0.5" in a.detail and s.g.head == 1
+    s.reviewer = judge(True, score=0.495)                                  # 容差之内（测量噪声）
+    s.world.define("w3", {})
+    s.snap("w3")
+    assert s.g.head == 2
+    s.reviewer = judge(True, score=None)                                   # 没测分数：门槛不清零
+    s.world.define("w4", {})
+    s.snap("w4")
+    s.reviewer = judge(True, score=0.3)
+    s.world.define("w5", {})
+    s.snap("w5")
+    assert s.g.head == 3 and s.g.checkpoints[3].score is None
+    assert delivery_checkpoint(s.g) == s.g.head
+    s2 = sim(reviewer=judge(True, score=0.9), runs=[])
+    s2.world.define("w1", {})
+    s2.snap("w1")
+    assert s2.g.checkpoints[1].score is None                              # 没有执行命令的分数不算
+
+
+def test_reviewer_not_approving_tells_the_worker_and_repeats_raise_a_stall_hint():
+    s = sim(reviewer=judge(False, reason="debug prints left in pkg/mod.py", feedback="remove the prints"),
+            cfg=bgc(stall_same_failure=2))
+    for i in range(2):
+        s.world.define(f"n{i}", {})
+        s.snap(f"n{i}")
+    assert s.g.head == 0
+    rej = s.g.wips["w1"].last_rejection
+    assert rej["reason"] == "review" and "debug prints" in rej["detail"]
+    text = build_context(s.g, "w1", 50_000, s.now, s.cfg, mode="resume").text
+    assert "The reviewer did not merge your snapshot" in text and "remove the prints" in text
+    s.tick()
+    st = s.g.stalls[-1]
+    assert st.kind == "review_rejections" and "2 merge requests in a row" in st.detail
+    n = len(s.g.stalls)
+    s.tick()
+    assert len(s.g.stalls) == n
+
+
+def test_reviewer_failure_is_retried_then_the_gate_alone_decides():
+    s = sim(reviewer=MANUAL, cfg=fg())
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    s.review("V1", None, failed=True)
+    assert s.running_review() == "V2" and s.g.reviews["V2"].retry_of == "V1"
+    s.review("V2", {"merge": True})                                       # 没有判定任何需求也可以合并
+    g = s.g
+    assert g.head == 1 and g.checkpoints[1].review == "V2" and g.submits[sid].status == "returned"
+    s.world.define("t2", {ADD: "PASSED"})
+    sid = s.submit("t2")
+    s.review(s.running_review(), {"no": "verdict"})                       # 没说合不合并：失败
+    s.review(s.running_review(), None, failed=True)
+    g = s.g
+    assert g.head == 2 and g.checkpoints[2].review is None                 # 复核者不可用：只按回归门合并
+    assert g.submits[sid].status == "accepted"                             # 自述（E0）
+    assert reqs(s)["R2"] == (REQ_DONE, "E0") and g.requirements["R2"].by == "self_report"
+    assert s.do(R.deliver, "complete") == "INCOMPLETE"
+    assert any("only self-reported" in x for x in s.g.run.status_reasons)
+    s.check_log()
+
+
+# ======================================================================== 提交：请求立即复核
+
+def test_submit_supersedes_a_background_review_and_reuses_the_gate():
+    s = sim(reviewer=MANUAL, cfg=bgc())
+    s.world.define("t1", {ADD: "PASSED"})
+    s.snap("t1")
+    bg = next(iter(s.g.attempts.values()))
+    assert s.running_review() == "V1" and s.g.reviews["V1"].attempt == bg.id
+    sid = s.submit("t1", summary="all done")                               # 同一棵树
+    g = s.g
+    assert g.attempts[bg.id].status == "superseded" and g.reviews["V1"].status == "cancelled"
+    assert "V1" in s.cancelled_reviews
+    fa = g.submits[sid].attempt
+    assert g.reviews["V2"].attempt == fa and g.reviews["V2"].trigger == "submit"
+    assert len([j for j in g.jobs.values() if j.purpose == "gate"]) == 1   # 回归门的结果按树复用
+    s.review("V2", judge(True, {"R2": ("done", "E1"), "R3": ("done", "E1")})(s, g.reviews["V2"]))
+    assert s.g.submits[sid].status == "accepted" and s.g.head == 1
+    assert "accepted" in render_submit(s.g, sid) and "Done (E3, tests): R1" in render_submit(s.g, sid)
+    s.do(R.end_session, "w1", "submitted")
+    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")
+
+
+def test_submit_returns_what_is_missing_then_accepts():
+    s = sim(cfg=fg(), reviewer=judge(True, {"R2": ("done", "E1"),
+                                            "R3": {"status": "partial", "level": "E1", "missing": ["docstring"]}},
+                                     feedback="write the docstring of add"))
     s.world.define("t1", {ADD: "PASSED"})
     sid = s.submit("t1", summary="fixed add, mul and docs")
     g = s.g
-    sub = g.submits[sid]
-    assert sub.checkpoint == 1 and g.checkpoints[1].kind == "submit" and g.checkpoints[1].label.startswith("fixed")
-    assert reqs(s) == {"R1": REQ_VERIFIED, "R2": REQ_SUBMITTED, "R3": REQ_SUBMITTED}
-    assert sub.status == "reviewing" and s.running_reviews() == ["V1"]
-    assert g.reviews["V1"].requirements == ("R2", "R3") and g.reviews["V1"].submit == sid
-    assert R.next_step(g, "w1", s.now, s.cfg) == ("resume_session", "S1")
-    s.review("V1", {"R2": {"implemented": "yes"}, "R3": {"implemented": "partial", "missing": ["docstring"]}})
-    g = s.g
     assert g.submits[sid].status == "returned" and g.submits[sid].open == ("R3",)
-    r3 = g.requirements["R3"]
-    assert r3.status == REQ_OPEN and r3.reopen_reason == "review_missing" and r3.last_failure == ("docstring",)
-    assert r3.review_reopens == 1 and g.requirements["R2"].review == "yes"
     text = render_submit(g, sid)
-    assert "not accepted yet" in text and "R3" in text and "docstring" in text
+    assert "merged as merge point 1" in text and "docstring" in text and "write the docstring of add" in text
+    assert R.next_step(g, "w1", s.now, s.cfg) == ("resume_session", "S1")
+    s.reviewer = judge(True, {"R3": ("done", "E1")})
     s.world.define("t2", {ADD: "PASSED"})
     sid2 = s.submit("t2")
-    g = s.g
-    assert g.submits[sid2].status == "accepted"                          # 第二次不再复查（上限 1 次）
-    assert g.requirements["R3"].status == REQ_SUBMITTED and g.requirements["R3"].review is None
-    assert "accepted" in render_submit(g, sid2)
+    assert s.g.submits[sid2].status == "accepted"
     s.do(R.end_session, "w1", "submitted")
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")
-    assert not llm_effects(s.log)
+    s.do(R.begin_finalize, "complete")
+    assert s.do(R.deliver, "complete") == "DONE" and s.g.run.delivered == 2
     s.check_log()
+
+
+def test_submit_without_changes_asks_the_reviewer_only_for_what_was_not_judged():
+    s = sim(cfg=bgc(), reviewer=judge(True, {"R2": ("done", "E1")}))
+    s.world.define("t1", {ADD: "PASSED"})
+    s.snap("t1")                                                           # 后台：R1（测试）、R2 完成，R3 没提到
+    assert s.g.head == 1 and reqs(s)["R3"] == (REQ_OPEN, None)
+    s.reviewer = judge(False, {"R3": {"status": "not_done", "level": "E1", "missing": ["no docstring"]}})
+    sid = s.submit("t1")                                                   # 快照就是链头：只判定、不合并
+    g = s.g
+    v = g.reviews[g.submits[sid].review]
+    assert v.trigger == "judge" and v.attempt is None and v.checkpoint == 1 and v.decision["merge"] is None
+    assert g.submits[sid].status == "returned" and g.requirements["R3"].missing == ("no docstring",)
+    assert "No new changes since merge point 1" in render_submit(g, sid)
+    n = len(g.reviews)
+    sid2 = s.submit("t1")                                                  # 同一棵树上都判过了：直接按账本回答
+    assert s.g.submits[sid2].status == "returned" and len(s.g.reviews) == n
+
+
+def test_blocked_declarations_are_judged_by_the_reviewer():
+    blocked = [{"requirement": "R3", "kind": "insufficient_info", "reason": "which docstring?"}]
+    s = sim(cfg=fg(), reviewer=judge(True, {"R2": ("done", "E1"),
+                                            "R3": {"status": "blocked", "level": "E1",
+                                                   "reason": "the task does not say which module"}}))
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1", blocked=blocked)
+    g = s.g
+    r3 = g.requirements["R3"]
+    assert g.submits[sid].status == "accepted" and r3.status == REQ_BLOCKED and r3.blocked_kind == "insufficient_info"
+    assert r3.by == "review"
+    s.do(R.begin_finalize, "complete")
+    assert s.do(R.deliver, "complete") == "DONE"                           # 受阻且复核者认可：算完成
+    s = sim(cfg=fg(), reviewer=judge(True, {"R2": ("done", "E1"),
+                                            "R3": {"status": "not_done", "level": "E1",
+                                                   "missing": ["document add and mul in pkg/mod.py"]}}))
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1", blocked=blocked)
+    r3 = s.g.requirements["R3"]
+    assert s.g.submits[sid].status == "returned" and r3.status == REQ_OPEN and r3.reason == "blocked_not_accepted"
+    assert "did not accept that it is blocked" in render_submit(s.g, sid)
+
+
+def test_reviewer_off_records_self_reports():
+    s = sim(cfg=fg(reviewer=False))
+    s.world.define("t1", {})
+    sid = s.submit("t1", blocked=[{"requirement": "R3", "kind": "environment", "reason": "no docs tool"}])
+    g = s.g
+    assert g.submits[sid].status == "returned" and g.submits[sid].open == ("R1",)    # 证据检查没过
+    assert reqs(s) == {"R1": (REQ_OPEN, None), "R2": (REQ_DONE, "E0"), "R3": (REQ_BLOCKED, None)}
+    assert ADD in g.requirements["R1"].missing[0] and not g.reviews
+    s.world.define("t2", {ADD: "PASSED"})
+    sid = s.submit("t2")
+    assert s.g.submits[sid].status == "accepted" and reqs(s)["R1"] == (REQ_DONE, "E3")
+    s.do(R.begin_finalize, "complete")
+    assert s.do(R.deliver, "complete") == "INCOMPLETE"
+    reasons = s.g.run.status_reasons
+    assert any("only self-reported" in x and "R2" in x for x in reasons)
+    assert any("R3 is blocked (environment, self-reported)" in x for x in reasons)
+    assert ledger(s.g)["category_requirements"]["self-reported"] == ["R2"]
 
 
 def test_submit_regression_is_rejected_with_reasons_locate_and_diagnosis():
@@ -225,22 +463,20 @@ def test_submit_regression_is_rejected_with_reasons_locate_and_diagnosis():
     sid = s.submit("bad", files=OTHER, dropped=("tests/test_other.py",))
     g = s.g
     sub = g.submits[sid]
-    assert sub.status == "rejected" and sub.reason == "regression" and g.head == 0
-    assert reqs(s) == {"R1": REQ_OPEN, "R2": REQ_OPEN, "R3": REQ_OPEN}   # 被拒：什么都没记下
-    assert g.wips["w1"].last_rejection["regressions"] == [f"{Z} (FAILED)"]
+    assert sub.status == "rejected" and sub.reason == "regression" and g.head == 0 and not g.reviews
+    assert reqs(s)["R1"] == (REQ_OPEN, None)
     text = render_submit(g, sid)
     assert f"assert failure in {Z}" in text and "ran in their original version" in text
     loc = next(iter(g.locates.values()))
     assert loc.trigger == "rejected" and loc.results
     d = next(iter(g.diagnoses.values()))
-    assert d.locate == loc.id
     s.do(R.record_diagnosis, d.id, {"suspects": [], "intentional": {"likely": True, "quote": "made up text"},
                                     "suggestion": "x"})
-    assert s.g.diagnoses[d.id].result["intentional"]["likely"] is False   # 引文校验不过：丢弃这一项
+    assert s.g.diagnoses[d.id].result["intentional"]["likely"] is False
     s.world.define("bad2", {Z: "FAILED", MUL: "PASSED"})
     s.submit("bad2", files=OTHER)
     rep = [x for x in s.g.diagnoses.values() if x.trigger == "repeated"]
-    assert rep and rep[0].previous == d.id                                # 同一签名第二次被拒：再诊断
+    assert rep and rep[0].previous == d.id
     assert not llm_effects(s.log)
 
 
@@ -249,62 +485,36 @@ def test_missing_or_skipped_guard_tests_are_regressions():
     s.world.define("skip", {MUL: "SKIPPED"})
     sid = s.submit("skip", files=[("pkg/mod.py", 1, 0)])
     assert s.g.submits[sid].status == "rejected"
-    s.world.trees["gone"] = {ADD: "FAILED", Z: "PASSED"}                 # MUL 漏跑
+    s.world.trees["gone"] = {ADD: "FAILED", Z: "PASSED"}
     sid = s.submit("gone", files=[("setup.py", 1, 0)])
     a = s.g.attempts[s.g.submits[sid].attempt]
-    assert a.tier == "full" and a.regressions == (f"{MUL} (MISSING)",)
+    assert a.regressions == (f"{MUL} (MISSING)",)
 
 
 def test_flaky_failure_confirmed_as_flaky_is_not_a_regression():
-    s = sim(cfg=fg(reviewer=False))
+    s = sim(cfg=fg())
     s.world.define("t1", {})
     s.world.flaky_once.add(("t1", MUL))
     sid = s.submit("t1")
     a = s.g.attempts[s.g.submits[sid].attempt]
-    assert a.status == "created" and a.flaky == (MUL,) and s.g.checkpoints[1].tier == "related"
-
-
-def test_evidence_failure_keeps_the_requirement_open_with_the_failing_checks():
-    s = sim(cfg=fg(reviewer=False))
-    s.world.define("t1", {})
-    sid = s.submit("t1")
-    g = s.g
-    assert g.submits[sid].status == "returned" and g.submits[sid].open == ("R1",)
-    assert g.requirements["R1"].status == REQ_OPEN and ADD in g.requirements["R1"].last_failure[0]
-    assert g.submits[sid].failing == {"R1": [f"{ADD} (FAILED)"]}
-    assert "R1" in render_submit(g, sid) and ADD in render_submit(g, sid)
-
-
-def test_submit_on_the_head_tree_uses_the_head_and_waits_for_evidence():
-    s = sim(auto_jobs=False, cfg=BelayConfig(reviewer=False))
-    s.world.define("t1", {ADD: "PASSED"})
-    s.snap("t1", files=OTHER)                                            # 不选 tests/test_mod.py 的改动
-    bg = next(iter(s.g.attempts.values()))
-    s.finish_job(bg.jobs[0])
-    assert s.g.head == 1
-    assert "tests/test_mod.py" in bg.selection                           # 证据检查也被选上
-    n = s.snap("t1", files=OTHER, reason="submit")
-    sid = s.do(R.request_submit, "w1", n, "done")
-    g = s.g
-    assert g.submits[sid].checkpoint == 1 and g.checkpoints[1].kind == "submit"
-    assert g.submits[sid].status == "accepted"
+    assert a.status == "created" and a.flaky == (MUL,)
 
 
 def test_submit_precheck_failure_is_rejected_at_once():
     s = sim(cfg=fg())
     sid = s.submit("broken", testable=False)
     sub = s.g.submits[sid]
-    assert sub.status == "rejected" and sub.reason == "precheck"
+    assert sub.status == "rejected" and sub.reason == "precheck" and not s.g.reviews
     assert "do not compile" in render_submit(s.g, sid)
-    with pytest.raises(Rejected, match="still being checked"):
-        s2 = sim(cfg=fg(), auto_jobs=False)
-        s2.world.define("t1", {})
-        s2.submit("t1")
+    s2 = sim(cfg=fg(), auto_jobs=False)
+    s2.world.define("t1", {})
+    s2.submit("t1")
+    with pytest.raises(Rejected, match="still being reviewed"):
         s2.submit("t1")
 
 
-def test_blocked_list_is_validated_and_check_conflict_needs_a_verbatim_quote():
-    s = sim(cfg=fg(reviewer=False))
+def test_blocked_list_and_waiver_proposals_are_validated():
+    s = sim(cfg=fg())
     s.world.define("t1", {ADD: "PASSED"})
     with pytest.raises(Rejected, match="kind must be"):
         s.submit("t1", blocked=[{"requirement": "R3", "kind": "lazy", "reason": "x"}])
@@ -312,117 +522,82 @@ def test_blocked_list_is_validated_and_check_conflict_needs_a_verbatim_quote():
         s.submit("t1", blocked=[{"requirement": "R9", "kind": "environment", "reason": "x"}])
     with pytest.raises(Rejected, match="verbatim"):
         s.submit("t1", blocked=[{"requirement": "R2", "kind": "check_conflict", "reason": "x", "quote": "nope"}])
-    sid = s.submit("t1", blocked=[{"requirement": "R2", "kind": "check_conflict", "reason": "old test",
-                                   "quote": "make mul handle negative numbers correctly"},
-                                  {"requirement": "R3", "kind": "environment", "reason": "no docs tool"}])
+    with pytest.raises(Rejected, match="not in the regression gate"):
+        s.submit("t1", waivers=[{"tests": [ADD], "quote": MUL_QUOTE, "reason": "x"}])
+    with pytest.raises(Rejected, match="verbatim"):
+        s.submit("t1", waivers=[{"tests": [MUL], "quote": "mul must change", "reason": "x"}])
+    s3 = sim(cfg=fg(waivers=False))
+    s3.world.define("t1", {})
+    with pytest.raises(Rejected, match="disabled"):
+        s3.submit("t1", waivers=[{"tests": [MUL], "quote": MUL_QUOTE, "reason": "x"}])
+
+
+# ======================================================================== 回归门豁免：worker 提议，复核者裁决
+
+def test_waivers_are_proposed_by_the_worker_and_granted_by_the_reviewer():
+    waiver = {"tests": [MUL], "quote": MUL_QUOTE, "reason": "the old test asserts the old sign", "requirement": "R2"}
+    s = sim(cfg=fg(locate=False), reviewer=MANUAL)
+    s.world.define("neg", {MUL: "FAILED", ADD: "PASSED"})
+    sid = s.submit("neg")
+    assert s.g.submits[sid].status == "rejected" and not s.g.reviews       # 没有提议：直接拒绝，不开复核
+    sid = s.submit("neg", waivers=[waiver])
+    v = s.g.reviews[s.running_review()]
+    assert v.gate["regressions"] == [f"{MUL} (FAILED)"]
+    s.review(v.id, judge(True, {"R2": ("done", "E1")},
+                         waivers=[{"tests": [MUL], "quote": "mul must change", "reason": "x"}])(s, v))
+    a = s.g.attempts[s.g.submits[sid].attempt]
+    assert a.status == "rejected" and a.reason == "review" and "not waived" in a.detail   # 引文不逐字：不采纳
+    assert not s.g.waived
+    sid = s.submit("neg", waivers=[waiver])
+    v = s.g.reviews[s.running_review()]
+    s.review(v.id, judge(True, {"R2": ("done", "E1")}, waivers=[waiver])(s, v))
     g = s.g
-    assert g.submits[sid].status == "accepted"
-    assert reqs(s) == {"R1": REQ_VERIFIED, "R2": REQ_BLOCKED, "R3": REQ_BLOCKED}
-    assert g.requirements["R2"].blocked_quote and g.requirements["R3"].blocked_kind == "environment"
-
-
-def test_baseline_passing_checks_are_never_evidence_even_when_they_pass():
-    s = sim(cfg=fg(reviewer=False))
-    s.world.define("t1", {ADD: "PASSED"})
-    s.submit("t1")
-    r2 = s.g.requirements["R2"]
-    assert r2.status == REQ_SUBMITTED and r2.checkpoint == 1             # 自述，不是 verified
-    assert ledger(s.g)["category_requirements"]["self-reported"] == ["R2", "R3"]
-
-
-def test_review_batches_blocked_reading_and_reviewer_off():
-    s = sim(cfg=fg(review_batch=1))
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1", blocked=[{"requirement": "R3", "kind": "insufficient_info", "reason": "which docstring?"}])
-    g = s.g
-    assert [(v.phase, v.requirements) for v in g.reviews.values()] == [("done", ("R2",)), ("blocked", ("R3",))]
-    s.review("V1", {"R2": {"implemented": "yes"}})
-    assert s.g.submits[sid].status == "reviewing"                        # 还有一批在复查
-    s.review("V2", {"R3": {"reading": "document add and mul in pkg/mod.py"}})
-    g = s.g
-    assert g.requirements["R3"].status == REQ_OPEN and g.requirements["R3"].reopen_reason == "review_reading"
-    assert g.submits[sid].status == "returned"
-    s = sim(cfg=fg(reviewer=False))
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    assert s.g.submits[sid].status == "accepted" and not s.g.reviews
-
-
-def test_environment_blocks_are_questioned_once():
-    s = sim(cfg=fg())
-    s.world.define("t1", {ADD: "PASSED"})
-    env = [{"requirement": "R3", "kind": "environment", "reason": "the docs tool is not installed"}]
-    sid = s.submit("t1", blocked=env)
-    g = s.g
-    assert [(v.phase, v.requirements) for v in g.reviews.values()] == [("done", ("R2",)), ("blocked", ("R3",))]
-    s.review("V1", {"R2": {"implemented": "yes"}})
-    s.review("V2", {"R3": {"reading": "write the docstring by hand in pkg/mod.py"}})
-    g = s.g
-    r3 = g.requirements["R3"]
-    assert r3.status == REQ_OPEN and r3.reopen_reason == "review_workaround" and r3.review_reopens == 1
-    text = render_submit(g, sid)
-    assert g.submits[sid].status == "returned" and "a way to do it in this repository" in text
-    assert "write the docstring by hand" in text
-    sid2 = s.submit("t1", blocked=env)                                   # 再次受阻：不再追问（上限 1 次）
-    assert s.g.submits[sid2].status == "accepted" and s.g.requirements["R3"].status == REQ_BLOCKED
-    s.check_log()
-    # 复查者没有把握（空读法）：受阻照常成立；check_conflict 不追问
-    s = sim(cfg=fg())
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1", blocked=env + [{"requirement": "R2", "kind": "check_conflict", "reason": "old test",
-                                         "quote": "make mul handle negative numbers correctly"}])
-    assert [v.requirements for v in s.g.reviews.values()] == [("R3",)]
-    s.review("V1", {"R3": {"reading": ""}})
-    assert s.g.submits[sid].status == "accepted" and s.g.requirements["R3"].status == REQ_BLOCKED
-
-
-def test_reviews_are_one_requirement_per_call_by_default():
-    s = sim(cfg=fg())
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    assert [s.g.reviews[v].requirements for v in s.running_reviews()] == [("R2",), ("R3",)]
-    s.review("V1", {"R2": {"implemented": "yes"}})
-    assert s.g.submits[sid].status == "reviewing"                       # 等所有批次
-    s.review("V2", {"R3": {"implemented": "yes"}})
-    assert s.g.submits[sid].status == "accepted"
+    assert g.submits[sid].status == "returned" and g.head == 1
+    w = g.waived[MUL]
+    assert w.review == v.id and w.requirement == "R2" and w.quote == MUL_QUOTE
+    L = ledger(g)
+    assert L["guard_checks"] == 1 and [x["test"] for x in L["waived"]] == [MUL] and L["waived"][0]["review"] == v.id
+    assert "Waived regression checks" in ledger_markdown(g)
+    assert "1 waived by the reviewer" in build_context(g, "w1", 24_000, s.now, s.cfg, mode="resume").text
     s.check_log()
 
 
-def test_reviewer_failure_does_not_reopen_and_deadline_only_records():
-    s = sim(cfg=fg(review_batch=5))
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    s.review("V1", {})                                                   # 复查者失败：什么都不重开，各自单条重试一次
-    assert s.g.submits[sid].status == "reviewing"
-    assert s.running_reviews() == ["V2", "V3"]
-    assert [s.g.reviews[v].requirements for v in ("V2", "V3")] == [("R2",), ("R3",)]
-    assert {s.g.reviews[v].retry_of for v in ("V2", "V3")} == {"V1"}
-    s.review("V2", {"R2": {"implemented": "yes"}})
-    s.review("V3", {})                                                   # 单条也失败：不再重试，不阻塞，记为未复查
-    assert s.running_reviews() == []
-    assert s.g.submits[sid].status == "accepted"
-    assert s.g.requirements["R2"].review == "yes" and s.g.requirements["R3"].review == "failed"
-    assert "not reviewed" in render_submit(s.g, sid) and "R3" in render_submit(s.g, sid)
-    assert ledger(s.g)["unreviewed"] == ["R3"]
-    assert "not reviewed" in ledger_markdown(s.g)
-    s = sim(cfg=fg())
-    s.world.define("t1", {ADD: "PASSED"})
-    sid = s.submit("t1")
-    s.advance(5400)
-    s.do(R.tick)
-    s.review("V1", {"R2": {"implemented": "no"}, "R3": {"implemented": "yes"}})
+def test_waivers_are_capped():
+    s = sim(cfg=fg(locate=False, waive_max_tests=0), reviewer=MANUAL)
+    s.world.define("neg", {MUL: "FAILED"})
+    s.submit("neg", waivers=[{"tests": [MUL], "quote": MUL_QUOTE, "reason": "x"}])
+    v = s.g.reviews[s.running_review()]
+    s.review(v.id, judge(True, waivers=[{"tests": [MUL], "quote": MUL_QUOTE, "reason": "x"}])(s, v))
+    assert not s.g.waived and any("at most 0" in n for n in s.g.reviews[v.id].decision["notes"])
+
+
+# ======================================================================== 没有回归门（LHTB）
+
+def test_without_tests_merges_rest_on_the_reviewer_and_the_score():
+    s = Sim({}, cfg=bgc(), reviewer=judge(True, {"R3": {"status": "done", "level": "E2", "runs": ["X1"]}},
+                                          score=0.3, score_note="python eval.py --metric f1"))
+    s.setup(TASK, PLAN, verifier=False)
+    s.do(R.start_session, "w1", "first", {})
+    assert not s.g.baseline and s.g.requirements["R1"].checks == ()
+    s.snap("w1")
     g = s.g
-    assert g.requirements["R2"].status == REQ_SUBMITTED and g.requirements["R2"].review == "no"   # 截止：只进账本
-    s.do(R.begin_finalize, "deadline")
-    s.do(R.promote_now)
-    assert s.do(R.deliver, "deadline") == "INCOMPLETE"
-    assert "the reviewer found R2 incomplete" in s.g.run.status_reasons
+    a = next(iter(g.attempts.values()))
+    assert a.selection == () and not g.jobs                               # 没有回归门作业
+    assert g.head == 1 and g.checkpoints[1].score == 0.3 and reqs(s)["R3"] == (REQ_DONE, "E2")
+    assert "No tests are available" in build_context(g, "w1", 24_000, s.now, s.cfg).text
+    s.reviewer = judge(True, score=0.2)
+    s.snap("w2")
+    assert s.g.head == 1                                                   # 分数下降：不合并
+    s.reviewer = judge(True, score=0.6)
+    s.snap("w3")
+    assert s.g.head == 2 and delivery_checkpoint(s.g) == 2
+    assert "score 0.6" in ledger_markdown(s.g)
 
 
-# ======================================================================== todo：运行级步骤
+# ======================================================================== todo
 
-def test_todos_are_mirrored_completed_anchored_and_label_checkpoints():
-    s = sim(cfg=BelayConfig(confirm_regressions=False))
+def test_todos_are_mirrored_completed_and_anchored():
+    s = sim(cfg=bgc(confirm_regressions=False))
     todos = [{"content": "read the code", "status": "in_progress"},
              {"content": "fix add (R1)", "status": "pending"}]
     s.do(R.update_todos, "w1", todos)
@@ -431,7 +606,7 @@ def test_todos_are_mirrored_completed_anchored_and_label_checkpoints():
         [("P1", "in_progress", ()), ("P2", "pending", ("R1",))]
     n = len(s.log)
     s.do(R.update_todos, "w1", todos)
-    assert len(s.log) == n                                               # 没有变化：不写事件
+    assert len(s.log) == n
     done = [{"content": "read the code", "status": "completed"}, {"content": "fix add (R1)", "status": "in_progress"}]
     assert R.newly_completed(s.g, done)
     s.world.define("td", {})
@@ -439,167 +614,46 @@ def test_todos_are_mirrored_completed_anchored_and_label_checkpoints():
     assert s.do(R.update_todos, "w1", done, n) == ["P1"]
     g = s.g
     assert g.todos["P1"].status == "anchored" and g.todos["P2"].status == "in_progress"
-    cp = g.checkpoints[g.todos["P1"].checkpoint]
-    assert cp.kind == "todo" and cp.label == "read the code"
-    assert not R.newly_completed(s.g, done) and g.sessions["S1"].progress
+    assert g.checkpoints[g.todos["P1"].checkpoint].trigger == "todo"
+    assert all(r.status == REQ_OPEN for r in g.requirements.values())    # todo 只是线索：不改变需求状态
     assert resume_point(g, "w1") == {"base": g.head, "partial": n, "todo": "P2"}
     s.do(R.update_todos, "w1", [{"content": "something else", "status": "pending"}])
-    assert set(s.g.todos) == {"P1", "P3"}                                # 删掉没完成的；完成的留着
+    assert set(s.g.todos) == {"P1", "P3"}
 
 
-def test_todo_completed_on_a_rejected_snapshot_is_anchored_by_a_later_checkpoint():
-    s = sim(cfg=BelayConfig(confirm_regressions=False))
+def test_todo_completed_on_a_rejected_snapshot_is_anchored_by_a_later_merge():
+    s = sim(cfg=bgc(confirm_regressions=False))
     s.do(R.update_todos, "w1", [{"content": "a", "status": "in_progress"}])
     s.world.define("sb", {MUL: "FAILED"})
     n = s.snap("sb", reason="todo")
     s.do(R.update_todos, "w1", [{"content": "a", "status": "completed"}], n)
-    assert s.g.todos["P1"].status == "completed" and s.g.wips["w1"].last_rejection is None
+    assert s.g.todos["P1"].status == "completed"
     s.world.define("sc", {})
     s.snap("sc")
     assert s.g.todos["P1"].status == "anchored"
 
 
 def test_rollback_reopens_requirements_and_invalidates_todos():
-    s = sim(cfg=BelayConfig(confirm_regressions=False, reviewer=False))
+    s = sim(cfg=bgc(confirm_regressions=False, reviewer=False))
     s.world.define("k1", {})
     s.snap("k1")
     s.do(R.update_todos, "w1", [{"content": "fix add", "status": "in_progress"}])
     s.world.define("k2", {ADD: "PASSED"})
     n = s.snap("k2", reason="todo")
     s.do(R.update_todos, "w1", [{"content": "fix add", "status": "completed"}], n)
-    assert s.g.requirements["R1"].status == REQ_VERIFIED and s.g.todos["P1"].status == "anchored"
+    assert reqs(s)["R1"] == (REQ_DONE, "E3") and s.g.todos["P1"].status == "anchored"
     with pytest.raises(Rejected):
         s.do(R.rollback, "w1", 7)
     s.do(R.rollback, "w1", 1)
     g = s.g
     assert g.head == 1 and g.epoch == 1 and g.requirements["R1"].status == REQ_OPEN
-    assert g.requirements["R1"].reopen_reason == "rolled_back" and g.todos["P1"].status == "in_progress"
+    assert g.requirements["R1"].reason == "rolled_back" and g.todos["P1"].status == "in_progress"
     assert any(e.kind == "restore_workspace" and e.args["reset_ref"] for e in s.effects)
-
-
-# ======================================================================== 模块 C：两级存档链
-
-def _bg(s: Sim):
-    return next(a for a in s.g.attempts.values() if a.lane == "bg" and a.status == "pending")
-
-
-def _promote(s: Sim):
-    return next(j for j in s.g.jobs.values() if j.purpose == "promote" and j.state == "running")
-
-
-def test_promotion_skips_older_provisional_points():
-    s = sim(auto_jobs=False)
-    for t in ("p1", "p2", "p3"):
-        s.world.define(t, {})
-    s.snap("p1")
-    s.finish_job(_bg(s).jobs[0])
-    p1 = _promote(s)
-    assert p1.tree == "p1" and s.g.checkpoints[1].level == "provisional"
-    for t in ("p2", "p3"):
-        s.snap(t)
-        s.finish_job(_bg(s).jobs[0])
-    assert s.g.head == 3 and _promote(s).id == p1.id                      # 同一时刻只提升一个
-    s.finish_job(p1.id)
-    assert s.g.confirmed == 1 and _promote(s).tree == "p3"               # 更老的暂存点（p2）跳过
-    s.finish_job(_promote(s).id)
-    assert s.g.confirmed == 3 and s.g.checkpoints[2].level == "provisional"
-
-
-def test_demotion_marks_suspects_and_delivery_falls_back():
-    s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False))
-    s.world.define("p1", {})
-    s.snap("p1")
-    s.finish_job(_bg(s).jobs[0])
-    s.finish_job(_promote(s).id)
-    assert s.g.confirmed == 1
-    # 第二个暂存点：related 档位（pkg/mod.py → tests/test_mod.py）漏检了 Z
-    s.world.define("p2", {Z: "FAILED"})
-    s.snap("p2")
-    s.finish_job(_bg(s).jobs[0])
-    prom = _promote(s)
-    s.world.define("p3", {Z: "FAILED", ADD: "PASSED"})
-    s.snap("p3")
-    s.finish_job(_bg(s).jobs[0])
-    assert s.g.head == 3 and prom.tree == "p2"
-    s.finish_job(prom.id)
-    g = s.g
-    assert g.checkpoints[2].demoted and g.confirmed == 1 and suspect(g, 3)
-    assert delivery_checkpoint(g, s.cfg) == 1
-    assert _promote(s).tree == "p3"                                       # 降级点之后的暂存点照常提升
-    assert not any(j.purpose == "recheck" for j in g.jobs.values())       # 后台存档被降级：不追查、不通知
-    assert not g.persistent and not g.locates
-
-
-def test_demotion_of_a_submit_rechecks_fixed_or_still_failing():
-    for fixed in (True, False):
-        s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False, reviewer=False))
-        s.world.define("d1", {Z: "FAILED"})
-        sid = s.submit("d1")                                              # worker 提交的存档才追查
-        s.finish_job(s.g.attempts[s.g.submits[sid].attempt].jobs[0])
-        s.world.define("d2", {} if fixed else {Z: "FAILED"})
-        s.snap("d2")
-        promote = next(j for j in s.g.jobs.values() if j.purpose == "promote")
-        s.finish_job(promote.id)
-        assert s.g.checkpoints[1].demoted
-        recheck = next(j for j in s.g.jobs.values() if j.purpose == "recheck")
-        assert recheck.tree == "d2" and recheck.selection == ("tests/test_other.py",)
-        s.finish_job(recheck.id)
-        if fixed:
-            assert not s.g.persistent                                     # 已经修复：只记录
-        else:
-            assert s.g.persistent[Z].trigger == "demoted"
-            assert any(l.trigger == "demoted" for l in s.g.locates.values())
-
-
-def test_delivery_consistency_finished_after_the_delivered_point():
-    s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False, reviewer=False, background="off"))
-    s.world.define("u1", {Z: "FAILED", ADD: "PASSED"})
-    sid = s.submit("u1")
-    s.finish_job(s.g.attempts[s.g.submits[sid].attempt].jobs[0])
-    assert s.g.submits[sid].status == "accepted" and s.g.head == 1
-    promote = next(j for j in s.g.jobs.values() if j.purpose == "promote")
-    s.finish_job(promote.id)
-    assert s.g.checkpoints[1].demoted and s.g.confirmed == 0
-    status = s.do(R.deliver, "complete")
-    assert status == "INCOMPLETE" and s.g.run.delivered == 0
-    L = ledger(s.g)
-    assert L["not_delivered"] == ["R1", "R2", "R3"] and L["categories"]["done-not-delivered"] == 3
-    assert s.log[-1].get("not_delivered") == ["R1", "R2", "R3"]
-
-
-def test_deliver_unconfirmed_policy():
-    for policy, expected in ((False, 0), (True, 1)):
-        s = sim(auto_jobs=False, cfg=fg(deliver_unconfirmed=policy, reviewer=False))
-        s.world.define("q1", {})
-        sid = s.submit("q1")
-        s.finish_job(s.g.attempts[s.g.submits[sid].attempt].jobs[0])
-        assert delivery_checkpoint(s.g, s.cfg) == expected
-        s.do(R.deliver, "deadline")
-        assert s.g.run.deliver_unconfirmed is policy
-
-
-def test_relation_learned_from_located_demotion():
-    s = sim(auto_jobs=False, cfg=BelayConfig(confirm_regressions=False, reviewer=False))
-    s.world.define("r1", {})
-    s.snap("r1")
-    s.finish_job(_bg(s).jobs[0])
-    s.world.define("r2", {Z: "FAILED"})
-    sid = s.submit("r2")
-    s.finish_job(s.g.attempts[s.g.submits[sid].attempt].jobs[0])
-    for j in [j for j in s.g.jobs.values() if j.purpose == "promote" and j.state == "running"]:
-        s.finish_job(j.id)
-    while s.pending_jobs:
-        s.finish_job(s.pending_jobs[0])
-    assert s.g.checkpoints[2].demoted
-    assert ("pkg/mod.py", "tests/test_other.py") in s.g.relations
-    sel, _ = related_units(["pkg/mod.py"], ["tests/test_mod.py", "tests/test_other.py"], s.g.relations)
-    assert "tests/test_other.py" in sel
 
 
 # ======================================================================== 模块 D：快照二分
 
 def _timeline(s: Sim, statuses: list[str]) -> list[int]:
-    """造一条时间线：每张快照一棵树，Z 的结果按 statuses（P 通过 / F 失败 / U 跑不出结果）。"""
     ns = []
     for i, st in enumerate(statuses):
         tree = f"tl{i}"
@@ -621,8 +675,7 @@ def test_bisect_finds_the_first_bad_snapshot():
     s, ns, loc = locate_sim(["P"] * 5 + ["F"] * 6)
     rec = loc.results[0]
     assert rec["exact"] and rec["bad"]["id"] == ns[5] and rec["good"]["id"] == ns[4]
-    steps = [j for j in s.g.jobs.values() if j.locate == loc.id]
-    assert len(steps) <= 5
+    assert len([j for j in s.g.jobs.values() if j.locate == loc.id]) <= 5
 
 
 def test_bisect_skips_untestable_midpoints_and_caps_steps():
@@ -634,8 +687,8 @@ def test_bisect_skips_untestable_midpoints_and_caps_steps():
 
 
 def test_bisect_uses_background_results_and_reports_the_last_transition():
-    s = sim(cfg=BelayConfig(confirm_regressions=False))
-    ns = _timeline(s, ["P", "F", "P", "P", "F", "F"])                    # 后台验证过其中一些快照（一过性失败）
+    s = sim(cfg=bgc(confirm_regressions=False))
+    ns = _timeline(s, ["P", "F", "P", "P", "F", "F"])
     loc = s.do(R.start_locate, [Z], {"tree": "tl5", "snapshot": ns[-1]}, "rejected")
     rec = s.g.locates[loc].results[0]
     assert rec["good"]["id"] == ns[3] and rec["bad"]["id"] == ns[4]
@@ -645,7 +698,7 @@ def test_bisect_across_rollback_uses_the_rollback_target():
     s = sim(cfg=fg(confirm_regressions=False, reviewer=False))
     s.world.define("k1", {})
     s.submit("k1", files=OTHER)
-    _timeline(s, ["F", "F"])                                              # 旧段里的失败
+    _timeline(s, ["F", "F"])
     s.do(R.rollback, "w1", 1)
     s.world.define("e1", {})
     n1 = s.snap("e1", files=OTHER)
@@ -658,55 +711,16 @@ def test_bisect_across_rollback_uses_the_rollback_target():
     assert rec["good"]["id"] == n1 and rec["bad"]["id"] == n2
 
 
-# ======================================================================== 回归门豁免
-
-MUL_QUOTE = "make mul handle negative numbers correctly"
-
-
-def test_waiver_takes_a_contradicted_test_out_of_the_gate():
-    s = sim(cfg=fg(locate=False, reviewer=False))
-    with pytest.raises(Rejected, match="not seen it fail"):              # 不能预先豁免
-        s.do(R.waive_checks, "w1", [MUL], MUL_QUOTE, "the old test asserts the old sign")
-    s.world.define("neg", {MUL: "FAILED", ADD: "PASSED"})
-    sid = s.submit("neg")
-    assert s.g.submits[sid].status == "rejected" and s.g.head == 0
-    with pytest.raises(Rejected, match="verbatim"):
-        s.do(R.waive_checks, "w1", [MUL], "mul must change", "the old test asserts the old sign")
-    with pytest.raises(Rejected, match="not in the regression gate"):    # 原始代码上就失败的不在门里
-        s.do(R.waive_checks, "w1", [ADD], MUL_QUOTE, "x")
-    with pytest.raises(Rejected, match="Unknown requirement"):
-        s.do(R.waive_checks, "w1", [MUL], MUL_QUOTE, "x", "R9")
-    assert s.do(R.waive_checks, "w1", [MUL], MUL_QUOTE, "the old test asserts the old sign", "R2") == [MUL]
-    w = s.g.waived[MUL]
-    assert w.requirement == "R2" and w.worker == "w1" and w.quote == MUL_QUOTE
-    sid = s.submit("neg")                                                # 同一棵树再提交：复用结果，门里已没有 MUL
-    assert s.g.submits[sid].status == "accepted" and s.g.head == 1
-    L = ledger(s.g)
-    assert L["guard_checks"] == 1 and [x["test"] for x in L["waived"]] == [MUL]
-    assert "Waived regression checks" in ledger_markdown(s.g)
-    assert "1 waived" in build_context(s.g, "w1", 24_000, s.now, s.cfg, mode="resume").text
-    with pytest.raises(Rejected, match="already waived"):
-        s.do(R.waive_checks, "w1", [MUL], MUL_QUOTE, "again")
-    s.check_log()
-
-
-def test_waivers_can_be_disabled_and_are_capped():
-    for kw, msg in (({"waivers": False}, "disabled"), ({"waive_max_tests": 0}, "At most 0")):
-        s = sim(cfg=fg(locate=False, **kw))
-        s.world.define("neg", {MUL: "FAILED"})
-        s.submit("neg")
-        with pytest.raises(Rejected, match=msg):
-            s.do(R.waive_checks, "w1", [MUL], MUL_QUOTE, "x")
-        assert not s.g.waived
-
-
 # ======================================================================== 时间、停滞、运行的结束
 
-def test_deadline_reserve():
-    cfg = BelayConfig(reserve_min_sec=300)
+def test_deadline_reserve_includes_a_review():
+    cfg = BelayConfig(reserve_min_sec=120, reserve_review_sec=300, reserve_extra_sec=0)
     s = sim(cfg=cfg)
-    s.advance(5400 - 299)
-    s.do(R.tick)
+    from belay.core.queries import reserve_sec
+    assert reserve_sec(s.g, cfg) == pytest.approx(s.g.baseline_sec * 1.3 + 300)
+    assert reserve_sec(s.g, cfg.with_(reviewer=False)) == 120
+    s.advance(5400 - reserve_sec(s.g, cfg) + 1)
+    s.tick()
     assert s.g.run.reserve and any(e.kind == "stop_workers" for e in s.effects)
     assert R.next_step(s.g, "w1", s.now, cfg) == ("finalize", "deadline")
 
@@ -715,21 +729,21 @@ def test_stall_hint_and_repeated_rejected_submits():
     cfg = BelayConfig(stall_no_progress_sec=600, reserve_min_sec=10, locate=False, background="off")
     s = sim(cfg=cfg)
     s.advance(601)
-    s.do(R.tick)
+    s.tick()
     assert s.g.stalls[-1].kind == "no_progress" and s.g.stalls[-1].action == "hint"
     for i in range(3):
         s.world.define(f"bad{i}", {MUL: "FAILED"})
         s.submit(f"bad{i}")
-    s.do(R.tick)
+    s.tick()
     st = s.g.stalls[-1]
     assert st.kind == "repeated_failure" and st.action == "hint" and "3 submits" in st.detail
     n = len(s.g.stalls)
-    s.do(R.tick)
+    s.tick()
     assert len(s.g.stalls) == n
 
 
 def test_session_end_is_not_run_end_and_submits_decide():
-    s = sim(cfg=fg(review_batch=5), auto_jobs=False)
+    s = sim(cfg=fg(), auto_jobs=False, reviewer=MANUAL)
     s.do(R.end_session, "w1", "done")
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("start_session", "restart")
     s.do(R.start_session, "w1", "restart", {})
@@ -737,11 +751,11 @@ def test_session_end_is_not_run_end_and_submits_decide():
     s.world.define("t1", {ADD: "PASSED"})
     s.submit("t1")
     s.do(R.end_session, "w1", "done")
-    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("wait", "checkpoint in progress")
+    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("wait", "merge in progress")
     while s.pending_jobs:
         s.finish_job(s.pending_jobs[0])
-    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("wait", "submit in progress")     # 复查进行中
-    s.review("V1", {"R2": {"implemented": "yes"}, "R3": {"implemented": "yes"}})
+    assert s.running_review()
+    s.review(s.running_review(), judge(True, {"R2": ("done", "E1"), "R3": ("done", "E1")})(s, last_review(s)))
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")
 
 
@@ -753,29 +767,36 @@ def test_sessions_without_progress_stop_the_run():
     assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "no_progress")
 
 
-def test_run_done_requires_satisfied_requirements_and_a_confirmed_delivery():
-    s = sim(cfg=fg(reviewer=False))
+def test_finalize_cancels_the_background_review_and_delivers_the_head():
+    s = sim(reviewer=MANUAL, cfg=bgc())
     s.world.define("t1", {ADD: "PASSED"})
-    s.submit("t1")
-    s.do(R.end_session, "w1", "submitted")
-    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("finalize", "complete")
-    s.do(R.begin_finalize, "complete")
-    assert s.do(R.promote_now) is False                                   # 模拟器里全量立即完成 → 提升
-    assert s.g.checkpoints[1].level == "confirmed" and s.g.confirmed == 1
-    assert s.do(R.deliver, "complete") == "DONE" and s.g.run.delivered == 1
-    assert s.g.run.status_reasons == () and ledger(s.g)["status_reasons"] == []
+    s.snap("t1")
+    vid = s.running_review()
+    s.do(R.begin_finalize, "deadline")
+    assert s.g.reviews[vid].status == "cancelled" and vid in s.cancelled_reviews
+    n = s.snap("t1", reason="deadline")
+    aid = s.do(R.request_merge, "w1", n, "deadline")
+    v2 = s.running_review()
+    assert s.g.reviews[v2].trigger == "deadline" and s.g.reviews[v2].attempt == aid
+    s.review(v2, judge(True, {"R2": ("done", "E1"), "R3": ("done", "E1")})(s, s.g.reviews[v2]))
+    assert s.g.head == 1
+    assert s.do(R.deliver, "deadline") == "DONE" and s.g.run.delivered == 1
     s.check_log()
 
 
-def test_blocked_requirement_is_incomplete_with_reasons():
-    s = sim(cfg=fg(reviewer=False))
+def test_unreviewed_final_snapshot_is_not_delivered_when_time_runs_out():
+    s = sim(reviewer=MANUAL, cfg=fg())
     s.world.define("t1", {ADD: "PASSED"})
-    s.submit("t1", blocked=[{"requirement": "R3", "kind": "environment", "reason": "no docs tool"}])
-    s.do(R.begin_finalize, "complete")
-    s.do(R.promote_now)
-    assert s.do(R.deliver, "complete") == "INCOMPLETE"
-    assert s.g.run.status_reasons == ("R3 is blocked (environment)",)
-    assert "not DONE because R3 is blocked" in ledger_markdown(s.g)
+    sid = s.submit("t1")
+    s.review(s.running_review(), judge(True)(s, last_review(s)))
+    assert s.g.head == 1 and s.g.submits[sid].status == "returned"
+    s.do(R.begin_finalize, "deadline")
+    s.world.define("t2", {ADD: "PASSED"})
+    n = s.snap("t2", reason="deadline")
+    s.do(R.request_merge, "w1", n, "deadline")
+    assert s.running_review()                                              # 复核还没结束就到点了
+    assert s.do(R.deliver, "deadline") == "INCOMPLETE"
+    assert s.g.run.delivered == 1 and not s.running_review()
 
 
 def test_unfinished_requirements_and_nothing_delivered():
@@ -795,16 +816,18 @@ def test_crash_restarts_are_bounded():
 
 
 def test_source_discipline_in_log():
-    s = sim(cfg=BelayConfig(reviewer=False))
+    s = sim(cfg=bgc(), reviewer=judge(True, {"R3": ("done", "E1")}))
     s.world.define("t1", {ADD: "PASSED"})
     s.snap("t1")
     s.submit("t1")
-    assert not check_log(s.log)
+    assert not check_log(s.log) and not llm_effects(s.log)
     assert all(e.source in ("rule", "observed") for e in s.log
-               if e.type in ("requirement_verified", "checkpoint_created", "checkpoint_confirmed", "todo_anchored"))
-    assert all(e.source == "self_report" for e in s.log if e.type in ("requirement_submitted", "todos_updated"))
-    forged = list(s.log) + [s.log[-1].__class__(len(s.log) + 1, 0, "requirement_verified", "worker:w1",
-                                                "self_report", {})]
+               if e.type in ("merged", "merge_advancing", "review_decided", "todo_anchored"))
+    assert all(e.source == "llm" for e in s.log if e.type == "merge_reviewed")
+    assert all(e.source == "rule" for e in s.log if e.type == "requirement_judged")
+    Event = s.log[-1].__class__
+    forged = list(s.log) + [Event(len(s.log) + 1, 0, "requirement_judged", "worker:w1", "self_report",
+                                  {"requirement": "R1", "status": "done", "level": "E2", "by": "self_report"})]
     assert check_log(forged)
 
 
@@ -819,10 +842,49 @@ def test_board_and_context_after_a_rejected_submit():
     text = ctx.text
     for needle in ("<task>", "- R1 add", "Your last submit was rejected", f"{MUL} (FAILED)",
                    "already fail on the original code", "[~] fix add in pkg/mod.py", "Decided to change add()",
-                   "model-written", "+ return a + b", "call submit", "Checklist: open 3"):
+                   "model-written", "+ return a + b", "call submit", "open 3", "Latest merge point"):
         assert needle in text, needle
-    assert "Suggested" not in text and "claim" not in text
     keys = [k for k, _ in ctx.sections]
     assert keys[:3] == ["task", "requirements", "pending"] and keys[-1] == "next"
     board = render_board(s.g, "w1", s.now, s.cfg)
     assert "Last submit U1: rejected" in board and "R1 [open]" in board
+    assert "How it will be checked" in render_board(s.g, "w1", s.now, s.cfg, requirement="R1")
+
+
+def test_without_tests_a_failing_reviewer_never_merges_a_background_snapshot():
+    s = Sim({}, cfg=bgc(review_retries=0), reviewer=MANUAL)
+    s.setup(TASK, PLAN, verifier=False)
+    s.do(R.start_session, "w1", "first", {})
+    s.snap("w1")
+    s.review(s.running_review(), None, failed=True)
+    a = next(iter(s.g.attempts.values()))
+    assert a.status == "rejected" and a.reason == "review" and s.g.head == 0       # 没有回归门可以兜底
+    sid = s.submit("w2")
+    s.review(s.running_review(), None, failed=True)
+    assert s.g.head == 1 and s.g.submits[sid].status == "accepted"                 # 自己提交的：按自述记下
+    assert reqs(s)["R3"] == (REQ_DONE, "E0")
+
+
+def test_finalize_hands_the_reviewer_to_a_waiting_submit():
+    s = sim(reviewer=MANUAL, cfg=bgc())
+    s.world.define("t1", {ADD: "PASSED"})
+    s.snap("t1")
+    bg_review = s.running_review()
+    s.world.define("t2", {ADD: "PASSED"})
+    n = s.snap("t2", reason="submit")
+    # 一个已经在等复核者的 submit（快照与链头不同，回归门已过）：模拟在后台复核进行中到达
+    s.do(R.request_submit, "w1", n, "done")
+    assert s.g.reviews[bg_review].status == "cancelled"                     # submit 取代了后台复核
+    fg_review = s.running_review()
+    assert s.g.reviews[fg_review].trigger == "submit"
+    s.do(R.begin_finalize, "deadline")
+    assert s.running_review() == fg_review                                   # 前台的复核不受收尾影响
+
+
+def test_only_a_declared_block_can_be_accepted():
+    s = sim(cfg=fg(), reviewer=judge(True, {"R3": {"status": "blocked", "level": "E1", "reason": "no docs tool"}}))
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    r3 = s.g.requirements["R3"]
+    assert r3.status == REQ_OPEN and "cannot be done here" in r3.missing[-1]
+    assert s.g.submits[sid].status == "returned"

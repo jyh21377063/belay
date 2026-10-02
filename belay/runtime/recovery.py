@@ -1,15 +1,16 @@
 """runtime 重启后的对账（视图已经由 Runtime.open 从快照 + 重放重建）。
 
-  0. 容器重建（rebuild=True，G4）：从原始代码重新初始化影子仓库（树哈希必须等于 0 号存档）→ 按顺序 unbundle 宿主机上的
-     全部 bundle → 检查每个存档与快照的对象（最后一次导出之后的快照记为 lost；丢了提交的存档按确定的提交重做，
-     连树都没有就把链截到还在的祖先）→ 恢复引用 → 工作区检出为最新一张已导出快照的原样树 → 重跑破坏探针。
-  1. 存档链：处于 advancing 的尝试查 git 引用。已指向新提交 → 补记 created；还指向旧提交 → 重做 CAS（提交是确定的）；
+  0. 容器重建（rebuild=True，G4）：从原始代码重新初始化影子仓库（树哈希必须等于 0 号合并点）→ 按顺序 unbundle 宿主机上的
+     全部 bundle → 检查每个合并点与快照的对象（最后一次导出之后的快照记为 lost；丢了提交的合并点按确定的提交重做——
+     提交说明由图决定——连树都没有就把链截到还在的祖先）→ 恢复引用 → 工作区检出为最新一张已导出快照的原样树 →
+     重跑破坏探针。
+  1. 合并链：处于 advancing 的合并请求查 git 引用。已指向新提交 → 补记 merged；还指向旧提交 → 重做 CAS（提交是确定的）；
      都不是 → cas_conflict。之后引用必须等于链头的提交，否则按链头修正（回退事件之后崩溃）。
   2. 作业：有完成标记的补收结果；进程组还活着的重新接上（G5，只在验证槽位与 live 作业上：它们不碰 worker 的工作区）；
      其余记为 unknown，由规则按同样的 (树, 检查集合) 重跑。
   3. 会话（G2）：容器还在、停机不久、同一会话恢复失败没有超过上限、轨迹读得出来 → 读盘重放（会话保持打开）；
      否则记为结束（runtime_crash / rebuild），从恢复点开新会话。
-  4. 没做完的 LLM 副作用（诊断、复查）与定位 diff 重新发起。
+  4. 没做完的 LLM 副作用（诊断、复核会话）与定位 diff 重新发起（复核会话从头开始）。
   5. runtime_recovered（停机时长按墙钟；rebuilt、lost_snapshots、isolation），然后由主循环继续。
 """
 from __future__ import annotations
@@ -33,7 +34,8 @@ if TYPE_CHECKING:
 async def rebuild_container(run: "BelayRun", report: dict) -> dict:
     rt, repo, env = run.rt, run.repo, run.env
     g = rt.graph
-    dirs = [run.s.git_dir, f"{run.s.git_dir}.bundles"] + ([run.verifier.verify_dir] if run.verifier else [])
+    dirs = [run.s.git_dir, f"{run.s.git_dir}.bundles", run.review_dir, f"{run.review_dir}.index",
+            f"{run.review_dir}.seeded"] + ([run.verifier.verify_dir] if run.verifier else [])
     await env.run("rm -rf " + " ".join(shlex.quote(d) for d in dirs), timeout=600, cwd="/")
     commit, tree = await repo.init()
     if tree != g.checkpoints[0].tree or commit != g.checkpoints[0].commit:
@@ -53,7 +55,7 @@ async def rebuild_container(run: "BelayRun", report: dict) -> dict:
     for s in snaps:
         if s.n not in lost:
             await repo.update_ref(f"{SNAP_REF}{s.n}", s.commit)
-    # 存档：提交是确定的；树还在就重做提交，连树都没有就把链截到还在的祖先
+    # 合并点：提交是确定的；树还在就重做提交，连树都没有就把链截到还在的祖先
     missing_cps = []
     for cp in sorted(g.checkpoints.values(), key=lambda c: c.id):
         if cp.id == 0:
@@ -82,7 +84,7 @@ async def rebuild_container(run: "BelayRun", report: dict) -> dict:
     snap = next((s for s in reversed(snaps) if s.n not in lost), None)
     target = snap.raw_tree if snap is not None else rt.graph.head_cp.tree
     await repo.checkout(target, run.w)
-    report["workspace"] = f"snapshot {snap.n}" if snap is not None else "checkpoint"
+    report["workspace"] = f"snapshot {snap.n}" if snap is not None else "merge point"
     iso = None
     if run.verifier is not None and run.spec.test_cmd:
         await run.verifier.setup()
@@ -107,7 +109,7 @@ async def reconcile(run: "BelayRun", rebuild: bool = False) -> dict:
     if rebuild:
         rebuilt = await rebuild_container(run, report)
 
-    # 1. 存档链
+    # 1. 合并链
     for a in [a for a in rt.graph.attempts.values() if a.status == ATT_ADVANCING]:
         ok, commit, files, detail = await run.advance(a.id)
         await rt.submit(R.ref_advanced, a.id, ok, commit, files, detail or "reconciled after restart")

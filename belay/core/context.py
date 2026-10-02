@@ -6,7 +6,8 @@
   - 稳定的在前，易变的在后：前缀是任务原文 + 需求索引（冻结后逐字不变），状态都放在后面，前缀缓存整次运行都能命中。
   - 每段有自己的上限（cfg.opening_caps），不再用一个总预算从下往上裁。
   - 每段标明来源；仍是纯函数：blobs 是调用方读出的附件（diff、离开期间工作区的变化），away 是上个会话之后的事件。
-v7：没有“当前焦点”和“建议顺序”。恢复时给出：需求状态、worker 自己的 todo、它写的交接摘要、链头以来的改动。
+v8：需求状态只来自合并时复核者的判定（带证据等级与缺失项）；恢复时给出：需求状态、worker 自己的 todo、它写的交接摘要、
+最新合并点以来的改动、离开期间的复核结论。
 """
 from __future__ import annotations
 
@@ -16,11 +17,12 @@ from typing import Iterable, Mapping, Optional
 
 from belay.core.config import BelayConfig
 from belay.core.events import Event
-from belay.core.model import (CONFIRMED, REQ_BLOCKED, REQ_FINISHED, REQ_OPEN, REQ_SUBMITTED, REQ_VERIFIED,
-                              TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED, Graph)
-from belay.core.queries import (actionable, chain, id_ranges, latest_handoff_summary, num, open_persistent,
-                                todos_in_order)
-from belay.core.render import checkpoint_line, render_diagnosis, render_located, requirement_line
+from belay.core.model import (E0, REQ_BLOCKED, REQ_DONE, REQ_OPEN, TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED,
+                              Graph)
+from belay.core.queries import (actionable, chain, id_ranges, last_score, latest_handoff_summary, num,
+                                open_persistent, todos_in_order)
+from belay.core.render import (checkpoint_line, render_diagnosis, render_located, requirement_line,
+                               requirement_state)
 from belay.core.verify import (B_FAIL, B_FLAKY, active_guard, check_unit, reasons_for_tree, regression_ids,
                                related_units, test_files_of)
 
@@ -31,8 +33,8 @@ LABEL = {"original": "task statement, verbatim", "rule": "derived by the harness
 
 INTRO = {
     "first": "You are starting work on the task below. The harness keeps a record of this run: the requirements "
-             "extracted from the task, verified checkpoints of your work and your todo list. This opening context "
-             "was generated from that record.",
+             "extracted from the task, the merge points of your work (each one reviewed) and your todo list. This "
+             "opening context was generated from that record.",
     "resume": "You are continuing work in a new session. Nothing from earlier sessions is in your context except "
               "what is below, which the harness rebuilt from its record. Files you read before are not in context: "
               "read a file again before editing it. Your earlier changes are still in the working tree.",
@@ -42,7 +44,7 @@ INTRO = {
 }
 PROTECTED = ("task", "requirements", "pending", "todos", "summary", "workspace")
 SUBMIT_LINE = ("When you believe every requirement on the checklist is done, call submit: the harness tests your "
-               "work, checks each requirement and tells you what is still missing.")
+               "work, a reviewer checks each requirement and you get back what is still missing.")
 
 
 @dataclass(frozen=True)
@@ -117,22 +119,9 @@ def _pending(g: Graph, worker: str) -> str:
     out = []
     open_tests = open_problem_tests(g)
     if open_tests:
-        recs = sorted((g.persistent[t] for t in open_tests), key=lambda r: r.seq)
-        by_trigger: dict[str, list[str]] = {}
-        for r in recs:
-            by_trigger.setdefault(r.trigger, []).append(r.test)
-        for trig, tests in by_trigger.items():
-            why = {"demoted": "failed the full suite on a checkpoint and still fails on your latest snapshot",
-                   "background": "failed the regression gate on two background snapshots in a row"
-                   }.get(trig, trig)
-            out.append(f"- Persistent regression ({why}): " + ", ".join(tests[:8])
-                       + (f" (+{len(tests) - 8} more)" if len(tests) > 8 else ""))
-    for cp in chain(g):
-        if cp.demoted:
-            regs = [r for r in cp.demote_regressions if regression_ids([r])[0] in open_tests]
-            if regs:
-                out.append(f"- Checkpoint {cp.id} was demoted: {'; '.join(regs[:4])} fail(s) in the full suite "
-                           "(the related tests did not select them).")
+        tests = sorted(open_tests)
+        out.append("- Persistent regression (failed the regression gate on two background snapshots in a row): "
+                   + ", ".join(tests[:8]) + (f" (+{len(tests) - 8} more)" if len(tests) > 8 else ""))
     shown = 0
     for loc in sorted(g.locates.values(), key=lambda l: -l.started_seq):
         if loc.epoch != g.epoch or not loc.results or not (set(loc.tests) & open_tests or loc.trigger == "rejected"):
@@ -153,59 +142,70 @@ def _pending(g: Graph, worker: str) -> str:
         regs = rej.get("regressions") or []
         extra = f" (+{rej['n_regressions'] - len(regs)} more)" if rej.get("n_regressions", 0) > len(regs) else ""
         a = g.attempts.get(rej.get("attempt"))
-        reasons = reasons_for_tree(g, a.tree) if a else {}
-        lines = []
-        for r in regs[:8]:
-            why = reasons.get(regression_ids([r])[0])
-            lines.append(f"{r}" + (f" — {why[:160]}" if why else ""))
-        out.append(f"- Your last submit was rejected (attempt {rej.get('attempt')}, {rej.get('reason')}): "
-                   + ("; ".join(lines) + extra if lines else rej.get("detail", "")))
+        if rej.get("reason") == "review":
+            v = g.reviews.get(rej.get("review") or "")
+            d = v.decision if v is not None else {}
+            line = (f"- The reviewer did not merge your snapshot s{rej.get('snapshot')} ({rej.get('trigger')}): "
+                    + "; ".join((d.get("reasons") or [str(rej.get("detail"))])[:4])[:800])
+            if d.get("feedback"):
+                line += f"\n  Reviewer's feedback: {d['feedback'][:1500]}"
+            out.append(line)
+        else:
+            reasons = reasons_for_tree(g, a.tree) if a else {}
+            lines = []
+            for r in regs[:8]:
+                why = reasons.get(regression_ids([r])[0])
+                lines.append(f"{r}" + (f" — {why[:160]}" if why else ""))
+            out.append(f"- Your last submit was rejected (merge request {rej.get('attempt')}, {rej.get('reason')}): "
+                       + ("; ".join(lines) + extra if lines else rej.get("detail", "")))
     return "\n".join(out)
 
 
 # ---------------------------------------------------------------- 5：离开期间
 
-_IMPORTANCE = {"checkpoint_demoted": 0, "persistent_regression": 0, "regression_located": 0,
-               "diagnosis_recorded": 0, "requirement_reopened": 0, "rollback": 0, "submit_updated": 0,
-               "review_recorded": 1, "checkpoint_confirmed": 1, "checkpoint_rejected": 1, "todo_anchored": 2,
-               "requirement_verified": 1, "checkpoint_created": 2, "job_finished": 3, "runtime_recovered": 1}
+_IMPORTANCE = {"persistent_regression": 0, "regression_located": 0, "diagnosis_recorded": 0,
+               "requirement_judged": 0, "rollback": 0, "submit_updated": 0, "review_decided": 0,
+               "merge_rejected": 1, "merged": 1, "todo_anchored": 2, "job_finished": 3, "runtime_recovered": 1}
 
 
 def _away_line(g: Graph, e: Event) -> Optional[str]:
     t = e.type
-    if t == "checkpoint_created":
+    if t == "merged":
         cid = int(e.get("checkpoint"))
-        return f"checkpoint {checkpoint_line(g, cid)} was created" if cid in g.checkpoints else None
-    if t == "checkpoint_confirmed":
-        return f"checkpoint {e.get('checkpoint')} passed the full suite (confirmed)"
-    if t == "checkpoint_demoted":
-        return f"checkpoint {e.get('checkpoint')} failed the full suite: {'; '.join(e.get('regressions')[:3])}"
-    if t == "checkpoint_rejected":
+        return f"merge point {checkpoint_line(g, cid)} was created" if cid in g.checkpoints and cid else None
+    if t == "merge_rejected":
         a = g.attempts.get(e.get("attempt"))
-        if a is None or (a.lane != "fg" and a.kind != "handoff") or not e.get("regressions"):
+        if a is None:
             return None
-        return f"checkpoint attempt {a.id} ({a.kind}) was rejected: {'; '.join(e.get('regressions')[:3])}"
+        if e.get("reason") == "review":
+            return f"merge request {a.id} (s{a.snapshot}) was not approved by the reviewer: {str(e.get('detail'))[:200]}"
+        if (a.lane != "fg" and a.trigger != "handoff") or not e.get("regressions"):
+            return None
+        return f"merge request {a.id} ({a.trigger}) was rejected: {'; '.join(e.get('regressions')[:3])}"
+    if t == "review_decided":
+        fb = e.get("feedback") or ""
+        return f"reviewer's feedback ({e.get('review')}): {fb[:300]}" if fb and e.get("merge") is not False else None
     if t == "persistent_regression":
         return f"persistent regression: {', '.join(e.get('tests')[:4])}"
     if t == "regression_located":
         return f"regression located: {', '.join(e.get('tests')[:3])} first failed at {e.get('bad', {}).get('id')}"
     if t == "diagnosis_recorded":
         return f"diagnosis {e.get('diagnosis')} recorded (see open problems)"
-    if t == "requirement_reopened":
-        return f"{e.get('requirement')} was reopened ({e.get('reason')})"
-    if t == "requirement_verified":
-        return f"{e.get('requirement')} is verified by its checks on checkpoint {e.get('checkpoint')}"
+    if t == "requirement_judged":
+        st = e.get("status")
+        lv = f" ({e.get('level')})" if st == REQ_DONE and e.get("level") else ""
+        miss = e.get("missing") or []
+        return f"{e.get('requirement')} was judged {e.get('judgement') or st}{lv} on merge point " \
+               f"{e.get('checkpoint')}" + (f"; missing: {'; '.join(miss[:2])[:200]}" if miss and st == REQ_OPEN
+                                          else "")
     if t == "submit_updated" and e.get("status") in ("accepted", "returned"):
         return f"submit {e.get('submit')} was {e.get('status')}" + \
             (f"; still open: {id_ranges(e.get('open'))}" if e.get("open") else "")
     if t == "todo_anchored":
         td = g.todos.get(e.get("todo"))
-        return f"todo \"{td.title[:60] if td else e.get('todo')}\" is in checkpoint {e.get('checkpoint')}"
-    if t == "review_recorded":
-        res = e.get("results") or {}
-        return "reviewer: " + ", ".join(f"{k}={v.get('implemented')}" for k, v in sorted(res.items()))
+        return f"todo \"{td.title[:60] if td else e.get('todo')}\" is in merge point {e.get('checkpoint')}"
     if t == "rollback":
-        return f"the working tree was rolled back to checkpoint {e.get('to')}"
+        return f"the working tree was rolled back to merge point {e.get('to')}"
     if t == "job_finished" and e.get("state") == "finished":
         j = g.jobs.get(e.get("job"))
         if j is None or j.live:
@@ -245,20 +245,22 @@ def _progress(g: Graph, cap_chars: int) -> str:
     reqs = actionable(g)
     counts: dict[str, int] = {}
     for r in reqs:
-        counts[r.status] = counts.get(r.status, 0) + 1
-    out = ["Checklist: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))]
-    ver = [r.id for r in reqs if r.status == REQ_VERIFIED]
-    sub = [r.id for r in reqs if r.status == REQ_SUBMITTED]
-    if ver:
-        out.append(f"Verified by their checks: {id_ranges(ver)}")
-    if sub:
-        out.append(f"Submitted earlier: {id_ranges(sub)}")
+        k = r.status + (f" {r.level}" if r.status == REQ_DONE else "")
+        counts[k] = counts.get(k, 0) + 1
+    out = ["Checklist (judged by the reviewer when your work is merged): "
+           + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))]
+    done = [r for r in reqs if r.status == REQ_DONE]
+    by_level: dict[str, list[str]] = {}
+    for r in done:
+        by_level.setdefault(r.level or "?", []).append(r.id)
+    for lv in sorted(by_level, reverse=True):
+        out.append(f"Done ({lv}{', self-reported' if lv == E0 else ''}): {id_ranges(by_level[lv])}")
     rest = [r for r in reqs if r.status in (REQ_OPEN, REQ_BLOCKED)]
     lines = [f"- {requirement_line(g, r.id, 90)}" for r in rest]
     body = "\n".join(lines)
-    if len(body) > cap_chars:                       # 太多：重开过的、受阻的优先，其余只列编号
-        first = [x for x, r in zip(lines, rest) if r.reopen_count or r.status == REQ_BLOCKED][:20]
-        others = [r.id for r in rest if not (r.reopen_count or r.status == REQ_BLOCKED)]
+    if len(body) > cap_chars:                       # 太多：判过没做完的、受阻的优先，其余只列编号
+        first = [x for x, r in zip(lines, rest) if r.missing or r.status == REQ_BLOCKED][:20]
+        others = [r.id for r in rest if not (r.missing or r.status == REQ_BLOCKED)]
         body = "\n".join(first) + (f"\n- not done yet: {id_ranges(others)} (board(status=\"open\"))" if others else "")
     if rest:
         out.append("Not done yet:\n" + body)
@@ -274,9 +276,9 @@ def _todos(g: Graph) -> str:
     for t in items:
         line = f"{mark.get(t.status, '[ ]')} {t.title}"
         if t.status == TODO_ANCHORED and t.checkpoint is not None:
-            line += f"  (in checkpoint {t.checkpoint})"
+            line += f"  (in merge point {t.checkpoint})"
         elif t.status == TODO_COMPLETED:
-            line += "  (not yet in a checkpoint)"
+            line += "  (not merged yet)"
         elif t.status == TODO_ACTIVE:
             line += "  <- in progress"
         out.append(line)
@@ -298,22 +300,19 @@ def _summary(g: Graph, worker: str, recent_calls: Iterable[str]) -> str:
 def _workspace(g: Graph, worker: str, blobs: Mapping[str, str], cfg: BelayConfig, mode: str) -> str:
     cp = g.head_cp
     if cp is None:
-        return "(no checkpoint yet)"
-    lines = [f"Latest checkpoint: {checkpoint_line(g, cp.id)}"]
-    conf = g.confirmed
-    if conf is not None and conf != cp.id:
-        ids = [c.id for c in chain(g)]
-        behind = ids.index(conf) if conf in ids else "?"
-        lines.append(f"Latest confirmed checkpoint (what would be delivered now): {conf}, {behind} checkpoint(s) "
-                     "behind; provisional checkpoints are confirmed by the full suite in the background.")
+        return "(no merge point yet)"
+    lines = [f"Latest merge point (what would be delivered now): {checkpoint_line(g, cp.id)}"]
+    score, note, at = last_score(g)
+    if score is not None and at != cp.id:
+        lines.append(f"Latest measured score: {score:g} at merge point {at} ({note[:200]})")
     w = g.wips.get(worker)
     if w is not None and w.dropped:
         lines.append("Changes under test paths (never delivered; checks run against the original test files): "
                      + ", ".join(w.dropped[:15]) + (" ..." if len(w.dropped) > 15 else ""))
     partial = blobs.get("partial_diff")
     if partial and mode != "first":
-        lines.append(f"Your changes since checkpoint {cp.id}, kept in your working tree (nothing was rolled back; "
-                     "the harness verifies them in the background):")
+        lines.append(f"Your changes since merge point {cp.id}, kept in your working tree (nothing was rolled back; "
+                     "the harness reviews them in the background):")
         lines.append("```diff\n" + _clip(partial, cfg.context_diff_chars, "the rest is in your working tree")
                      + "\n```")
     elif w is not None and w.base == cp.id and not w.files and mode != "first":
@@ -325,22 +324,23 @@ def _gate(g: Graph, worker: str) -> str:
     if not g.baseline_ready:
         return "(baseline not recorded yet)"
     if not g.baseline:
-        return "No test results are available for this task, so checkpoints are not verified by tests."
+        return ("No tests are available for this task: a reviewer checks each merge of your work by reading and "
+                "running it.")
     fails = sorted(t for t, c in g.baseline.items() if c == B_FAIL)
     flaky = sorted(t for t, c in g.baseline.items() if c == B_FLAKY)
     lines = [f"{len(active_guard(g))} checks passed twice on the original code: these form the regression "
-             "gate. A checkpoint is accepted only if none of them fails, errors, is skipped or goes missing."]
+             "gate. Your work is merged only if none of them fails, errors, is skipped or goes missing."]
     if g.waived:
-        lines.append(f"{len(g.waived)} waived (the task asks for behaviour they contradict): "
+        lines.append(f"{len(g.waived)} waived by the reviewer (the task asks for behaviour they contradict): "
                      + ", ".join(sorted(g.waived)[:10]) + (" ..." if len(g.waived) > 10 else ""))
     if g.degraded:
-        lines.append("(The tests cannot run outside the working tree here, so checks run only when you submit "
+        lines.append("(The tests cannot run outside the working tree here, so merges happen only when you submit "
                      "or a session ends.)")
     w = g.wips.get(worker)
     files = [p for p, _, _ in w.files] if w else []
     related = []
     if files and fails:
-        sel, _ = related_units(files, test_files_of(g.baseline), g.relations)
+        sel, _ = related_units(files, test_files_of(g.baseline))
         if sel:
             related = [t for t in fails if check_unit(t) in set(sel)]
     if fails:

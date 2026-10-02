@@ -1,8 +1,9 @@
-"""端到端：LocalEnv + ScriptedLLM + 真实的 git 与 pytest。不需要容器和模型。
+"""端到端：LocalEnv + ScriptedLLM + 真实的 git 与 pytest。不需要容器和模型（复核者、诊断者用 fakes.FakeAux）。
 
-覆盖：首次开场（build_context）→ 后台验证最新快照、需求随检查项自动验证 → submit（判定需求、复查、接受或交还清单）
-→ 交付最近的确认点；回归被拒、测试改动不交付；模型停下不调工具时先追问、再当作提交；会话结束不等于运行结束；
-L2 / L3 压缩与 L4 交接；worker 崩溃；runtime 崩溃后的对账（CAS 前 / CAS 后 / 作业丢失）；截止时交付最近的存档。
+覆盖：首次开场（build_context）→ 后台合并请求（回归门 + 复核者）、需求随检查项（E3）与复核者的判定记下 →
+submit（请求立即复核：合并并判定、交还缺失项或接受）→ 交付合并链的链头；复核者失败时的重试与降级；
+回归被拒、测试改动不交付；模型停下不调工具时先追问、再当作提交；会话结束不等于运行结束；L2 / L3 压缩与 L4 交接；
+worker 崩溃；runtime 崩溃后的对账（CAS 前 / CAS 后 / 作业丢失）；截止时交付链头。
 每个场景结束后都检查：事件库重放 == 实时的图，日志满足来源纪律。
 """
 from __future__ import annotations
@@ -16,13 +17,14 @@ from pathlib import Path
 import pytest
 
 from belay.core.config import BelayConfig
-from belay.core.invariants import check, check_log
+from belay.core.invariants import check, check_log, llm_effects
 from belay.core.reduce import replay
 from belay.env import LocalEnv
 from belay.llm import ScriptedLLM
 from belay.runtime.driver import BelayRun, RunSettings
 from belay.runtime.store import EventStore
 from belay.runtime.verifier import VerifierSpec
+from tests.integration.fakes import FakeAux, oracle
 
 ADD, MUL = "tests/test_mod.py::test_add", "tests/test_mod.py::test_mul"
 TASK = ("# Changes\n"
@@ -82,10 +84,11 @@ class Harness:
         self.settings = RunSettings(**kw)
         self.logs: list[str] = []
 
-    def make(self, llm, cls=BelayRun, aux=None) -> BelayRun:
-        """aux：诊断者、复查者、标签用的模型（默认没有脚本：这些调用失败，只记为 failed，不影响 worker 的脚本）。"""
-        return cls(llm, LocalEnv(str(self.repo)), self.settings, self.cfg, SPEC, aux_llm=aux or ScriptedLLM([]),
-                   log=self.logs.append)
+    def make(self, llm, cls=BelayRun, aux=None, spec: VerifierSpec | None = None) -> BelayRun:
+        """aux：复核者与诊断者用的模型（默认 FakeAux：看复核目录里的快照下结论的 oracle）。"""
+        self.aux = aux if aux is not None else FakeAux()
+        return cls(llm, LocalEnv(str(self.repo)), self.settings, self.cfg, SPEC if spec is None else spec,
+                   aux_llm=self.aux, log=self.logs.append)
 
     def events(self):
         store = EventStore(self.settings.run_dir)
@@ -98,7 +101,7 @@ class Harness:
         events = self.events()
         g = replay(events)
         assert g == run.rt.graph, "replaying the event store must rebuild the live graph"
-        assert not check(g) and not check_log(events)
+        assert not check(g) and not check_log(events) and not llm_effects(events)
         return events
 
     def run_dir(self) -> Path:
@@ -106,12 +109,14 @@ class Harness:
 
 
 def assert_sub_blocked(run: BelayRun, res) -> None:
-    """脚本里 R3（加 sub）以 insufficient_info 受阻、其余都做完时：运行如实记为 INCOMPLETE，原因只有这一条，
-    交付的是确认点。"""
+    """脚本里 R3（加 sub）以 insufficient_info 受阻、R2 做完时：复核者认可受阻，运行记为 DONE；交付的是链头，
+    它是复核过的合并点。"""
     g = run.rt.graph
-    assert res.status == "INCOMPLETE", res.status
-    assert g.run.status_reasons == ("R3 is blocked (insufficient_info)",), g.run.status_reasons
-    assert g.run.delivered_level == "confirmed"
+    assert res.status == "DONE", (res.status, g.run.status_reasons)
+    r3 = g.requirements["R3"]
+    assert r3.status == "blocked" and r3.by == "review" and r3.blocked_kind == "insufficient_info"
+    assert g.requirements["R2"].status == "done" and g.requirements["R2"].level == "E3"
+    assert g.run.delivered == g.head and g.checkpoints[g.head].review is not None
 
 
 def results(llm: ScriptedLLM) -> list[str]:
@@ -149,63 +154,138 @@ def test_happy_path_done(tmp_path):
     llm = ScriptedLLM([PLANNER, call(READ, todos), call(FIX_ADD), call(ADD_SUB), call(SUBMIT)])
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"
+    assert res.status == "DONE", run.rt.graph.run.status_reasons
     g = run.rt.graph
-    assert g.requirements["R2"].status == "verified" and g.requirements["R3"].status == "submitted"
+    assert (g.requirements["R2"].status, g.requirements["R2"].level, g.requirements["R2"].by) == ("done", "E3",
+                                                                                                    "checks")
+    assert (g.requirements["R3"].status, g.requirements["R3"].level, g.requirements["R3"].by) == ("done", "E1",
+                                                                                                    "review")
     assert g.requirements["R1"].kind == "context"
     assert g.baseline == {ADD: "fail", MUL: "pass"}
     req1 = llm.requests[1]
     tools = [t["name"] for t in req1["tools"]]
-    assert "submit" in tools and "claim" not in tools and "step_done" not in tools and len(tools) == 13
+    assert "submit" in tools and "waive_check" not in tools and len(tools) == 12
     opening = first_message(req1)
     assert "<task>" in opening and "- R2 fix add" in opening and "- R1 heading" not in opening
-    assert "Checklist: open 2" in opening and "call submit" in opening and "claim" not in opening
+    assert "open 2" in opening and "call submit" in opening and "reviewer" in opening
     out = tool_outputs(run, "submit")
-    assert len(out) == 1 and "accepted" in out[0] and "Verified by their checks: R2" in out[0]
+    assert len(out) == 1 and "accepted" in out[0] and "Done (E3, tests): R2" in out[0] and "R3" in out[0]
     patch = (h.run_dir() / "deliverable.diff").read_text()
     assert "+    return a + b" in patch and "+def sub(a, b):" in patch
-    assert (h.run_dir() / "ledger.md").exists()
     events = h.verify_log(run)
     assert events[-1].type == "delivered" and events[-1].get("status") == "DONE"
-    assert any(e.type == "checkpoint_attempted" and e.get("lane") == "bg" for e in events)   # 编辑后后台验证
-    assert g.checkpoints[g.run.delivered].level == "confirmed"
+    assert any(e.type == "merge_requested" and e.get("lane") == "bg" for e in events)   # 编辑后后台请求合并
+    delivered = g.checkpoints[g.run.delivered]
+    assert delivered.review is not None and delivered.label == "change reviewed by the oracle"
     assert g.sessions["S1"].end_reason == "submitted" and len(g.sessions) == 1
-    assert (h.run_dir() / "git" / "1.bundle").exists()                     # G3：影子仓库对象导出到宿主机
+    assert (h.run_dir() / "git" / "1.bundle").exists()
+    assert (h.run_dir() / "reviews" / f"{delivered.review}.jsonl").exists()      # 复核会话的轨迹
+    msg = subprocess.run(["git", f"--git-dir={h.settings.git_dir}", "log", "-1", "--format=%B",
+                          "refs/belay/delivered"], capture_output=True, text=True).stdout
+    assert "change reviewed by the oracle" in msg                                # 交付点有标签，提交说明来自复核者
     L = json.loads((h.run_dir() / "ledger.json").read_text())
-    assert L["categories"]["verified"] == 1 and L["submits"][-1]["status"] == "accepted"
+    assert L["categories"]["done-E3"] == 1 and L["categories"]["done-E1"] == 1
+    assert L["submits"][-1]["status"] == "accepted"
+    opening = h.aux.openings[-1]
+    assert "## Regression gate" in opening and "def sub" in opening and "Submit summary: fixed add" in opening
+    import argparse
+    import contextlib
+    import io
+    from belay.cli import _handoff
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):                                       # 随时导出交接上下文
+        _handoff(argparse.Namespace(run_dir=str(h.run_dir()), worker=None))
+    assert "<task>" in buf.getvalue() and "Latest merge point" in buf.getvalue() and "Done (E3): R2" in buf.getvalue()
 
 
 def test_reviewer_returns_what_is_missing_then_accepts(tmp_path):
-    h = Harness(tmp_path, BelayConfig(labeler=False))
-    review_no = say(json.dumps({"requirements": [{"id": "R3", "implemented": "no", "missing": ["sub() is not "
-                                                                                               "defined"]}]}))
+    h = Harness(tmp_path)
     llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(SUBMIT), call(ADD_SUB), call(SUBMIT)])
-    run = h.make(llm, aux=ScriptedLLM([review_no]))
+    run = h.make(llm)
     res = asyncio.run(run.start(TASK))
     assert res.status == "DONE"
     out = results(llm)
-    returned = next(o for o in out if "not accepted yet" in o)
-    assert "R3" in returned and "sub() is not defined" in returned
+    returned = next(o for o in out if "still open" in o)
+    assert "R3" in returned and "sub() is not defined" in returned and "define sub(a, b)" in returned
     g = run.rt.graph
-    assert g.requirements["R3"].review_reopens == 1 and g.requirements["R3"].status == "submitted"
+    assert g.requirements["R3"].status == "done" and g.requirements["R3"].level == "E1"
     assert [s.status for s in g.submits.values()] == ["returned", "accepted"]
     events = h.verify_log(run)
-    assert {e.type for e in events if e.source == "llm"} <= {"plan_proposed", "review_recorded", "diagnosis_recorded",
-                                                            "checkpoint_labeled", "compacted"}
+    assert {e.type for e in events if e.source == "llm"} <= {"plan_proposed", "merge_reviewed", "diagnosis_recorded",
+                                                            "compacted"}
 
 
-def test_a_review_without_json_is_retried_alone_then_recorded_as_not_reviewed(tmp_path):
-    h = Harness(tmp_path, BelayConfig(labeler=False))
+def test_reviewer_runs_commands_and_cites_them_as_e2(tmp_path):
+    def policy(opening, review_dir):
+        v = oracle(opening, review_dir)
+        for r in v["requirements"]:
+            if r["status"] == "done":
+                r.update(level="E2", runs=["X1"])
+        return v
+    h = Harness(tmp_path)
     llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(ADD_SUB), call(SUBMIT)])
-    run = h.make(llm, aux=ScriptedLLM([say("I could not decide."), say('{"requirements": [{"id": "R3"')]))
+    run = h.make(llm, aux=FakeAux(policy, run_first="python -c 'from pkg.mod import sub; print(sub(5, 3))'"))
     res = asyncio.run(run.start(TASK))
-    assert res.status == "DONE"                                          # 复查者失败不阻塞：只记为未复查
+    assert res.status == "DONE"
     g = run.rt.graph
-    assert [(v.requirements, v.retry_of) for v in g.reviews.values()] == [(("R3",), None), (("R3",), "V1")]
-    assert g.requirements["R3"].review == "failed"
-    assert "not reviewed" in tool_outputs(run, "submit")[-1]
-    assert any("review V1 failed: no JSON in the reply" in m for m in h.logs)
-    assert json.loads((h.run_dir() / "ledger.json").read_text())["unreviewed"] == ["R3"]
+    r3 = g.requirements["R3"]
+    assert r3.level == "E2" and r3.runs == ("X1",)
+    v = g.reviews[r3.review]
+    assert v.runs[0]["id"] == "X1" and v.runs[0]["rc"] == 0
+    tr = (h.run_dir() / "reviews" / f"{v.id}.jsonl").read_text()
+    assert "[run X1] exit code 0\\n2" in tr                                # 输出写进复核会话的轨迹
+    h.verify_log(run)
+
+
+def test_a_reviewer_without_a_verdict_is_retried_then_the_gate_alone_decides(tmp_path):
+    h = Harness(tmp_path)
+    llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(ADD_SUB), call(SUBMIT)])
+    run = h.make(llm, aux=FakeAux(lambda opening, d: "I could not decide."))
+    res = asyncio.run(run.start(TASK))
+    g = run.rt.graph
+    fg = [v for v in g.reviews.values() if v.trigger == "submit"]
+    assert [v.status for v in fg] == ["failed", "failed"] and fg[1].retry_of == fg[0].id
+    assert g.checkpoints[g.head].review is None                                   # 复核者不可用：只按回归门合并
+    assert g.requirements["R3"].level == "E0" and g.requirements["R3"].by == "self_report"
+    assert res.status == "INCOMPLETE" and any("only self-reported" in x for x in g.run.status_reasons)
+    assert "regression gate only" in tool_outputs(run, "submit")[-1]
+    assert json.loads((h.run_dir() / "ledger.json").read_text())["category_requirements"]["self-reported"] == ["R3"]
+    h.verify_log(run)
+
+
+def test_without_tests_the_reviewer_runs_the_code_and_the_score_must_not_drop(tmp_path):
+    """LHTB 的情形：没有测试配置（没有回归门）。复核者在复核目录里运行程序（E2）、按任务自测分数；分数下降的快照不合并。"""
+    def policy(opening, review_dir):
+        v = oracle(opening, review_dir)
+        mod = (review_dir / "pkg" / "mod.py").read_text()
+        score = (0.5 if "return a + b" in mod else 0.0) + (0.5 if "def sub(" in mod else 0.0)
+        if "a + b + 0" in mod:
+            score = 0.1                                                    # 改坏了 mul：分数下降
+        if "return a + b\n" in mod:
+            v["requirements"].append({"id": "R2", "status": "done", "level": "E2"})
+        for r in v["requirements"]:
+            if r["status"] == "done":
+                r.update(level="E2", runs=["X1"])
+        return {**v, "score": score, "score_note": "python score.py"}
+    h = Harness(tmp_path, BelayConfig(merge_min_interval_sec=0))
+    break_mul = tu("bm", "edit_file", file_path="pkg/mod.py", old_string="return a * b", new_string="return a + b + 0")
+    fix_mul = tu("fm", "edit_file", file_path="pkg/mod.py", old_string="return a + b + 0", new_string="return a * b")
+    wait = lambda i: call(tu(f"w{i}", "bash", command="sleep 1.5"))      # noqa: E731
+    llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), wait(1), call(break_mul), wait(2), call(fix_mul),
+                       call(ADD_SUB), call(SUBMIT)])
+    run = h.make(llm, aux=FakeAux(policy, run_first="python -c 'import pkg.mod'"), spec=VerifierSpec())
+    res = asyncio.run(run.start(TASK))
+    g = run.rt.graph
+    assert not g.baseline and not [j for j in g.jobs.values() if j.purpose != "baseline"]   # 没有回归门作业
+    assert res.status == "DONE", g.run.status_reasons
+    assert g.checkpoints[g.head].score == 1.0 and g.requirements["R3"].level == "E2"
+    dropped = [a for a in g.attempts.values() if a.reason == "review" and "score dropped" in a.detail]
+    assert dropped                                                          # 改坏 mul 的那一版没有合并
+    scores = [c.score for c in reversed([g.checkpoints[i] for i in g.checkpoints if i]) if c.score is not None]
+    assert scores == sorted(scores, reverse=True)                           # 合并链上的分数不下降
+    L = json.loads((h.run_dir() / "ledger.json").read_text())
+    assert L["gate_available"] is False and L["delivered_score"] == 1.0
+    assert "a + b + 0" not in (h.run_dir() / "deliverable.diff").read_text()
     h.verify_log(run)
 
 
@@ -230,7 +310,8 @@ def test_regression_rejected_and_test_changes_are_not_delivered(tmp_path):
     assert "tests/test_mod.py" not in patch and "+    return a + b" in patch
     assert "tests/test_mod.py" in (h.run_dir() / "worktree.diff").read_text()
     g = run.rt.graph
-    assert g.requirements["R3"].status == "blocked" and g.requirements["R2"].status == "verified"
+    rej = [a for a in g.attempts.values() if a.trigger == "submit" and a.status == "rejected"]
+    assert rej and rej[0].reason == "regression" and not rej[0].reviews     # 回归门没过：不开复核
     assert "assert mul(2, 3) == 6" in (h.repo / "tests/test_mod.py").read_text()   # 交付时工作区 = 交付点
     reminders = [json.dumps(r["messages"][-1]["content"]) for r in llm.requests]
     assert sum("Keeping a todo list" in x for x in reminders) == 1       # 第一次改文件、还没有 todo：提醒一次
@@ -261,9 +342,12 @@ def test_an_implicit_submit_that_is_returned_continues_the_session(tmp_path):
     res = asyncio.run(run.start(TASK))
     assert res.status == "DONE"
     reply = json.dumps(llm.requests[4]["messages"][-1]["content"])
-    assert "treated that as a submit" in reply and "R2" in reply and ADD in reply   # 证据检查没过：交还
+    assert "treated that as a submit" in reply and "R2" in reply and ADD in reply   # 检查没过：交还
+    assert "sub() is not defined" in reply                                      # 只判定的复核：R3 没做
     g = run.rt.graph
     assert [s.implicit for s in g.submits.values()] == [True, False] and len(g.sessions) == 1
+    first = next(iter(g.submits.values()))
+    assert first.attempt is None and g.reviews[first.review].trigger == "judge"
     h.verify_log(run)
 
 
@@ -351,7 +435,7 @@ def test_l4_handoff_keeps_todos_summary_and_partial_changes(tmp_path):
     opening2 = first_message(llm.requests[5])
     assert "keep its signature" in opening2 and "model-written" in opening2
     assert "[~] fix add in pkg/mod.py" in opening2 and "[ ] add sub" in opening2
-    assert "+    return a + b" in opening2 or "Verified by their checks: R2" in opening2
+    assert "+    return a + b" in opening2 or "Done (E3): R2" in opening2
     assert "Files you were changing (re-read by the harness)" in opening2
     h.verify_log(run)
 
@@ -425,7 +509,7 @@ class LoseJobs(BelayRun):
     main: asyncio.Task | None = None
 
     async def _eff_launch_job(self, job: str) -> None:
-        if self.rt.graph.jobs[job].purpose == "verify":
+        if self.rt.graph.jobs[job].purpose == "gate":
             self.main.cancel()                    # 作业既没启动也没有完成标记：恢复时只能记为 unknown 并重跑
             await asyncio.sleep(3600)
         await super()._eff_launch_job(job)
@@ -464,17 +548,17 @@ def test_runtime_crash_around_cas_is_reconciled(tmp_path, cas_first):
     assert res.checkpoint == 1
     events = h.verify_log(run)
     types = [e.type for e in events]
-    assert types.count("checkpoint_advancing") == 1 and types.count("checkpoint_created") == 2     # 0 与 1，只创建一次
+    assert types.count("merge_advancing") == 1 and types.count("merged") == 2     # 0 与 1，只创建一次
     assert "runtime_recovered" in types
     g = run.rt.graph
     assert g.sessions["S1"].resumes == ("replay",) and len(g.sessions) == 1   # 同一个会话接着做
-    assert g.requirements["R2"].status == "verified"                          # 恢复后需求照常判定
+    assert g.requirements["R2"].level == "E3"                                 # 恢复后需求照常判定
     ref = subprocess.run(["git", f"--git-dir={h.settings.git_dir}", "rev-parse", "refs/heads/belay"],
                          capture_output=True, text=True).stdout.strip()
     assert ref == g.checkpoints[1].commit
     parents = subprocess.run(["git", f"--git-dir={h.settings.git_dir}", "rev-list", "--count", ref],
                              capture_output=True, text=True).stdout.strip()
-    assert parents == "2"                                                     # 基线 + 一个存档，没有重复合并
+    assert parents == "2"                                                     # 基线 + 一个合并点，没有重复合并
     first = llm2.requests[0]["messages"]                                      # 重放的对话 + 恢复点提醒
     assert first[0]["content"].startswith("You are starting work")
     tail = json.dumps(first[-1]["content"])
@@ -491,13 +575,13 @@ def test_runtime_crash_with_a_lost_job(tmp_path):
     events = h.verify_log(run)
     lost = [e for e in events if e.type == "job_finished" and e.get("state") == "unknown"]
     assert len(lost) == 1
-    verify_jobs = [e for e in events if e.type == "job_started" and e.get("purpose") == "verify"]
+    verify_jobs = [e for e in events if e.type == "job_started" and e.get("purpose") == "gate"]
     assert len(verify_jobs) == 2 and verify_jobs[0].get("key") == verify_jobs[1].get("key")   # 同一个键重跑
 
 
 # ======================================================================== 截止
 
-def test_deadline_delivers_the_latest_confirmed_checkpoint(tmp_path):
+def test_deadline_delivers_the_head_of_the_merge_chain(tmp_path):
     cfg = BelayConfig(reserve_min_sec=4, reserve_max_frac=0.5, reserve_extra_sec=0)
     h = Harness(tmp_path, cfg, budget=14, stop_grace_sec=2, finalize_grace_sec=20)
     break_mul = tu("bm", "edit_file", file_path="pkg/mod.py", old_string="return a * b", new_string="return a + b + 0")
@@ -506,15 +590,15 @@ def test_deadline_delivers_the_latest_confirmed_checkpoint(tmp_path):
                        call(break_mul)] + sleeps)
     run = h.make(llm)
     res = asyncio.run(run.start(TASK))
-    assert res.status == "INCOMPLETE" and res.checkpoint == 1               # 没有提交，但后台存档照常交付
+    assert res.status == "INCOMPLETE" and res.checkpoint == 1               # 没有提交，但后台合并的照常交付
     events = h.verify_log(run)
     types = [e.type for e in events]
     assert "deadline_reserve" in types
     g = run.rt.graph
     last = sorted(g.attempts.values(), key=lambda a: a.created_seq)[-1]
-    assert last.trigger == "deadline" and last.tier == "full" and last.status == "rejected"
+    assert last.trigger == "deadline" and last.selection is None and last.status == "rejected"
     assert g.sessions["S1"].end_reason == "deadline"
-    assert g.requirements["R2"].status == "verified"                         # 没人声明，检查项照样判定
+    assert g.requirements["R2"].level == "E3"                                # 没人声明，检查项照样判定
     patch = (h.run_dir() / "deliverable.diff").read_text()
     assert "+    return a + b\n" in patch and "a + b + 0" not in patch       # 未验证的进度不交付
     assert "return a * b" in (h.repo / "pkg/mod.py").read_text()
@@ -531,7 +615,7 @@ def test_board_shows_the_checklist(tmp_path):
     out = results(llm)
     assert "Requirements: open 2" in out[0] and "R2 [open] fix add" in out[0]
     assert "Task text:" in out[1] and ADD in out[1]
-    assert "not accepted yet" in out[2] and ADD in out[2]
+    assert "still open" in out[2] and ADD in out[2]
     assert_sub_blocked(run, res)
 
 

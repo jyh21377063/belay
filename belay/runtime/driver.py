@@ -1,13 +1,13 @@
 """BelayRun：一次运行的生命周期（命令式外壳）。
 
-  start(task)   准备：run_started → 影子仓库与 0 号存档 → 基线（工作区一次 + 验证槽位一次，比对导入隔离）与规划并行
-                → 冻结需求
+  start(task)   准备：run_started → 影子仓库与 0 号合并点 → 基线（工作区一次 + 验证槽位一次，比对导入隔离）与规划并行
+                → 冻结需求（带验收方法）
   _main()       循环问 next_step(图)：开会话 / 接上会话 / 等 / 收尾。会话结束不等于运行结束；提交被接受才收尾。
-  _finalize()   停 worker → 取消后台尝试 → 对当前 WIP 做一次全量存档尝试 → 交付最新的确认点
+  _finalize()   停 worker → 取消后台合并请求 → 最新快照还没合并就在余量内做一次前台合并请求（回归门 + 复核）→ 交付链头
   resume()      runtime 崩溃后：快照 + 重放 → 对账（recovery.py）→ 回到循环；rebuild=True 时先从 git bundle 重建容器状态
   suspend()     外层调度挂起：强制快照 → 导出 bundle → 结束会话
 
-副作用（作业、git CAS、镜像、还原工作区、交付、停 worker、取消孤儿作业、定位 diff、诊断、复查、标签）
+副作用（作业、git CAS、镜像、还原工作区、交付、停 worker、取消孤儿作业、定位 diff、诊断、复核会话）
 都由已经写入日志的事件触发。worker 与后台只通过事件日志交汇，后台从不碰 worker 的工作区（隔离无效时降级）。
 """
 from __future__ import annotations
@@ -25,11 +25,11 @@ from belay.core import rules as R
 from belay.core.config import BelayConfig
 from belay.core.context import build_context, resume_reminder
 from belay.core.effects import Effect
-from belay.core.model import (ATT_ADVANCING, ATT_PENDING, JOB_RUNNING, LANE_BG, LANE_FG, MILESTONE_KINDS,
-                              WHERE_SLOT, WHERE_WORKSPACE)
+from belay.core.model import (ATT_ADVANCING, ATT_PENDING, JOB_RUNNING, LANE_BG, LANE_FG, REV_DECIDED, WHERE_SLOT,
+                              WHERE_WORKSPACE)
 from belay.core.plan import renumber, validate_plan
-from belay.core.queries import (current_todo, delivery_checkpoint, last_ended_session, latest_handoff_summary,
-                                latest_snapshot, next_id, open_attempt, resume_point)
+from belay.core.queries import (current_todo, delivery_checkpoint, last_ended_session, latest_snapshot, next_id,
+                                open_attempt, open_submit, resume_point)
 from belay.core.render import ledger, ledger_markdown
 from belay.core.rules import Rejected, SnapObs
 from belay.core.verify import (guard_set, is_test_path, job_priority, reasons_for_tree, suite_layout, test_files_of,
@@ -37,11 +37,10 @@ from belay.core.verify import (guard_set, is_test_path, job_priority, reasons_fo
 from belay.env import Env
 from belay.llm import Usage
 from belay.runtime import planner as P
-from belay.runtime.gitops import CP_REF, SNAP_REF, ShadowRepo
+from belay.runtime.gitops import CP_REF, DELIVERED_REF, SNAP_REF, ShadowRepo
 from belay.runtime.port import WorkerPort
-from belay.runtime.review import review_input
-from belay.runtime.prompts import (DIAGNOSE_SYSTEM, LABEL_SYSTEM, REVIEW_BLOCKED_SYSTEM,
-                                   REVIEW_SYSTEM, system_prompt)
+from belay.runtime.prompts import DIAGNOSE_SYSTEM, system_prompt
+from belay.runtime.reviewer import Reviewer
 from belay.runtime.runtime import Runtime
 from belay.runtime.session import BelaySession, ModelCallFailed, load_transcript_messages
 from belay.runtime.store import EventStore
@@ -70,10 +69,11 @@ class RunSettings:
     git_dir: str = "/opt/belay/git"
     jobs_dir: str = "/opt/belay/jobs"
     verify_dir: Optional[str] = None         # 默认与 jobs_dir 同级的 verify/
+    review_dir: Optional[str] = None         # 复核目录，默认与 jobs_dir 同级的 review/
     tick_sec: float = 5.0
     stop_grace_sec: float = 30.0
     finalize_grace_sec: float = 60.0         # 截止之后最多再等这么久让最后的验证结束
-    deliver_checkout: bool = True            # 结束时把工作区检出为交付的存档
+    deliver_checkout: bool = True            # 结束时把工作区检出为交付的合并点
     planner_rounds: int = 3
     crash_backoff_sec: float = 5.0
     retry_backoff_sec: float = 5.0           # 模型接口失败后内存重试前的等待
@@ -181,7 +181,7 @@ class BelayRun:
                  clock: Callable[[], float] = time.time, log: Callable[[str], None] = lambda m: None):
         self.llm = llm
         self.planner_llm = planner_llm if planner_llm is not None else llm
-        self.aux_llm = aux_llm if aux_llm is not None else self.planner_llm    # 诊断者、复查者、标签（可用便宜模型）
+        self.aux_llm = aux_llm if aux_llm is not None else self.planner_llm    # 复核者、诊断者
         self.env = env
         self.s = settings
         self.cfg = cfg or BelayConfig()
@@ -195,7 +195,9 @@ class BelayRun:
                                         settings.verify_dir, slots=self.cfg.verify_slots,
                                         nice=self.cfg.background_nice, cpu_limit=self.cfg.background_cpu_limit)
                          if self.spec.available else None)
-        state_dirs = (settings.git_dir, settings.jobs_dir, "/logs") + \
+        self.review_dir = settings.review_dir or \
+            str(Path(settings.jobs_dir.rstrip("/")).parent / "review")
+        state_dirs = (settings.git_dir, settings.jobs_dir, "/logs", self.review_dir) + \
             ((self.verifier.verify_dir,) if self.verifier is not None else ())
         self.policy = settings.policy or Policy(protected_prefixes=state_dirs)
         self.rt: Optional[Runtime] = None
@@ -218,6 +220,11 @@ class BelayRun:
         self._snap_lock = asyncio.Lock()
         self._mirror_lock = asyncio.Lock()
         self.platform = "Linux"
+        self.reviewer = Reviewer(self)
+
+    @property
+    def review_usage(self) -> Usage:
+        return self.reviewer.usage
 
     # ================================================================ 入口
     async def start(self, task: str, run_id: str = "run") -> RunResult:
@@ -256,8 +263,8 @@ class BelayRun:
                     " ".join(graph.run.task.split()) == " ".join(task.split()))
 
     async def emergency_deliver(self) -> Optional[int]:
-        """被外部取消（评测框架超时）时的兜底：停下 worker 与作业，按图把工作区检出为交付点，写账本。
-        不经过规则（runtime 可能已经停了）；交付点的选取与正常收尾相同（最新的确认点）。"""
+        """被外部取消（评测框架超时）时的兜底：停下 worker、复核者与作业，按图把工作区检出为交付点（链头），写账本。
+        不经过规则（runtime 可能已经停了）；交付点的选取与正常收尾相同。"""
         if self.rt is None or self.rt.graph.head_cp is None:
             return None
         self.stop_event.set()
@@ -267,15 +274,18 @@ class BelayRun:
         g = self.rt.graph
         if g.run is not None and g.run.delivered is not None:
             return g.run.delivered
+        for vid in list(self.reviewer.tasks):
+            self.reviewer.cancel(vid)
         if self.verifier is not None:
             for j in [j for j in g.jobs.values() if j.state == JOB_RUNNING]:
                 try:
                     await self.verifier.cancel(j.id)
                 except Exception:
                     pass
-        cid = delivery_checkpoint(g, self.cfg)
+        cid = delivery_checkpoint(g)
         try:
             await self.repo.checkout(g.checkpoints[cid].tree, self.w)
+            await self.repo.update_ref(DELIVERED_REF, g.checkpoints[cid].commit)
         except Exception as e:
             self.log(f"emergency delivery: checkout failed: {type(e).__name__}: {e}")
         d = Path(self.s.run_dir)
@@ -283,7 +293,7 @@ class BelayRun:
             L = ledger(g)
             L.update(status="incomplete", delivered_checkpoint=cid, emergency=True)
             (d / "ledger.json").write_text(json.dumps(L, indent=1, ensure_ascii=False), encoding="utf-8")
-            (d / "ledger.md").write_text(ledger_markdown(g) + f"\n(emergency delivery of checkpoint {cid} after "
+            (d / "ledger.md").write_text(ledger_markdown(g) + f"\n(emergency delivery of merge point {cid} after "
                                          "an external cancellation)\n", encoding="utf-8")
         except Exception as e:
             self.log(f"emergency delivery: ledger failed: {type(e).__name__}: {e}")
@@ -329,6 +339,8 @@ class BelayRun:
         await self.env.run(f"rm -rf {shlex.quote(self.s.git_dir)}", timeout=120, cwd="/")
         if self.verifier is not None:
             await self.env.run(f"rm -rf {shlex.quote(self.verifier.verify_dir)}", timeout=600, cwd="/")
+        await self.env.run(f"rm -rf {shlex.quote(self.review_dir)} {shlex.quote(self.review_dir)}.index "
+                           f"{shlex.quote(self.review_dir)}.seeded", timeout=600, cwd="/")
         commit, tree = await self.repo.init()
         await rt.submit(R.create_base, commit, tree)
         await self.repo.set_cp_ref(0, commit)
@@ -774,28 +786,25 @@ class BelayRun:
         hard = rt.graph.run.deadline_t + self.s.finalize_grace_sec
         left = lambda: max(0.0, hard - rt.now())                        # noqa: E731
         await rt.submit(R.begin_finalize, reason)
-        # worker 停下时可能还有一次前台存档在验证（它是 worker 最后的状态）：先等它
-        await rt.wait_until(lambda g: open_attempt(g, None, LANE_FG) is None, timeout=left())
+        # worker 停下时可能还有一次 submit 在复核（它是 worker 最后的状态）：先等它
+        await rt.wait_until(lambda g: open_attempt(g, None, LANE_FG) is None and open_submit(g) is None,
+                            timeout=left())
         trigger = "deadline" if reason == "deadline" else "final"
         try:
             n = await self.take_snapshot(trigger)
-            aid = await rt.submit(R.request_checkpoint, self.w, n, trigger, tier="full") if n else None
+            aid = await rt.submit(R.request_merge, self.w, n, trigger) if n else None
         except Rejected as e:
-            self.log(f"final checkpoint not attempted: {e}")
+            self.log(f"final merge request not made: {e}")
             aid = None
-        if aid is not None:
+        if aid is not None:                                             # 最新快照还没合并：回归门 + 复核
             await rt.wait_until(lambda g: g.attempts[aid].status not in (ATT_PENDING, ATT_ADVANCING), timeout=left())
-        while left() > 0:                                               # 链头仍是暂存点：有时间就提升它
-            if not await rt.submit(R.promote_now):
-                break
-            await rt.changed(timeout=min(self.s.tick_sec, left()))
         for j in list(rt.graph.jobs.values()):                          # 到点还没跑完的作业：取消
             if j.state == JOB_RUNNING:
                 await self._cancel_job(j.id, "cancelled at the deadline")
-        # 正在 CAS 的尝试不能中止（git 引用与图必须一致）：等它做完，这一步只是几条 git 命令
+        # 正在 CAS 的合并不能中止（git 引用与图必须一致）：等它做完，这一步只是几条 git 命令
         await rt.wait_until(lambda g: not any(a.status == ATT_ADVANCING for a in g.attempts.values()))
         g = rt.graph
-        cid = delivery_checkpoint(g, self.cfg)
+        cid = delivery_checkpoint(g)
         lag = await self._lag(cid)
         self.delivered.clear()
         await rt.submit(R.deliver, reason, cid, lag)
@@ -844,7 +853,7 @@ class BelayRun:
     async def mirror(self, reason: str) -> None:
         """把影子仓库新增的对象导出为增量 git bundle，写到宿主机 run_dir/git/<n>.bundle。
 
-        快照提交是一条链（父提交是上一张快照），所以最新快照的 ref 覆盖全部快照；存档 ref 只多出提交对象。
+        快照提交是一条链（父提交是上一张快照），所以最新快照的 ref 覆盖全部快照；合并点的 ref 只多出提交对象。
         增量 bundle 累积到 mirror_consolidate 份时合并成一份完整的（以 0 号基线为前提），旧文件删掉：
         一天的运行不会在宿主机上留下成千上万个小文件，重建时也不用逐个 unbundle。"""
         async with self._mirror_lock:
@@ -918,7 +927,18 @@ class BelayRun:
         await self.rt.submit(R.job_finished, job, out.state, out.results, out.sec, out.error, out.reasons)
 
     def commit_message(self, attempt_id: str) -> str:
-        return f"belay: checkpoint from attempt {attempt_id}"
+        """合并提交的说明：复核者写的一行标签（没有复核时用 todo 条目或提交摘要）。只由图决定，所以重建时能原样重做。"""
+        g = self.rt.graph
+        a = g.attempts.get(attempt_id)
+        label = ""
+        if a is not None and a.review:
+            v = g.reviews.get(a.review)
+            if v is not None and v.status == REV_DECIDED:
+                label = str(v.decision.get("label") or "")
+        if not label and a is not None:
+            label = a.summary or ""
+        first = label.strip().split("\n")[0][:200]
+        return f"belay: merge {attempt_id}" + (f"\n\n{first}" if first else "")
 
     async def advance(self, attempt_id: str) -> tuple[bool, str, list, str]:
         """commit-tree（确定的）+ CAS。重做安全：引用已经指向这个提交就算成功。"""
@@ -942,39 +962,15 @@ class BelayRun:
         await self.rt.submit(R.ref_advanced, attempt, ok, commit, files, detail)
 
     async def _eff_mirror_checkpoint(self, checkpoint: int) -> None:
-        """存档 ref 每个都设（便宜）；补丁镜像与 bundle 只在里程碑上做。非里程碑存档（交接）的提交是确定的，
-        它的树就是某张快照的候选树：只要快照已导出，重建时可以原样重做（recovery.rebuild_container）。"""
+        """每个合并点都设 ref、写补丁镜像、导出 bundle（合并点经过节流，数量不多）。"""
         g = self.rt.graph
         cp = g.checkpoints[checkpoint]
         await self.repo.set_cp_ref(checkpoint, cp.commit)
-        if cp.kind not in MILESTONE_KINDS:
-            return
         patch = await self.repo.diff(g.checkpoints[0].tree, cp.tree, binary=True)
         d = Path(self.s.run_dir) / "checkpoints"
         d.mkdir(exist_ok=True)
         (d / f"{checkpoint}.diff").write_text(patch, encoding="utf-8", errors="surrogateescape")
-        await self.mirror("milestone")
-
-    async def _eff_label_checkpoint(self, checkpoint: int) -> None:
-        """没有标签时的兜底：里程碑存档（以及每 label_every 个其他存档）生成一行“这段做了什么”（llm）。"""
-        g = self.rt.graph
-        cp = g.checkpoints.get(checkpoint)
-        if cp is None or cp.label or not self.cfg.labeler or self.aux_llm is None:
-            return
-        if cp.kind not in MILESTONE_KINDS and checkpoint % max(1, self.cfg.label_every):
-            return
-        parent = g.checkpoints.get(cp.parent) if cp.parent is not None else None
-        sess = g.sessions.get(g.workers[self.w].session or "") or next(
-            (s for s in sorted(g.sessions.values(), key=lambda s: -s.started_seq)), None)
-        tail = self._transcript_tail(sess.transcript if sess else None, 8000, parent.created_t if parent else 0.0)
-        if not tail:
-            return
-        try:
-            resp = await self.aux_llm.call(LABEL_SYSTEM, [], [{"role": "user", "content": tail}])
-            await self.rt.submit(R.label_checkpoint, checkpoint, resp.text.strip().splitlines()[0][:300]
-                                 if resp.text.strip() else "")
-        except Exception as e:
-            self.log(f"labelling checkpoint {checkpoint} failed: {type(e).__name__}: {e}")
+        await self.mirror("merge")
 
     async def _eff_restore_workspace(self, worker: str, checkpoint: int, reset_ref: bool) -> None:
         try:
@@ -1000,6 +996,10 @@ class BelayRun:
             (d / "ledger.md").write_text(ledger_markdown(g), encoding="utf-8")
             if self.s.deliver_checkout:
                 await self.repo.checkout(cp.tree, self.w)
+            try:                                                        # 交付的合并点在影子仓库里有一个标签
+                await self.repo.update_ref(DELIVERED_REF, cp.commit)
+            except Exception as e:                                      # noqa: BLE001
+                self.log(f"delivered ref failed: {type(e).__name__}: {e}")
             await self.mirror("deliver")
         finally:
             self.delivered.set()
@@ -1029,8 +1029,7 @@ class BelayRun:
                 continue
             # 作业按 (树, 选择) 去重：别的尝试可能复用它而不在自己的 jobs 里，所以按树判断，宁可不取消
             used = any(o.tree == j.tree for o in g.attempts.values() if o.id != attempt and
-                       o.status in (ATT_PENDING, ATT_ADVANCING)) or \
-                any(cp.tree == j.tree and cp.level != "confirmed" for cp in g.checkpoints.values())
+                       o.status in (ATT_PENDING, ATT_ADVANCING))
             if not used:
                 await self._cancel_job(jid, f"attempt {attempt} was superseded")
 
@@ -1101,10 +1100,10 @@ class BelayRun:
             for c in [c for c in g.compactions if c.session == sess and c.summary][-1:]:
                 parts.append(f"## Summary written in that session (model-written)\n{c.summary[:3000]}")
         else:
-            conf = g.checkpoints.get(g.confirmed or 0)
-            if conf is not None and g.head_cp is not None:
-                diff = await self.repo.diff(conf.tree, g.head_cp.tree, max_bytes=20000)
-                parts.append(f"## Changes since the latest confirmed checkpoint\n```diff\n{diff}\n```")
+            snap = latest_snapshot(g, self.w)
+            if snap is not None and g.head_cp is not None and snap.tree != g.head_cp.tree:
+                diff = await self.repo.diff(g.head_cp.tree, snap.tree, max_bytes=20000)
+                parts.append(f"## Changes since the latest merge point\n```diff\n{diff}\n```")
         if d.previous and d.previous in g.diagnoses:
             parts.append("## A previous diagnosis of the same failure (give a different hypothesis)\n"
                          + json.dumps(g.diagnoses[d.previous].result)[:3000])
@@ -1112,42 +1111,8 @@ class BelayRun:
         return text[:int(budget)]
 
     async def _eff_review(self, review: str) -> None:
-        """复查一批需求（llm 只能收紧）：输入是需求原文 + 按需求筛过的相关改动 + 全部改动文件的列表。"""
-        g = self.rt.graph
-        v = g.reviews.get(review)
-        if v is None:
-            return
-        results: dict = {}
-        try:
-            if self.aux_llm is None:
-                raise RuntimeError("no model for the reviewer")
-            reqs = [g.requirements[r] for r in v.requirements]
-            if v.phase == "blocked":
-                body = (f"<task_statement>\n{g.run.task.strip()[:8000]}\n</task_statement>\n\n" + "\n".join(
-                    f"- {r.id} (kind: {r.blocked_kind}): \"{r.quote}\"\n  the agent's reason: {r.blocked_reason}"
-                    for r in reqs))
-                resp = await self.aux_llm.call(REVIEW_BLOCKED_SYSTEM, [], [{"role": "user", "content": body}])
-            else:
-                cp = g.checkpoints.get(v.checkpoint) if v.checkpoint is not None else g.head_cp
-                base = g.checkpoints[0]
-                diff = await self.repo.diff(base.tree, cp.tree) if cp is not None and cp.tree != base.tree else ""
-                files = await self.repo.numstat(base.tree, cp.tree) if diff else []
-                sub = g.submits.get(v.submit or "")
-                body = review_input(reqs, diff, files, summary=sub.summary if sub else "",
-                                    todos=[t.title for t in g.todos.values()],
-                                    notes=latest_handoff_summary(g, self.w) or "",
-                                    budget=self.cfg.review_input_chars)
-                resp = await self.aux_llm.call(REVIEW_SYSTEM, [], [{"role": "user", "content": body}])
-            data = _reply_json(resp, "requirements")
-            for item in (data or {}).get("requirements") or []:
-                if isinstance(item, dict) and str(item.get("id") or "") in v.requirements:
-                    results[str(item["id"])] = item
-            if data is None:
-                self.log(f"review {review} failed: no JSON in the reply (stop_reason={resp.stop_reason}, "
-                         f"{len(resp.text)} chars): {resp.text[:300]!r}")
-            elif len(results) < len(v.requirements):
-                self.log(f"review {review}: no answer for {sorted(set(v.requirements) - set(results))} "
-                         f"(stop_reason={resp.stop_reason})")
-        except Exception as e:
-            self.log(f"review {review} failed: {type(e).__name__}: {e}")
-        await self.rt.submit(R.record_review, review, results)
+        """一次复核：带工具的复核者会话（runtime/reviewer.py），结论经规则校验后入图。"""
+        await self.reviewer.review(review)
+
+    async def _eff_cancel_review(self, review: str) -> None:
+        self.reviewer.cancel(review)

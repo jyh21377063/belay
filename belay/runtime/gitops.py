@@ -1,4 +1,4 @@
-"""影子仓库：存档链对应的 git 提交。只有 runtime 写它；worker 看不到（路径在 Policy.protected_prefixes 里）。
+"""影子仓库：合并链对应的 git 提交。只有 runtime 写它；worker 看不到（路径在 Policy.protected_prefixes 里）。
 
 GIT_DIR 在工作区之外，work tree 指向工作区；仓库自己的 .git 不受影响（worker 用 git diff 看到的仍是相对原始
 提交的改动）。git 仓库与不是 git 仓库的目录走同一套代码。
@@ -7,10 +7,11 @@ GIT_DIR 在工作区之外，work tree 指向工作区；仓库自己的 .git �
   snapshot    工作区当前内容 → 树（持久的索引文件，重复快照只重新哈希改动过的文件）
   strip_tests 把测试路径下的改动恢复为基线版本 → 候选树
   commit      确定的提交（日期取事件时间，所以重做得到同一个提交）
-  cas         update-ref <新> <旧>：比较并交换推进存档链
+  cas         update-ref <新> <旧>：比较并交换推进合并链（合并提交的说明就是复核者写的一行标签）
   checkout    把工作区精确切换为某棵树（回退、交付、重建）
   snapshot_commit  把一张快照（原样树 + 候选树）包成一个确定的提交，ref 为 refs/belay/snap/<n>（防 gc、便于导出）
   bundle      增量 git bundle：宿主机上的镜像由它恢复（G3）
+  export_to   把一棵树导出到复核目录（复核者在那里读代码、运行程序）；交付时 refs/belay/delivered 指向交付的合并点
   revert_files     只撤销“好 → 坏”之间、限定文件的改动（逐文件三方合并；有冲突就什么都不改）
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ from belay.env import Env
 REF = "refs/heads/belay"
 SNAP_REF = "refs/belay/snap/"
 CP_REF = "refs/belay/cp/"
+DELIVERED_REF = "refs/belay/delivered"
 EXCLUDES = ["__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".hypothesis/",
             "*.belay-tmp", ".belay_checks/"]
 LARGE_FILE_MB = 20
@@ -171,6 +173,25 @@ class ShadowRepo:
         res = await self.env.run(f"{self._git()} show {tree}:{shlex.quote(path)} | head -c {max_chars}",
                                  timeout=60, cwd="/")
         return res.output if res.return_code == 0 else ""
+
+    # ---- 复核目录（模块 F）
+    async def export_to(self, target: str, tree: str, seed_index: str | None = None) -> None:
+        """把 tree 增量导出到 target：只改动与上次导出不同的文件；未跟踪的文件（上次复核运行留下的输出）清掉，
+        被忽略的文件（构建缓存）保留。第一次导出时从工作区复制被忽略的文件作为构建缓存种子（尽力而为）。"""
+        t = target.rstrip("/")
+        q, marker = shlex.quote(t), shlex.quote(t + ".seeded")
+        git = self._git(index=t + ".index") + f" --work-tree={q}"
+        # 上次复核的命令改过的已跟踪文件：read-tree 只比较索引，所以先按工作树把它们找出来恢复
+        await self._run(f"mkdir -p {q} && {git} read-tree --reset -u {tree} && "
+                        f"{{ {git} update-index -q --refresh >/dev/null 2>&1; "
+                        f"{git} diff-files --name-only -z | xargs -0 -r env {git} checkout-index -f --; }} && "
+                        f"{git} clean -f -d -q", timeout=900)
+        if seed_index:
+            ws = shlex.quote(self.workspace)
+            lister = self._git(work_tree=True, index=seed_index)
+            await self.env.run(f"[ -f {marker} ] && exit 0; cd {ws} && {lister} ls-files -z -o -i --exclude-standard "
+                               f"--directory 2>/dev/null | xargs -0 -r cp -a --reflink=auto --parents -t {q} 2>/dev/null; "
+                               f"touch {marker}", timeout=1800, cwd="/")
 
     # ---- 快照提交与引用（模块 B / G3）
     async def snapshot_commit(self, n: int, raw_tree: str, cand_tree: str, parent: str | None, date: float) -> str:

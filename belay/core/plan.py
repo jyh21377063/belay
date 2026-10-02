@@ -1,6 +1,6 @@
 """规划的规则部分：校验规划器（LLM）的提议，以及不调模型的机械切分兜底。
 
-规划器只产出需求清单（v7 没有任务层）。入图之前必须满足：
+规划器只产出需求清单（没有任务层）：每条需求带一句验收方法（复核者怎么确认它做完了，只是描述）。入图之前必须满足：
   - 每条需求的引文逐字出现在任务原文里（只把连续空白视为相同）；
   - 任务原文的每个实质单元（非标题的行或句子）都被某条引文覆盖；标题、套话、背景可以标成 context，
     只用来覆盖原文，不进入清单；
@@ -140,7 +140,8 @@ def validate_plan(task_text: str, proposal: dict, known_checks: Iterable[str] = 
         if dropped:
             rep.warnings.append(f"{rid}: dropped unknown checks {dropped[:5]}")
         reqs[rid] = {"id": rid, "quote": normalize_ws(quote), "summary": str(r.get("summary") or "")[:300],
-                     "kind": kind, "checks": [c for c in checks if c in known]}
+                     "kind": kind, "checks": [c for c in checks if c in known],
+                     "acceptance": str(r.get("acceptance") or "").strip()[:500] if kind == "actionable" else ""}
 
     missing = uncovered_units(task_text, [r["quote"] for r in reqs.values()])
     for u in missing[:30]:

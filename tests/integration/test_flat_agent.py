@@ -80,7 +80,7 @@ def test_flat_agent_end_to_end(setup):
 TASK = "Fix add() in calc.py so that it returns the sum of its arguments."
 PLAN = {"requirements": [{"id": "R1", "kind": "actionable", "quote": TASK, "summary": "fix add"}]}
 PLANNER = [{"type": "text", "text": json.dumps(PLAN)}]
-QUIET = {"reviewer": False, "labeler": False, "diagnoser": False}       # 这些后台 LLM 调用会打乱脚本的顺序
+QUIET = {"reviewer": False, "diagnoser": False}       # 复核者与诊断者另有 aux 客户端；这里只看 worker 的脚本
 
 
 def tu(i, name, **inp):
@@ -114,7 +114,7 @@ def test_belay_agent_without_gate_runs_strict_and_delivers(setup):
     denied = llm.requests[4]["messages"][-1]["content"][0]
     assert denied["is_error"] and "Git write" in denied["content"]          # Belay 组：越界直接拒绝
     meta = context.metadata
-    assert meta["belay_status"] == "DONE" and meta["delivered_level"] == "confirmed", meta
+    assert meta["belay_status"] == "INCOMPLETE" and meta["delivered"] == 1, meta     # 没有复核者：只有自述（E0）
     assert meta["prepared_in_setup"] is False and context.n_agent_steps == 4
     patch = (agent_dir / "patch.diff").read_text()
     assert "+    return a + b" in patch
@@ -146,7 +146,7 @@ def test_belay_agent_prepares_in_setup_and_verifies_with_the_gate(setup):
     events = [json.loads(x) for x in (agent_dir / "belay" / "events.jsonl").read_text().splitlines()]
     types = [e["type"] for e in events]
     assert "clock_started" in types and types.index("clock_started") < types.index("session_started")
-    assert context.metadata["belay_status"] == "DONE" and context.metadata["prepared_in_setup"]
+    assert context.metadata["prepared_in_setup"] and context.metadata["delivered"] == 1
     patch = (agent_dir / "patch.diff").read_text()
     assert "+    return a + b" in patch and "tests/" not in patch
 
@@ -160,12 +160,12 @@ def _with_tests(repo: Path) -> dict:
     return {"workdir": str(repo), "test_cmd": "python -m pytest -rA -p no:cacheprovider tests", "timeout_sec": 120}
 
 
-def test_belay_agent_cancelled_by_the_harness_delivers_the_confirmed_checkpoint(setup):
+def test_belay_agent_cancelled_by_the_harness_delivers_the_head_of_the_merge_chain(setup):
     repo, agent_dir = setup
     gate = _with_tests(repo)
     env = FakePierEnvironment(repo, agent_dir)
     agent = belay_agent(agent_dir, gate_spec=json.dumps(gate), task_instruction=TASK)
-    script = [PLANNER, WORKER[0], WORKER[1], [tu("w", "bash", command="sleep 4")],      # 后台验证并提升这一版
+    script = [PLANNER, WORKER[0], WORKER[1], [tu("w", "bash", command="sleep 4")],      # 后台合并这一版
               [tu("e2", "edit_file", file_path="calc.py", old_string="a + b", new_string="a + b + 1")],   # 回归：不进链
               [tu("s", "bash", command="sleep 30")]]
     llm = ScriptedLLM([list(s) for s in script])
@@ -187,4 +187,38 @@ def test_belay_agent_cancelled_by_the_harness_delivers_the_confirmed_checkpoint(
     assert context.metadata["worker_status"] == "cancelled"
     assert context.metadata["belay_emergency_checkpoint"] is not None
     patch = (agent_dir / "patch.diff").read_text()
-    assert "+    return a + b\n" in patch and "a + b + 1" not in patch  # 交付的是确认过的存档，不是半成品
+    assert "+    return a + b\n" in patch and "a + b + 1" not in patch  # 交付的是合并点，不是半成品
+
+
+def test_belay_agent_without_gate_merges_on_the_reviewer_and_the_score(setup):
+    """没有 gate.json（LHTB 的情形）：没有回归门，合并只靠复核者；复核者运行程序（E2）并按任务自测分数。"""
+    from tests.integration.fakes import FakeAux
+
+    def policy(opening, review_dir):
+        code = (review_dir / "calc.py").read_text()
+        ok = "a + b" in code
+        return {"merge": True, "reason": "ok", "summary": "add returns the sum" if ok else "no change",
+                "requirements": [{"id": "R1", "status": "done" if ok else "not_done", "level": "E2", "runs": ["X1"],
+                                  "missing": [] if ok else ["add still subtracts"]}],
+                "score": 1.0 if ok else 0.0, "score_note": "python -c 'from calc import add; print(add(1, 2))'",
+                "feedback": ""}
+    repo, agent_dir = setup
+    env = FakePierEnvironment(repo, agent_dir)
+    agent = belay_agent(agent_dir, runtime={"reviewer": True})
+    llm = ScriptedLLM([PLANNER] + [list(s) for s in WORKER])
+    agent._make_llm = lambda: llm
+    aux = FakeAux(policy, run_first="python -c 'from calc import add; print(add(1, 2))'")
+    agent._aux_llm = lambda: aux
+    context = SimpleNamespace(metadata=None)
+
+    async def go():
+        await agent.setup(env)
+        await agent.run(TASK, env, context)
+    asyncio.run(go())
+    meta = context.metadata
+    assert meta["belay_status"] == "DONE" and meta["delivered_score"] == 1.0, meta
+    assert meta["review_tokens"]["input"] > 0 and meta["reviews"] >= 1
+    ledger = json.loads((agent_dir / "belay" / "ledger.json").read_text())
+    r1 = next(r for r in ledger["requirements"] if r["id"] == "R1")
+    assert r1["level"] == "E2" and not ledger["gate_available"]
+    assert "+    return a + b" in (agent_dir / "patch.diff").read_text()

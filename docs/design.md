@@ -1,32 +1,36 @@
-# Belay 实现设计（v7：worker 只做自然的事，状态由图从观察推出）
+# Belay 实现设计（v8：以合并为关口、复核者为裁判）
 
 本文是 Belay 落到代码时的设计说明：计划里没写死、但实现必须定下来的东西，以及为什么这样定。目标场景：一个任务连续
-运行几十分钟到一天，中间经历多次会话交接，runtime 进程与容器都可能丢失。
+运行几十分钟到一天，中间经历多次会话交接，runtime 进程与容器都可能丢失；有的任务有测试（SWE-EVO、ProMax），有的
+没有公开测试、交付物是产物（LHTB）。
 
-## v7 为什么大改
+## v8 为什么改
 
-v6 里图上所有有用的东西都挂在 worker 的主动声明上：认领 → 当前焦点 → todo 变成步骤 → `step_done` 锚点 → 后台验证
-→ `ready_for_review` → 任务完成。模型（DeepSeek）不认领，整条链就全断：todo 只记成笔记、后台没有语义节点可验证、
-任务永远是 open、复查者从来不跑、开场让它先去认领。一次 dask 2023.6.1 的试跑里，几百次工具调用之后链头仍是 0。
-它看了 `board` / `task` 十几次——图被当成参考资料，而不是要走的流程；认领在训练分布里没有对应的习惯，循环里也没有
-任何东西把它拉回来。同一次试跑的规划里 22 个任务没有一个带检查项（SWE-EVO 的评分测试都是新加的），任务层与需求
-一一对应，只多了一层编号。
+v7 的验证实际只回答“有没有变差”，没有可靠地回答“需求做没做完”：没有检查项的需求在提交时一律记为 submitted，
+worker 的一次笼统自述就等于完成；复查只在提交时触发，而且是一次只读 diff 的 LLM 调用；测试冲突由 worker 自己豁免；
+暂存点 / 确认点、提交被拒、后台验证、提升各有一套触发。换到没有测试的 LHTB，整套验证几乎空转。
 
-v7 的四条原则：
+v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯一的裁判，合并点是唯一的交付单位，账本是唯一的进度来源。**
 
-1. **只依赖模型的自然行为**：读、改、跑测试、（可选的）todo、结束时说“做完了”。认领、步骤声明、逐个任务申请验收这些
-   要模型主动想起来的流程全部删掉。
-2. **需要模型提供的信息，由 harness 在自己控制的时机去要**：交接摘要（L3/L4）、提交时的说明、模型停下时的追问。
-3. **反应式工具的用法写在触发它们的消息里**：`revert_change`、`waive_check` 的说明不放进系统提示。
-4. 不变：事件日志是唯一事实来源；纯函数核心；LLM 只能收紧不能放行；存档链、验证、定位、诊断、恢复的机制都保留。
+1. **不绑定数据集。** 测试是复核者手里最强的一种证据，而不是“验证”本身。没有测试时流程不变，只是证据等级变低。
+2. **合并与完成分开。** 合并的标准是“不比上一个合并点差”；需求是否完成记在账本里。合并是增量的，任何时刻超时都有
+   可交付的版本。
+3. **不依赖模型主动走流程。** worker 不认领、不必写需求编号；todo 勾选和 submit 只是“请现在看一眼”的信号，
+   不直接改变任何需求状态。
+4. **复核者可以放行，但必须带证据。** 每条判定附证据等级和合并点；规则校验证据等级是否站得住，worker 的自述只作线索。
+5. **合并链是单调的。** 已完成的需求不会在后面的合并点上退回、分数不会下降，所以链头就是最好的结果，交付的永远是链头。
+6. **事件日志仍是唯一事实来源。** 复核结论也是事件，账本由纯函数推导，崩溃后可重放。v7 的日志不能在 v8 上重放
+   （`run_started` 没有 `version` 或类型不认识时直接报错），v7 的结果用它们的 `ledger.json`。
+
+保留不动的部分：事件日志、影子 git 快照、独立验证目录、回归门、二分定位、崩溃与容器丢失的恢复、由账本生成会话开场。
 
 ## 0. 一句话结构
 
 ```
-          worker 工具请求 / 快照 / 验证器结果 / git 结果 / LLM 结果 / 时钟
+          worker 工具请求 / 快照 / 验证器结果 / git 结果 / 复核结论 / 时钟
                            │  (输入)
                            ▼
-   rules.*(graph, 输入, now, cfg) ──► [事件草稿]      纯函数：决定
+   rules.*(graph, 输入, now, cfg) ──► [事件草稿]      纯函数：决定（复核结论在这里校验）
                            │
                   store.append(事件)                  先写日志
                            │
@@ -34,337 +38,199 @@ v7 的四条原则：
                            │
            effects_for(事件, graph') ──► [副作用]      纯函数：计划副作用
                            │
-      执行副作用（作业、git CAS、bundle、定位 diff、诊断、复查……）   命令式外壳，结果再作为输入回来
+      执行副作用（作业、git CAS、bundle、定位 diff、诊断、复核会话……）   命令式外壳，结果再作为输入回来
 ```
 
-一次运行内部有两条并行的线：worker 在前台写代码；runtime 在后台拍快照、持续验证最新快照、推进存档、提升、定位。两者
-只通过事件日志与通知交汇，后台从不碰 worker 的工作区（验证在验证槽位里跑；隔离无效时降级，见 §4.1）。
+## 1. 角色
 
-- `belay/core/` 全是纯函数：不做 IO、不调模型、不读时钟（`now` 作为参数传入）。
-- `belay/runtime/` 是薄的命令式外壳：事件存储、git、验证槽位、会话循环、LLM 调用、镜像与恢复。
-- **唯一写者**：`Runtime.submit()` 在一把锁里执行“规则 → 追加事件 → 更新视图”，所以不需要其他并发控制。
+| 角色 | 做什么 | 不做什么 | 代码 |
+| --- | --- | --- | --- |
+| worker | 读、改、跑测试；可选 todo；可选 submit（请求立即复核，可附受阻声明与豁免提议） | 不改需求状态；不豁免测试 | `runtime/session.py`、`tools/belay.py` |
+| runtime | 拍快照；发起与节流合并请求；跑回归门；管理会话、预算、交接与收尾；交付链头 | 不判断需求是否完成 | `runtime/driver.py`、`core/rules.py` |
+| 规划器 | 开工时拆需求清单，每条 actionable 需求写一句验收方法 | 运行中不改清单 | `runtime/planner.py`、`core/plan.py` |
+| 复核者 | 处理合并请求：读代码、跑命令和测试、二分定位；判定是否合并、逐条判定需求、裁决豁免、测分数、写反馈 | 不改 worker 工作区；它的结论要经规则校验 | `runtime/reviewer.py`、`rules.decide_review` |
+| 诊断者 | 回归被拒时解释原因（只是建议） | 不改变任何状态 | `driver._eff_diagnose` |
+| 账本 | 由事件推导：需求的状态、证据等级、合并点；合并链 | 不存事件之外的状态 | `core/reduce.py`、`core/model.py` |
 
-## 1. worker 与图分别持有什么
-
-| | worker | 图 |
-|---|---|---|
-| 计划 | todo（自己的，可以不列） | 镜像为运行级的 todo；勾掉一条时拍锚点快照，被链上存档包含即 anchored |
-| 正在做什么 | 只在它的上下文里 | 不持有“当前焦点”；需要时从 todo（in_progress 的那条）和链头以来的 diff 推出 |
-| 完成 | `submit`（唯一要它做的声明） | 每条需求的状态：verified / submitted / blocked / open |
-| 存档 | 不用管 | 快照 → 后台持续验证最新快照 → 暂存点 → 空闲时提升为确认点 |
-| 思路、走不通的路 | 交接时由 harness 要求它写 | 存为摘要（compacted），下个会话开场交还 |
-| 回归 | 收到消息后调 `revert_change` / `waive_check` | 定位、诊断 |
-| 何时结束 | 不用管 | 提交被接受 + 预算 + 停滞 |
+复核者与诊断者用 `aux_llm`（评测里默认与 worker 同一个模型、单独的客户端与录制文件）。v7 的“存档标签”LLM 角色
+取消：合并点的标签就是复核者 verdict 里的一行 `summary`，它同时是影子仓库里合并提交的说明；交付时
+`refs/belay/delivered` 指向交付的合并点。
 
 ## 2. 事件
 
-每条事件：`seq`（从 1 开始连续递增，同时是图的版本号）、`t`（墙钟秒）、`type`、`actor`、`source`、`payload`。
-
-**来源纪律**（`invariants.check_log` / `llm_effects`）：`requirement_verified`、`checkpoint_created`、
-`checkpoint_advancing`、`checkpoint_confirmed`、`todo_anchored`、`delivered` 只能来自 `rule` / `observed`；
-`requirement_submitted`、`requirement_blocked`、`todos_updated`、`todo_completed` 是 worker 的自述（`self_report`），账本如实
-区分；`llm` 的事件只能记录、重开（`diagnosis_recorded`、`review_recorded`、`checkpoint_labeled`），永远不引起完成、
-存档、提升。
+每条事件：`seq`、`t`、`type`、`actor`、`source`、`payload`。来源纪律（`invariants.check_log` / `llm_effects`）：
+`merged`、`merge_advancing`、`review_decided`、`waiver_granted`、`todo_anchored`、`delivered` 只能来自 `rule` /
+`observed`；`requirement_judged` 来自 `rule`，只有复核者不可用时的 E0 完成与自述受阻来自 `self_report`；
+复核者的原始结论 `merge_reviewed`（llm）之后必须紧跟同一次复核的 `review_decided`（rule）。
 
 | 类别 | 事件 | 来源 | 视图变化 |
 | --- | --- | --- | --- |
-| 运行 | `run_started` / `runtime_recovered` / `clock_started` / `run_suspended` | rule / observed | 预算、恢复与重建次数、丢失的快照、隔离状态 |
-| | `deadline_reserve` / `finalize_started` / `delivered` | rule | 截止预留；收尾开始（不再开后台验证）；交付点、级别、为什么不是 DONE |
-| 需求 | `plan_proposed` / `requirement_frozen` | llm / rule | 需求清单冻结：引文、摘要、`kind`（actionable / context）、`checks` |
-| | `requirement_verified` | rule | 证据检查在链上存档里全部通过 |
-| | `requirement_submitted` / `requirement_blocked` | self_report | 提交时记下（在提交的存档上）；受阻带种类、理由、引文 |
-| | `requirement_reopened` | rule | 复查者说没做完 / 给出了合理读法 / 给出了在仓库里做到的办法 / 回退 |
-| todo | `todos_updated` / `todo_completed` | self_report | todo_write 的镜像（按标题匹配保持 id 稳定，条目文字里的 R 编号顺带关联）；勾掉时带锚点快照 |
-| | `todo_anchored` / `todo_invalidated` | rule | 锚点被链上同段存档包含；回退使锚点不在链上 |
-| 提交 | `submit_requested` | rule | 一次提交：快照、摘要、受阻清单、是否隐式；带存档尝试，或直接落在链头 |
-| | `submit_updated` | rule | pending → checkpointed → reviewing → accepted / returned；被拒（rejected）由 `checkpoint_rejected` 推出 |
-| 执行 | `session_started` / `session_resumed` / `session_ended` / `compacted` | rule / observed / llm | `session_resumed.mode` = memory / replay |
-| | `snapshot_taken` | observed | 快照时间线（序号、段号、原因、可测、拍下时进行中的 todo、快照提交）；同时更新 WIP |
-| | `stall_detected` | rule | no_progress / repeated_failure（提示）、sessions_no_progress（停止） |
-| 验证 | `job_started`（`where`：slot / workspace / live）/ `job_preempted` / `job_finished`（带 `reasons`）/ `baseline_recorded` | rule / observed | 作业与失败原因、守护集合、导入隔离 |
-| 存档 | `checkpoint_attempted`（`snapshot`、`lane`、`kind`）/ `attempt_superseded` | rule | 前台（submit、收尾）/ 后台（最新快照）尝试；更旧的尝试被新存档取代 |
-| | `checkpoint_advancing` / `checkpoint_created` / `checkpoint_rejected` | rule / observed | 父节点在推进时确定；新存档为暂存（related）或确认（full） |
-| | `checkpoint_confirmed` / `checkpoint_demoted` / `checkpoint_marked` | observed / rule | 全量通过 → 确认点前移；确认过的回归 → 降级；勾掉的 todo、提交落在已有存档上 → 升级 kind 并带标签 |
-| | `check_waived` / `rollback` | rule | 豁免回归门里的测试；回退（只由恢复流程使用）：段号 +1 |
-| 定位 | `persistent_regression` / `locate_started` / `locate_concluded` / `regression_located` / `relation_learned` | rule / observed | 见 §4.4 |
-| LLM | `diagnosis_requested` / `diagnosis_recorded` | rule / llm | 诊断者（只解释） |
-| | `review_started` / `review_recorded` | rule / llm | 复查者（只收紧），一批若干条需求 |
-| | `checkpoint_labeled` | llm | 没有标签的存档补一行说明 |
+| 运行 | `run_started`（带 `version: 8`）/ `runtime_recovered` / `clock_started` / `run_suspended` | rule / observed | |
+| | `deadline_reserve` / `finalize_started` / `delivered` | rule | 交付点 = 链头 |
+| 需求 | `plan_proposed` / `requirement_frozen` | llm / rule | 清单冻结：引文、摘要、kind、checks、acceptance |
+| | `requirement_judged` | rule / self_report | 状态 open / done / blocked，证据等级、证据、缺失项、所在合并点、来源（review / checks / self_report / rollback） |
+| todo | `todos_updated` / `todo_completed` / `todo_anchored` / `todo_invalidated` | self_report / rule | 锚点被链上合并点包含即 anchored |
+| 提交 | `submit_requested` / `submit_updated` | rule | pending → accepted / returned；被拒由 `merge_rejected` 推出 |
+| 执行 | `session_*` / `compacted` / `snapshot_taken` / `stall_detected` | | |
+| 验证 | `job_started` / `job_preempted` / `job_finished` / `baseline_recorded` | rule / observed | |
+| 合并 | `merge_requested`（`lane`、`trigger`、`selection`）/ `merge_superseded` | rule | 合并请求 |
+| | `merge_advancing` / `merged` / `merge_rejected`（`reason`：regression / requirement_regression / review / precheck / cancelled / cas_conflict） | rule / observed | 合并点 |
+| | `rollback` | rule | 只由恢复流程使用 |
+| 复核 | `review_started`（请求或只判定、focus、回归门结果）/ `merge_reviewed`（llm 原文、执行过的命令） | rule / llm | |
+| | `review_decided`（合并与否、原因、被忽略的判断、判定、分数、标签、反馈）/ `review_cancelled` / `waiver_granted` | rule | |
+| 定位 | `persistent_regression` / `locate_started` / `locate_concluded` / `regression_located` | rule / observed | |
+| 诊断 | `diagnosis_requested` / `diagnosis_recorded` | rule / llm | |
 
-v6 的 `task_*`、`steps_planned` / `step_*`、`review_requested`、`note` 都删掉了。旧日志不能在 v7 上重放。
+## 3. 视图
 
-## 3. 三个视图
+全部定义在 `belay/core/model.py`（不可变 dataclass）。
 
-全部定义在 `belay/core/model.py`，是不可变 dataclass；`reduce` 返回新图（结构共享，不修改旧图）。
+- 需求账本：`Requirement`（`status` open / done / blocked，`level` E0–E3，`judgement` done / partial / not_done / blocked，
+  `by`、`evidence`、`tests`（E3 依据）、`runs`（E2 依据）、`missing`、`checkpoint`、`review`、受阻信息、`misses`）、
+  `Todo`、`Submit`、`Review`。
+- 执行状态：`Session`、`Wip`、`Snapshot`、`Job`、`Persistent`、`Locate`、`Diagnosis`、`Waiver`（带裁决它的复核）。
+- 合并链：`Attempt`（合并请求：`trigger`、`lane`、`selection`、`review`、`reviews`）、`Checkpoint`（合并点：`review`、
+  `score`、`score_note`、`label`）；`graph.head`。没有暂存点 / 确认点、提升与降级。
 
-- 需求账本：`Requirement`（`kind`、`checks`、`status`、`checkpoint`、`submit`、受阻信息、`reopen*`、`last_failure`、
-  `passed_checks`、`review*`、`history`）、`Todo`、`Submit`、`Review`。没有任务层、持有关系与当前焦点。
-- 执行状态：`Session`、`Wip`、`Snapshot`（`todo` 取代了 v6 的 `held` / `step`）、`Job`、`Persistent`、`Locate`、
-  `Diagnosis`；`graph.epoch` / `graph.epoch_base`；`graph.isolation`。
-- 存档链：`Attempt`（`submit` 取代了 `tasks`）、`Checkpoint`（`kind` ∈ auto / todo / submit / handoff / final / baseline、
-  `level` ∈ provisional / confirmed、`demoted`、`label`）；`graph.head` 与 `graph.confirmed`。
+### 证据等级
 
-### 需求的状态
+| 等级 | 含义 | 规则怎么校验 | 是否计为完成 |
+| --- | --- | --- | --- |
+| E3 测试 | 引用的测试在这个快照上通过，且至少一个在原始代码上不通过 | 测试必须在基线里、在这棵树上有结果（回归门全量结果或复核者的 `run_tests`）；不够就降为 E2 | 是 |
+| E2 运行验证 | 复核者执行命令，观察到预期行为或产物 | 引用的命令编号（X1…）必须在这次复核里执行过；不够就降为 E1 | 是 |
+| E1 代码审读 | 复核者读改动，判断已实现 | — | 是，报告单独统计 |
+| E0 自述 | 只有 worker 的说法 | 复核者给的 E0 完成改记为 partial；只有复核者不可用时的自述才是 E0 | 否 |
 
-| 状态 | 怎么进入 | 来源 |
-|---|---|---|
-| `open` | 初始；被重开也回到这里，带上原因与 `last_failure` | rule |
-| `verified` | 证据检查在链上的某个存档里全部通过（`auto_verify`：每次存档创建、作业完成后检查） | rule |
-| `submitted` | worker 提交，提交的存档通过回归门；这条需求没有证据检查 | self_report |
-| `blocked` | worker 在提交的 `blocked` 清单里声明做不了（种类、理由；check_conflict 要逐字引文） | self_report |
+规划器关联的检查（原始代码上不通过的已有测试）在合并点上全部通过时，规则直接记 E3（`by=checks`）。
 
-- **证据检查** = 需求的 `checks` 中在原始代码上**不通过**的那些（`queries.evidence_checks`）。基线上本来就通过的检查
-  已经在回归门里，证明不了任何事；这一条在验证时判断，规划器与基线谁先跑完都没关系。
-- `context` 需求（标题、日期、版本横幅、“代码在 /testbed”、“以下是发布说明”）只为覆盖原文，不进清单、不参与提交与
-  DONE；`requirement_frozen` 要求至少一条 actionable。
-- 复查者对 submitted 与 blocked 只能做两件事：yes 只记录；no / partial（或受阻给出了合理读法、在仓库里做到的办法）
-  重开为 open。
+### DONE 的条件（`queries.status_reasons`，空列表 = DONE）
 
-### 三个基准
+交付的合并点上，每条 actionable 需求都完成（E1 及以上），或受阻且复核者认可。只有自述的完成（E0）、复核者没有认可
+（或复核者不可用时自述）的受阻、没做完的需求都如实列为原因。
 
-| 用途 | 基准 | 实现 |
+## 4. 合并
+
+### 4.1 合并请求的触发（`rules.schedule_background`、`request_submit`、`driver._finalize`）
+
+| 触发 | 车道 | 节流 |
 | --- | --- | --- |
-| 交付 | 最新的确认点 | `queries.delivery_checkpoint`；除基线外没有确认点时按 `deliver_unconfirmed` |
-| 恢复的起点 | 链头（后台持续验证，链头紧跟工作区） | `queries.resume_point` |
-| `rollback` 的默认目标（只由恢复流程使用） | 最近的里程碑（todo / submit / handoff / final / baseline） | `queries.latest_milestone` |
-| 容器重建 | 整条链、全部快照与最新快照 | `recovery.rebuild_container` |
+| 后台：空闲时最新的可测快照（比链头新、这棵树在这一段还没请求过） | bg | 两次后台复核之间至少 `merge_min_interval_sec`（默认 600 s）；只按回归门被拒的请求没有复核，不计入 |
+| 勾掉 todo（锚点快照） | bg | `merge_todo_interval_sec`（默认 180 s） |
+| 交接 / 会话结束的快照 | bg | 不节流 |
+| submit | fg | 不节流；取代正在进行的后台请求（作业按树复用，复核取消） |
+| 收尾（最新快照还没合并） | fg | 在截止预留里做 |
 
-## 4. 关键规则
+没有复核者时（`reviewer=False`）不节流：回归门只花 CPU。时钟（`tick`）会在间隔到了时补发后台请求。同一时刻每个
+worker 每条车道至多一个合并请求，整个运行同一时刻只有一个复核；前台需要复核者时取代正在复核的后台请求。
 
-### 4.1 独立目录验证（模块 A）
+### 4.2 一个合并请求怎么走（`rules.advance_attempt`）
 
-- 非 live 的作业默认 `where=slot`：runner 先把候选树导出到验证槽位（`read-tree --reset -u` 按槽位索引只改动不同的
-  文件；`git clean -fd` 清掉未被忽略的未跟踪文件，被忽略的构建产物留作缓存），第一次导出后从工作区复制被忽略的文件与
-  项目自己的 `.git` 作为构建缓存种子（`cp -a --reflink=auto`）。
-- `sys.path` 映射：基线阶段在工作区跑 `runner.py probe`，把位于工作区之下的条目按原顺序映射到槽位（再补根目录与
-  `src/`），作为 `PYTHONPATH` 放在最前（`RunnerVerifier.map_sys_path`）。
-- 基线双跑：一次 `where=workspace`（此时还没有 worker），一次 `where=slot`；工作区通过而槽位没通过的测试先在槽位里确认
-  重跑，剩下的数量超过 `isolation_max_diff` 就判定隔离无效。守护集合只取两边都通过的测试。
-- 破坏探针（`runner.py isolation-probe`）：在槽位里找一个被测试导入的源文件，先确认 `import` 解析到槽位，再在文件开头插
-  `raise ImportError` 跑那个测试，必须失败。命令里写死了工作区绝对路径（`VerifierSpec.mentions`）同样判为无效。
-- 降级模式（`graph.degraded`）：作业回到 `where=workspace`（`TreeOverlay` 切换工作区），与 worker 的写类工具在
-  `workspace_lock` 上互斥；不做任何后台验证（不验证步骤锚点、不提升、不定位），只在 worker 本来就在等待时
-  验证（submit、会话结束与交接——这时驱动等验证结束再开新会话、收尾）。基线用工作区上的两次。
-- 调度：`RunnerVerifier` 的槽位池 + 优先级队列（`verify.job_priority`：1 收尾与基线 / 2 worker 在等的（submit、
-  证据、定位）/ 3 后台：最新快照的验证与提升 / 4 已被取代还在跑的后台作业）。第 1、2 档到达而槽位被第 3、4 档占着时取消低档作业（TERM）并重新排队，写 `job_preempted`，不算丢失。
-  第 3、4 档以 `nice` 运行，可选限制并发（`background_cpu_limit`）。
-- 作业进程：`setsid` 起会话，`timeout --foreground` 保证取消信号能到达 runner；外层 shell 用 trap 挡住 TERM，保证写完成
-  标记；进程组 id 由作业自己写。启动命令先把自己的输出换成 `/dev/null`，launch 立即返回（v5 里 launch 实际会等作业跑完）。
+1. 被链头超过（同一段、快照序号不大于链头）或就是链头的树 → `merge_superseded`。
+2. 回归门：有测试配置时跑全量（`selection=None`；v7 的 related 档位与“相关测试先过、全量后验”的两级取消），
+   回归先确认重跑，重跑通过的记为 flaky。没有测试配置时 `selection=()`，直接通过。
+3. 单调检查：已完成（E3）的需求依据的测试在这棵树上不再通过 → `merge_rejected(requirement_regression)`。
+4. 有回归：worker 在这次 submit 里提议了豁免 → 请复核者裁决；否则 `merge_rejected(regression)`（前台的立即定位与诊断，
+   后台的同一回归连续两次才定位与诊断）。
+5. 没有回归 → 请复核者（复核者在忙就等；前台取代后台）。
+6. 复核者的结论经规则校验后写 `review_decided`：批准 → `merge_advancing` → CAS → `merged`，随后写这次复核的需求判定
+   与测试判定（`requirement_judged`）、锚定 todo、给提交下结论；不批准 → `merge_rejected(review)`，原因与反馈进账本
+   并告诉 worker。
+7. 复核者失败（没有给出结论）→ 重试 `review_retries` 次；仍失败就按复核者不可用处理：有回归门时只按回归门合并
+   （合并点 `review=None`，提交的需求按自述 E0 记下）；没有回归门时只有 worker 自己 submit 的快照会合并，后台与
+   截止时的快照（常常改到一半）不合并。
 
-### 4.2 快照与后台验证（模块 B）
+### 4.3 合并标准（`rules.decide_review`，纯函数）
 
-三层：**存**（快照，只存不打扰）→ **验**（后台空闲时验证最新的可测快照；submit 与收尾在前台验证）→ **查**（只有
-worker 的提交被拒、或提交的存档被降级时，才二分定位）。没有任何基于时间的存档或提醒。
+- 回归门全过；复核者批准的豁免必须引用任务原文（至少三个词、逐字），测试必须在守护集合里并且确实在这棵树上失败，
+  每次运行最多 `waive_max_tests` 个；没被豁免的回归 → 不合并。
+- 复核者批准（`merge=true`）；它不批准时写明原因（破坏性改动、调试代码、伪造结果……）。
+- 已完成的需求没有被这次改动弄坏：复核者说一条已完成的需求不再成立，必须有 E2 / E3 的证据；`regressed=true` →
+  不合并；不是这次弄坏的（重新评估）→ 合并，需求退回 open（`reason=reassessed`）。只凭阅读（E1）的否定判断不改变
+  已完成的需求（记为 note，防止复核者在同一棵树上来回改判）。证据等级只升不降。
+- 分数：复核者执行过命令时报告的 `score` 不比链上最近一次测到的低超过 `score_tolerance`（相对，默认 2%）；没测分数
+  的合并点不会把门槛清零。
+- 合并不要求任何需求已经完成。
 
-- 快照时机（`_Hooks.after_tools` → `driver.take_snapshot`，没有限流）：`edit_file` / `write_file` 之后一定拍；bash 不一定
-  写文件，累计 `snapshot_bash_every` 次再拍；模型跑测试 / 构建的 bash 命令执行前拍（`model_test`）；勾掉 todo、submit、
-  会话结束、交接、截止、恢复开始、撤销之后都拍。原样树与上一张相同就直接沿用，不记新快照（交接 / 会话结束例外）。
-- 每张快照是一个确定的提交（树 = `{raw: 原样树, cand: 候选树}`，父提交是上一张快照），ref 为 `refs/belay/snap/<n>`。
-- 候选树 = 原样树剔除测试路径下的改动（恢复为基线版本），交付也只交付候选树。测试路径按基线实际收集到的测试判断
-  （`verify.suite_layout`），所以 `django/test/`、`numpy/testing/` 这类源码包不会被当成测试剔除。
-- 预检：改动的 `.py` 文件用 `compile()` 检查语法（不写 `.pyc`）；可配 `precheck_cmd`。失败的快照标为不可测。
-- **后台线**（`rules.schedule_background` / `_background_candidate`）：同一时刻每个 worker 至多一个后台尝试；空闲时取这个
-  worker 同一段里**最新**的可测快照——比链头新、它的树在这一段还没尝试过（被拒过的树不再重试，等新的改动）；最新的
-  快照预检不过就往前找最近的可测快照。为前台意图拍的快照（submit、收尾）后台不取，由发起者自己验证。
-  `cfg.background`：`latest`（默认）/ `handoff`（只验交接快照，v6 的做法，用于消融）/ `off`。降级模式等同 `handoff`。
-- 为什么能这样做：回归门只判断“原来能过的有没有被弄坏”，所以任何过门的快照都是不比基线差的合法交付物；交付最新的
-  过门快照，正好是评分上最好的选择。后台被拒是常态（中间态），只是链头不动，不计入“同一回归反复被拒”的停滞检测；
-  一次被拒不通知、不定位、不诊断。同一个测试在连续两个被拒的后台尝试（不同的树、同一段）上都是回归时
-  （`rules._background_persists`），才记 `persistent_regression(trigger=background)` → 通知 worker + 定位 + 诊断，结果
-  作为下一轮的提示送达，不打断它；同一个测试在它重新通过之前只处理一次。代价只有 CPU（第 3 档作业，`nice`、`background_cpu_limit`）。
-- **新快照胜出**：前台、后台尝试各至多一个；链头的快照序号不小于尝试的快照序号（同段）时，尝试被 `attempt_superseded`
-  取代（它带着的提交转到链头上判定）；正在跑的尝试不会被更新的快照打断，跑完再去拿最新的。父节点在
-  `checkpoint_advancing` 时才确定，CAS 用它校验。
-- 每次存档尝试的选择都带上还没完成的需求的证据检查（`_evidence_of_open`），需求验证通过不需要任何人声明。
-- **进展**（`reduce._progress`）只来自：需求验证通过、某条证据检查第一次在存档上通过、需求被提交或受阻、todo 被锚定。
-  存档本身（包括后台存档、提升为确认点）不算进展：否则一个不断写出能过门的半成品的 worker 会永远“有进展”，
-  停滞检测与“连续几个会话没有进展就停”都失效。
-- 标签：todo 存档的标签是条目文字，提交存档的标签是摘要第一行；勾掉的 todo 或提交落在已有的自动 / 交接存档上时
-  `checkpoint_marked` 把它升级为对应的 kind（回退的默认目标不会越过它）。其余没有标签的里程碑（以及每 `label_every`
-  个其他存档）用 `aux_llm` 补一行。
+### 4.4 交付
 
-### 4.3 两级存档链（模块 C）
+交付点 = 链头（`queries.delivery_checkpoint`）。收尾（`driver._finalize`）：`begin_finalize` 取代后台请求 → 等 worker
+最后的 submit → 最新快照还没合并就发起一次前台请求（`final` / `deadline`）→ 到点还没结束的作业与复核取消 →
+`delivered`。最新快照的复核没做完时交付的仍是链头。截止预留 = max(下限, 全量回归门耗时 × 系数 + 余量 + 一次复核)，
+最多占预算的 `reserve_max_frac`。
 
-- related 档位通过 → 暂存点；full 档位通过（例如 related 升级为 full、收尾）→ 直接是确认点。
-- 提升（`schedule_promotion`）：验证队列有空闲时，只看最新确认点与最近一次降级之后的暂存点，取最新的跑全量（更老的
-  跳过），同一时刻只提升一个。全量通过（回归先确认重跑）→ `checkpoint_confirmed`；确认过的回归 → `checkpoint_demoted`，
-  它之后的暂存点是 suspect，直到它们自己跑完全量。
-- 降级后：提交的存档（kind = submit）对最新的可测快照只跑这几个失败的测试（`recheck`）：仍失败 →
-  `persistent_regression(trigger=demoted)` → 通知 worker + 定位 + 诊断；已通过 → 只记录。后台、todo、交接存档被降级
-  只是不再交付，不追查、不通知。
-- 收尾（`driver._finalize`）：`finalize_started` 取消后台尝试 → 对当前 WIP 做一次 full 前台尝试 → 链头仍是暂存点且还有
-  时间就提升它 → 取消剩下的作业 → 交付最新的确认点（`delivered` 带 `level`、`lag`、`not_delivered`、`status_reasons`）。
-- 豁免（`rules.waive_checks`，工具 `waive_check`）：任务原文明确要求的行为与某个现有测试冲突时，worker 可以把这个测试
-  从回归门里去掉。规则校验：引文逐字出现在任务原文里（至少三个词）；每个检查都在守护集合里、不是公开检查，并且确实
-  在 worker 的某个候选树上失败过（不能预先豁免）；一次运行最多 `waive_max_tests` 个。可以注明是哪条需求。豁免不改变
-  需求的检查项；账本逐条列出。整个需求做不了时用 `submit(blocked=[{kind: "check_conflict", quote}])`。
-- DONE 的条件（`queries.status_reasons`，空列表 = DONE）：
-  1. 每条 actionable 需求都 verified，或 submitted 且复查者没有认定没做完；没有 open、没有 blocked；
-  2. 每条需求所在的存档都在交付点的祖先链上（否则是“完成但未交付”）；
-  3. 交付的是确认点（没有被降级）。
-  受阻是诚实、正确的结束方式（收尾照常进行），只是不计为 DONE。
+## 5. 复核者（`runtime/reviewer.py`）
 
-### 4.4 被拒信息与规则定位（模块 D）
+- 每个复核开一个带工具的短会话，复用 worker 的循环（`belay/worker/loop.py`），轮数（`review_max_turns`）与时间
+  （`review_max_sec`）有上限；用完还没给结论就再给一轮只要求 verdict，仍没有就记为失败。
+- 复核目录（默认 `<state>/review`）：`ShadowRepo.export_to` 把被复核的候选树增量导出（上次复核改过的已跟踪文件恢复、
+  未跟踪的输出清掉、被忽略的构建缓存保留，第一次从工作区复制被忽略的文件作为种子）。复核结束杀掉工作目录在复核目录
+  里的进程。
+- 工具：`read_file` / `list_files` / `grep_search`（只读快照）；`run`（在复核目录执行命令，编号 X1…，退出码入日志）；
+  `run_tests`（让验证器在独立目录用原始测试文件跑指定测试，结果是观察，E3 的依据）；`run_gate`（回归门结果）；
+  `locate`（在快照之间二分）；`verdict`（唯一的写出口）。
+- 开场（全部来自图）：任务原文；触发与上一个合并点；上次测到的分数与测法；回归门结果（含没通过的测试与原因、
+  原始代码上失败现在通过的测试）；需求清单（账本状态、验收方法、关联测试的结果、上次的缺失项，focus 标星）；worker
+  的自述（提交摘要、受阻声明、豁免提议、todo、交接摘要，统一标为未核实）；上一次复核的结论；相对上一个合并点的改动
+  （按需求预排序的 diff）；被剔除的测试改动；怎么跑测试。
+- 防偏差：不共享 worker 的上下文；工作区路径、影子仓库、作业与验证目录、`/logs` 都在保护名单里（读文件与命令都检查）；
+  git 写、联网、全盘搜索拒绝。
+- 反馈 worker（`port.py`）：submit 触发的复核结论总是随 submit 返回；后台请求没被批准时以 system-reminder 告诉 worker
+  原因与反馈；同一需求连续 `notify_misses` 次被判为没做完时提醒；连续 `stall_same_failure` 个请求没被批准时给一次
+  停滞提示（最新的合并点仍是交付物，撤掉有问题的改动不会丢东西）。
 
-- D1：runner 的 `reasons` 经 `JobOutcome` → `job_finished.reasons` → 拒绝消息（每个回归下一行原因）；`failure_log(test)`
-  从最近一次包含它的作业日志里截出 traceback 段落（`verifier.extract_failure`）。
-- D2：回归所在的测试文件在快照的 `dropped` 里时提示“以原始版本运行”（worker 改了测试文件不算数）。
-- D3：`locate_started` 记下测试、坏端（快照）、段号与段起点。区间内的点 = 段起点存档 + 同段内坏端之前的可测快照（连续
-  相同的树只取一张）+ 坏端；每个点上某个测试的状态由作业结果推出（`verify.point_status`：pass / fail / unknown /
-  running / untested），所以二分的中间状态不单独记事件。每个测试取“最后一次已知通过”为好端（自然处理了非单调的一过性
-  失败），与之后第一次失败之间取中点跑那个测试单元；跑不出结果的点记为 unknown 跳过；达到 `locate_max_steps` /
-  `locate_max_sec` 就给出已缩小的区间。多个测试共享作业，按（好端, 坏端）分组写 `locate_concluded`；外壳算出组内
-  “好 → 坏”的改动与 diff 后写 `regression_located`（带当时进行中的 todo 与会话）。
-  触发（只针对 worker 的提交）：提交因回归被拒、提交的存档被降级后问题仍在。后台验证的快照结果直接复用为二分的点。二分时才按需
-  测中间快照；预检不过的快照不可测，直接跳过（相当于 `git bisect skip`）。
-- D4：`revert_change(located)` 逐文件三方合并（ours = 工作区，base = 坏端，theirs = 好端），全部干净才写回，有冲突就什么
-  都不改（`gitops.revert_files`）。
-- 学到的相关性：降级触发、且定位精确时，把“改动的源文件 → 失败测试所在文件”记为 `relation_learned`；`related_units`
-  之后把它们加入选择。
+## 6. 需求状态
 
-### 4.5 诊断者（模块 E）
+需求状态只在合并时由判定改变（`requirement_judged`）：复核者的判定（经校验）、关联检查全部通过（E3）、复核者不可用
+时的自述（E0 / 自述受阻），以及恢复流程的回退（退回 open）。todo、submit、worker 的说法都不直接改状态。
 
-- `persistent_regression` 有两种来源：降级后问题仍在（`trigger=demoted`）；同一回归在连续两个被拒的后台尝试上都在
-  （`trigger=background`，一次被拒只是中间态，不算）。之后没有任何同段快照上它通过就算“仍未解决”。
-- 诊断：规则写 `diagnosis_requested`（同一（回归签名, 定位区间）只一次；同一签名第二次被拒时带上前一次的结论再诊断），
-  外壳从图里组装输入（失败原因、测试源码、定位 diff、当时进行中的 todo 与它提到的需求原文、压缩摘要，限
-  `diagnose_input_tokens`），用 `aux_llm` 调用，结果经 `record_diagnosis` 校验：`intentional=true` 的引文不在任务原文里就
-  丢弃这一项。诊断不改变门的判定。
+```
+open ──(复核者 done + 证据，或关联检查通过)──► done(E1/E2/E3)
+open ──(worker 声明受阻且复核者认可)────────► blocked
+done ──(E2/E3 证据表明不再成立，重新评估)────► open        （这次改动弄坏的：不合并，需求保持 done）
+done ──(合并点在恢复时被回退)──────────────► open
+blocked ──(复核者给出读法或做法)────────────► open
+```
 
-### 4.6 提交（唯一的完成声明）与复查者（模块 F）
+只判定、不合并的复核：worker 调 submit 时快照就是链头（没有新改动），而还有没在这棵树上判定过的需求、或新的受阻声明，
+请复核者看一眼；都判定过就直接按账本回答（不会在同一棵树上反复复核同样的东西）。
 
-`submit(summary, blocked=[{requirement, kind, reason, quote?}])`（`rules.request_submit`）：
+## 7. 会话交接与导出
 
-1. 外壳强制拍一张快照；规则先校验受阻清单（需求在清单上、种类合法、有理由、check_conflict 的引文逐字在原文里），
-   不合法就整个拒绝，什么都不记。
-2. 快照的树就是链头：直接在链头上判定（`checkpoint_marked` 把链头标成 submit）。否则发起前台存档尝试（related 档位，
-   带上还没完成的需求的证据检查），`submit_requested` 在尝试有结果之前写入。预检不过、回归、被取消 → 提交被拒
-   （`render_submit` 给出失败的测试与原因，定位与诊断随之开始），worker 继续干活。
-3. 存档有了（`checkpointed`）：先等证据检查的结果（缺就起 `evidence` 作业），再逐条判定 open 的 actionable 需求：
-   证据检查全部通过 → verified；在受阻清单里 → blocked；有证据检查但没过 → 仍是 open，没过的检查记进
-   `submit.failing` 与 `last_failure`；其余 → submitted（锚在这个存档上）。
-4. 复查（`_start_reviews`）：还没复查过、被复查者重开的次数没到 `review_max_reopens` 的 submitted 需求，以及以
-   insufficient_info 或 environment 受阻的需求，按 `review_batch` 条一批（默认 1：多条一批在实测里容易整批拿不到
-   结论）发起 `review_started`；提交进入 `reviewing`。
-5. 所有批次都有结果后（`finish_submit`）：还有 open 的 actionable 需求 → `returned`（清单交还 worker，带原因）；没有 →
-   `accepted`，会话结束，运行收尾。
+开场上下文继续由 `build_context` 从账本生成：任务原文、需求索引（冻结后逐字不变）、待处理的问题（持续回归、定位、
+诊断、最近一次被拒或没被批准的原因与反馈）、需求状态（等级与缺失项）、todo、交接摘要、链头与最新合并点以来的 diff、
+离开期间的事件（合并、判定、复核反馈……）、回归门。换会话、进程崩溃、容器重建都从账本接着做。
+`python -m belay.cli handoff --run-dir <dir>` 随时把同样的上下文从事件库导出来，交给下一个会话。
 
-复查者（`driver._eff_review` + `runtime/review.py`）：输入是需求原文 + 按每条需求原文里的名字（反引号里的代码、带下划线
-/ 驼峰 / 带点的标识符、文件路径、PR 号）筛出的相关 hunk + 全部改动文件的列表 + 剩余预算内的完整 diff，再加上 worker
-的提交摘要、todo 与交接摘要（都标为自述）。它只能收紧：`no` / `partial` → `requirement_reopened(review_missing)`；受阻的
-需求：insufficient_info 给出合理读法 → `requirement_reopened(review_reading)`；environment 给出“不装、不下载任何东西，
-只改这个仓库自己的代码也能做到”的办法 → `requirement_reopened(review_workaround)`（实测：worker 把几条依赖新版编译
-扩展的行为一律报成环境受阻，另一次运行在仓库里做到了）；`yes`、空读法什么都不做。两种重开都计入
-`review_max_reopens`，同一条需求最多被追问一次。check_conflict 不追问（它有引文与失败证据）。
-复查的回复按 `requirements` 键从正文里找 JSON（说明文字里有别的花括号也行，不合法的反斜杠转义宽松处理；正文里没有再
-看思考块），拿不到就把回复开头与 stop_reason 写进日志。一批里没拿到结论的条目各自单条重试一次（`retry_of`）；单条
-还失败就记为 `failed`（未复查），不阻塞：复查者只能收紧，它自己出故障不该反过来卡住 worker；未复查的需求在 submit
-结果与账本（`unreviewed`）里单独列出。
-截止收尾时复查结果只进账本（不重开、不重试）。账本口径（`render.requirement_category`）：verified / reviewed（自报，复查通过）/
-self-reported（复查没跑完或没有复查）/ done-not-delivered / blocked / open。在 SWE-EVO 这类题上，大部分需求会落在
-reviewed：图能提供硬保证的只有“不回归”和“每条需求都被过问过”，需求是不是真做对了，靠的是复查。
+## 8. 数据集适配
 
-**模型停下不调用工具时**（`BelaySession._on_stop`）：第一次在同一个会话里追问一句（“If every requirement is done, call
-submit; otherwise continue working.”）；再次停下就当作提交（`implicit=true`，最后的回复作为摘要），结果作为一条
-system-reminder 交还给它，会话继续；被接受时会话结束。一个会话最多 `max_implicit_submits` 次隐式提交，之后会话结束。
-图的正确性不依赖模型调不调 submit。
+| 数据集 | 回归门 | 主要证据 | 复核者主要做什么 |
+| --- | --- | --- | --- |
+| SWE-EVO | 有 | E3 少量 + E1 为主 | 跑相关测试，逐条对照发布说明读改动；裁决测试冲突 |
+| ProMax | 有 | E3 + 构建通过 | 构建、跑测试、检查跨文件重构是否一致 |
+| LHTB | 无 | E2 | 运行程序、检查产物、按任务描述自测分数（分数不下降是合并标准的一部分） |
 
-### 4.7 todo 与恢复点（模块 H）
+LHTB 的注意事项：工作目录不是 git 仓库也可以（影子仓库在工作区之外，超过 20 MB 的文件不进快照）；交付时工作区检出为
+链头，工作目录之外的产物和被忽略的构建产物不会随之回退——最新快照没被合并时，这些产物可能来自更新的代码；复核者
+运行程序写绝对路径时可能碰到工作区之外的东西（复核目录只隔离相对路径）。
 
-- todo_write 的列表每次立即镜像到图上（`rules.update_todos`）：按标题匹配保持 id 稳定；从列表里删掉的没完成的条目
-  删除，完成的保留；条目文字里的 `R12` 关联到需求，不写也没关系。
-- 新标为 completed 的条目：外壳先强制拍一张锚点快照，写 `todo_completed`；锚点被链上同段、快照序号不小于它的存档
-  包含时写 `todo_anchored`，那个存档标成 todo 存档；回退使锚点不再在链上时写 `todo_invalidated`。
-- todo 提醒（学 Claude Code，`BelaySession._todo_notes`）：第一次改文件时还没有 todo，提醒一次（“todo 是你在上下文被
-  重置后能拿回的进度；简单任务可以不列”）；之后每 `todo_reminder_turns` 轮没更新再提醒，一个会话最多
-  `todo_reminder_max` 次。
-- `queries.resume_point`：基底 = 链头，部分快照 = 最新一张，当前 todo = in_progress 的那条。部分改动默认保留在工作区，
-  开场上下文展示链头 → 最新快照的 diff，并预读链头以来改过的文件和当前 todo 提到的文件。
-- 交接时机（`session._manage_context`）：到软阈值（`handoff_soft_tokens`，默认等于 `l2_tokens`）且有进行中的 todo 时暂缓
-  L2，等下一个自然停顿点再交接：勾掉一条 todo、模型要跑测试（`model_test` 快照）、拿到提交结果；没有进行中的 todo
-  时照旧 L2/L3；硬阈值（`l4_tokens`）照旧强制交接。
+## 9. 恢复
 
-## 5. 分层开场上下文（模块 I）
+与 v7 相同（G1–G7），差别：合并提交的说明由图决定（复核者的标签），容器重建时可以原样重做；正在进行的复核会话在
+runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录随状态目录一起重建。
 
-`build_context`，按顺序：任务原文 → 需求清单索引（只列 actionable 的 id + 摘要，冻结后逐字不变，前缀缓存整次运行都能
-命中）→ 待处理的问题（仍未解决的持续回归与降级、定位结果、诊断、被拒的提交）→ 需求状态（计数；verified 与
-submitted 折叠成区间；open 与 blocked 逐条列出，重开过的带原因）→ 你的 todo → 你的交接摘要（模型写的）与中断前
-最后几个动作 → 工作区（链头、确认点、链头以来的 diff）→ 离开期间（只在恢复时）→ 回归门 → 一句“做完了就调 submit”。
-受保护段：任务原文、需求索引、待处理的问题、todo、摘要、工作区；每段各有上限（`opening_caps`），被折叠的段都留下
-查询入口（`board(...)`、`failure_log`）。v6 的“当前焦点”和“建议顺序”删掉了（`core/suggest.py` 一并删除）。
-`resume_reminder`：原样接上对话时，把待处理的问题、需求状态与离开期间作为 system-reminder 追加。
+## 10. 配置（`core/config.py`，新增与变化）
 
-worker 能看到的工具（13 个）：read_file、edit_file、write_file、list_files、grep_search、bash、todo_write、explore、
-`submit`、`board`（只读：清单与状态、需求详情、存档链、基线失败列表）、`failure_log`、`revert_change`、`waive_check`。
-系统提示里讲 harness 的部分只有四句：后台在存档和测试；有一份需求清单、上下文会被恢复；多步工作列 todo；做完了调
-submit。
+`merge_min_interval_sec`、`merge_todo_interval_sec`、`review_max_turns`、`review_max_sec`、`review_run_timeout_sec`、
+`review_retries`、`review_input_chars`、`review_locate_wait_sec`、`score_tolerance`、`notify_misses`、`reserve_review_sec`。
+取消：`checkpoint_tier`、`deliver_unconfirmed`、`review_batch`、`review_max_reopens`、`labeler`、`label_every`。
 
-## 6. 会话、压缩与交接
-
-| 层 | 触发 | 做什么 |
-| --- | --- | --- |
-| L0 | 单个工具结果超过 `l0_chars` | 全文存附件，上下文保留开头、报错行、结尾和路径 |
-| L1 | 上下文超过 `l1_trigger_tokens`（默认 50 万） | 先只清命令 / 测试输出，保留 `read_file`；仍超过再一起清 |
-| L2 | 上下文超过 `l2_tokens`（默认 70 万），且没有进行中的 todo | 旧对话 → `build_context(mode=compaction)` + 最近一段原文 + 重读最近改过的文件 |
-| L3 | L2 之后仍超过目标 | 模型只写图里没有的东西，摘要入图 |
-| L4 | 软阈值后的下一个自然停顿点，或超过 `l4_tokens`（默认 76 万），或压缩次数达到上限 | 交接摘要；结束会话；新会话从恢复点开始 |
-
-会话的结束原因：submitted（提交被接受）| done（不调用工具，隐式提交用完或追问关闭）| handoff | deadline | max_turns |
-crash | stuck | runtime_crash。`next_step`：提交被接受 → 收尾；截止预留 → 收尾；连续 `max_idle_sessions` 个会话没有进展
-→ 收尾；连续崩溃 → 收尾；有提交或前台存档在判定 → 等；会话结束了但没有提交 → 开新会话。
-
-每条追加进对话的消息都写进轨迹（`message` 记录），整体替换（开场、L1–L3、提醒）时写 `messages_checkpoint`（blob）：
-读盘重放 = 最后一个 checkpoint + 之后的 message 记录，没有结果的 `tool_use` 补一条“中断，效果未知”。
-
-## 7. 恢复（模块 G）
-
-| 中断 | 做法 |
-| --- | --- |
-| 会话崩溃（模型接口多次重试仍失败），runtime 仍在 | 内存重试：`ModelCallFailed` → 退避 → 原样再调用，附上离开期间的变化（`session_resumed(memory)`）；上下文本身的问题（400 / 413 / “too long”）或连续失败达到 `resume_max_failures` 改开新会话 |
-| runtime 进程崩溃，容器仍在 | `reconcile`：CAS 对账；有完成标记的作业补收结果，进程组还活着的重新接上（G5），其余记 unknown 重跑；停机不超过 `resume_max_downtime_sec` 且轨迹读得出来就读盘重放（`session_resumed(replay)`），否则开新会话 |
-| 容器 / 工作区 / 影子仓库丢失 | `resume(rebuild=True)`：从原始代码重建 0 号存档（树与提交必须一致）→ 按顺序 unbundle → 最后一次导出之后的快照记为 lost；丢了提交的存档按确定的提交重做，连树都没有就截链 → 恢复引用 → 工作区检出为最新一张已导出快照的原样树 → 重跑破坏探针 → `runtime_recovered(rebuilt=true)` |
-
-- 镜像（G3）：每张快照、每个存档都有 ref；`driver.mirror` 按节奏（每 `mirror_every` 张快照、每个里程碑存档、会话结束、
-  交付、挂起）导出增量 bundle（`git bundle create <新 ref> ^<上次已导出的提交>`，以 0 号基线提交为前提），经 base64 分段
-  传回宿主机 `run_dir/git/<n>.bundle`；已导出的 ref 记在事件库的 meta 里。增量 bundle 累积到 `mirror_consolidate` 份时
-  合并成一份完整的 `<n>-full.bundle`，旧文件删除。非里程碑存档（后台自动存档）不单独触发导出：它的树就是某张快照的候选树，提交是确定的，
-  重建时按原来的父提交与日期原样重做。补丁镜像 `checkpoints/<k>.diff` 也只写里程碑。
-- 恢复的第一步是补拍一张 `recover` 快照（G7）；离开期间的变化（G1）进入开场。
-- 外层调度：`BelayRun.suspend()` = 强制快照 → 导出 bundle → 会话以 suspended 结束 → `run_suspended`。
-
-## 8. 不变量（`core/invariants.py`）
-
-1. 事件序号连续；快照序号从 1 连续。
-2. 冻结后至少有一条 actionable 需求；context 需求永远是 open；verified 的需求，其证据检查在它的存档那棵树上全部
-   PASSED；verified / submitted 的需求所在的存档在链上；submitted 的需求来自一次存在的提交。
-3. 每个 worker 至多一个在判定中的提交。
-4. 存档链从链头沿 parent 能走回 0 号；链上存档的快照序号严格递增；每个非基线存档来自一个没有回归的尝试；
-   `confirmed` 等于链头最近的确认祖先；没有既确认又降级的存档。
-5. anchored 的 todo，其锚点快照被链上某个同段存档包含。
-6. 同一时刻最多一个尝试处于 advancing；每个 worker 前台、后台尝试各至多一个；同一个作业键最多一个非 unknown 作业。
-7. 来源纪律（§2）；交付后封口。
-
-## 9. 与计划的差异和补充决定（需要时可以改回）
-
-- 回归门豁免：允许在有引文和失败证据时豁免具体的测试，代价是门不再完全由基线决定，所以每条豁免都进账本。
-- 提交被接受后已经复查通过的需求，之后的提交不再复查（只复查新提交的、还没复查过的）。
-- 试过让复查者列出“需求没要求的原有行为改动”并软退回一次（v7.2）：在发布说明类题上它把需求本身的效果也当成副作用，
-  worker 照着改，只添乱，已撤掉。系统提示里“保持原有行为”那句同样没有效果，也撤掉了。
-- 后台被拒的回归只在连续两次出现时才追查；改成一次就追查会把大量中间态送去定位，太吵。
-- `rollback` 不再是工具；规则保留给恢复流程（容器重建后链上的存档丢了）。worker 用 `revert_change` 撤销定位出的改动。
-- 规划器只产出需求清单（没有任务、依赖、优先级、拆分）；停滞时只给提示，不再重新规划。
-- 降级模式下不做规则定位（二分作业会切换工作区）；后台只验证交接快照。
-- 评测接入：`eval/agents/belay_agent.py`。准备（`prepare`）放在评测框架的 setup 阶段，`clock_started` 让预算从 run
-  阶段开始计时；被取消时 `emergency_deliver` 不经过规则，直接按图把工作区检出为交付点。
-
-## 10. 测试（`python -m pytest -q`，不需要容器和模型）
+## 11. 测试（`python -m pytest -q`，不需要容器和模型）
 
 | 要求 | 测试 |
 | --- | --- |
-| 事件、推导、非法转换 | `tests/unit/test_reduce.py` |
-| 规则：后台验证最新快照、新快照胜出、需求随检查项验证、提交（判定、证据失败、受阻、复查批次与上限、单条重试、环境受阻追问、截止）、todo 与锚点、提升 / 降级 / 交付一致性、二分、追查提交与后台持续回归、回归门豁免、停滞、DONE 的条件 | `tests/unit/test_rules.py` |
-| 重放一致性（提交、复查、todo、后台验证、定位、诊断、回退、抢占……随机驱动 40 个种子） | `tests/unit/test_replay.py` |
-| 分层开场：段顺序、前缀稳定、重开原因、300 需求 / 100 会话仍在预算内、board 过滤 | `tests/unit/test_context.py` |
-| 外壳辅助：traceback 截取、sys.path 映射、L1 保留读取、读盘重放、离开期间上限 | `tests/unit/test_runtime_helpers.py` |
-| 端到端：提交被接受、复查交还清单、复查失败单条重试、追问后隐式提交、回归被拒、交接、内存重试 / 读盘重放、截止交付 | `tests/integration/test_belay_run.py` |
-| 长程：导入隔离、降级、验证与编辑并发、抢占、被拒信息与撤销、重新接上作业、从 bundle 重建、todo 停顿点交接、中途被杀、诊断者与复查者 | `tests/integration/test_long_run.py` |
+| 事件、推导、非法转换、v7 日志被拒 | `tests/unit/test_reduce.py`、`test_rules.py::test_v7_logs_are_refused_with_a_clear_error` |
+| 合并请求（节流、交接与 todo、回归门、复核）、证据等级校验、单调（已完成不退回、E3 测试、分数）、豁免由复核者裁决、复核失败的重试与降级、只判定的复核、受阻的裁决、没有回归门的路径、收尾、DONE 的条件 | `tests/unit/test_rules.py` |
+| 重放一致性（随机复核结论：失败、格式坏、豁免、分数、各种等级） | `tests/unit/test_replay.py` |
+| 开场、等级与缺失项、board | `tests/unit/test_context.py` |
+| 端到端：复核会话（真实的复核目录与工具）、E2、复核失败、回归被拒、后台不批准的提醒、交接、恢复、截止 | `tests/integration/test_belay_run.py`、`test_long_run.py` |
+| 评测接入：没有 gate 时复核者与分数 | `tests/integration/test_flat_agent.py`（需要 pier） |

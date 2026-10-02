@@ -15,7 +15,7 @@ from belay.core.model import Graph
 class Effect:
     kind: str                         # launch_job | advance_ref | mirror_checkpoint | restore_workspace | deliver |
     args: dict = field(default_factory=dict)   # stop_workers | cancel_orphans | locate_diff | diagnose | review |
-    #                                            label_checkpoint
+    #                                            cancel_review
 
 
 def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
@@ -23,12 +23,9 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
     for e in events:
         if e.type == "job_started":
             out.append(Effect("launch_job", {"job": e.get("job")}))
-        elif e.type == "checkpoint_advancing":
+        elif e.type == "merge_advancing":
             out.append(Effect("advance_ref", {"attempt": e.get("attempt")}))
-        elif e.type == "checkpoint_created" and int(e.get("checkpoint")) > 0:
-            out.append(Effect("mirror_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
-            out.append(Effect("label_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
-        elif e.type == "checkpoint_marked":
+        elif e.type == "merged" and int(e.get("checkpoint")) > 0:
             out.append(Effect("mirror_checkpoint", {"checkpoint": int(e.get("checkpoint"))}))
         elif e.type == "rollback":
             out.append(Effect("restore_workspace", {"worker": e.get("worker"), "checkpoint": int(e.get("to")),
@@ -37,7 +34,7 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
             out.append(Effect("deliver", {"checkpoint": e.get("checkpoint"), "status": e.get("status")}))
         elif e.type == "deadline_reserve":
             out.append(Effect("stop_workers", {"reason": "deadline"}))
-        elif e.type == "attempt_superseded":
+        elif e.type == "merge_superseded":
             out.append(Effect("cancel_orphans", {"attempt": e.get("attempt")}))
         elif e.type == "locate_concluded":
             out.append(Effect("locate_diff", {"locate": e.get("locate"), "groups": len(e.get("groups") or ())}))
@@ -45,4 +42,6 @@ def effects_for(events: Iterable[Event], g: Graph) -> list[Effect]:
             out.append(Effect("diagnose", {"diagnosis": e.get("diagnosis")}))
         elif e.type == "review_started":
             out.append(Effect("review", {"review": e.get("review")}))
+        elif e.type == "review_cancelled":
+            out.append(Effect("cancel_review", {"review": e.get("review")}))
     return out

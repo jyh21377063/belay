@@ -1,4 +1,5 @@
-"""重放一致性：用随机的请求序列驱动规则（作业乱序完成、作业丢失、CAS 失败、提交、复查、todo、回退、会话起止……），检查
+"""重放一致性：用随机的请求序列驱动规则（作业乱序完成、作业丢失、CAS 失败、提交、复核结论（含失败、格式坏、
+豁免、分数）、todo、回退、会话起止……），检查
 
   1. 每个事务之后不变量成立（模拟器里做）；日志满足来源纪律与序号连续；
   2. replay(日志) == 实时维护的图；
@@ -21,7 +22,7 @@ from belay.core.model import graph_from_json, to_json
 from belay.core.queries import chain
 from belay.core.reduce import replay
 from belay.core.rules import Rejected
-from tests.sim import Sim
+from tests.sim import MANUAL, Sim
 
 ADD, MUL, Z, W, V = ("tests/test_mod.py::test_add", "tests/test_mod.py::test_mul", "tests/test_other.py::test_z",
                      "tests/test_other.py::test_w", "tests/test_other.py::test_v")
@@ -47,8 +48,10 @@ def drive(seed: int, steps: int = 200):
     cfg = BelayConfig(stall_no_progress_sec=900, reserve_min_sec=60, confirm_regressions=rnd.random() < 0.7,
                       locate=rnd.random() < 0.9, locate_max_steps=rnd.choice([3, 8]),
                       background=rnd.choice(["latest", "latest", "latest", "handoff", "off"]),
-                      review_batch=rnd.choice([1, 5]), review_max_reopens=rnd.choice([1, 2]))
-    s = Sim(BASE, cfg=cfg, auto_jobs=False, auto_located=rnd.random() < 0.8)
+                      reviewer=rnd.random() < 0.85, review_retries=rnd.choice([0, 1]),
+                      merge_min_interval_sec=rnd.choice([0, 0, 300, 600]), merge_todo_interval_sec=rnd.choice([0, 100]),
+                      waive_max_tests=rnd.choice([1, 20]), stall_same_failure=rnd.choice([2, 3]))
+    s = Sim(BASE, cfg=cfg, auto_jobs=False, auto_located=rnd.random() < 0.8, reviewer=MANUAL)
     s.setup(TASK, PLAN, budget=rnd.choice([1500, 20000]))
     s.do(R.start_session, "w1", "first", {})
     snapshots = [(s.g.seq, s.g)]
@@ -74,19 +77,22 @@ def drive(seed: int, steps: int = 200):
         return [{"content": c, "status": rnd.choice(["pending", "in_progress", "completed"])} for c in items]
 
     ops = ["submit", "submit", "submit_head", "job", "job", "job", "job", "job", "job", "tick", "session", "rollback",
-           "cas_fail", "snap", "snap", "snap", "snap", "todos", "todos", "diagnosis", "review_result",
-           "review_result", "locate_diff", "promote", "waive"]
+           "cas_fail", "snap", "snap", "snap", "snap", "todos", "todos", "diagnosis", "review", "review", "review",
+           "locate_diff"]
     for _ in range(steps):
         op = rnd.choice(ops)
         try:
             if op == "submit":
-                blocked = []
+                blocked, waivers = [], []
                 if rnd.random() < 0.2:
                     blocked = [{"requirement": rnd.choice(["R2", "R3", "R4", "R1"]),
                                 "kind": rnd.choice(R.BLOCK_KINDS), "reason": "stuck",
                                 "quote": "Also make mul handle negative numbers correctly."}]
+                if rnd.random() < 0.35:
+                    waivers = [{"tests": [rnd.choice([MUL, Z, W])], "reason": "old behaviour",
+                                "quote": "make mul handle negative numbers correctly"}]
                 s.submit(new_tree() if rnd.random() < 0.85 else s.g.head_cp.tree, files=rnd.choice(FILES),
-                         testable=rnd.random() < 0.95, blocked=blocked)
+                         testable=rnd.random() < 0.95, blocked=blocked, waivers=waivers)
             elif op == "submit_head":
                 n = s.snap(s.g.head_cp.tree, files=rnd.choice(FILES), reason="submit")
                 s.do(R.request_submit, "w1", n, "on the head")
@@ -122,23 +128,36 @@ def drive(seed: int, steps: int = 200):
                     s.do(R.record_diagnosis, d.id, {"suspects": [{"file": "pkg/mod.py"}],
                                                     "intentional": {"likely": rnd.random() < 0.5,
                                                                     "quote": rnd.choice(["nope", TASK[20:50]])}})
-            elif op == "review_result":
+            elif op == "review":
                 for v in [v for v in s.g.reviews.values() if v.status == "running"][:1]:
-                    res = {}
-                    for rid in v.requirements:
-                        if rnd.random() < 0.9:
-                            res[rid] = {"implemented": rnd.choice(["yes", "no", "partial", "maybe"]),
-                                        "missing": ["m"], "reading": rnd.choice(["", "a reading"])}
-                    s.review(v.id, res)
+                    r = rnd.random()
+                    if r < 0.12:
+                        s.review(v.id, None, failed=True)
+                    elif r < 0.18:
+                        s.review(v.id, {"garbage": True})
+                    else:
+                        items = []
+                        for rid in rnd.sample(["R1", "R2", "R3", "R4", "R9"], rnd.randint(0, 4)):
+                            items.append({"id": rid, "status": rnd.choice(["done", "partial", "not_done", "blocked",
+                                                                           "maybe"]),
+                                          "level": rnd.choice(["E0", "E1", "E2", "E3", "E7"]),
+                                          "tests": rnd.sample([ADD, MUL, Z, V], rnd.randint(0, 2)),
+                                          "runs": rnd.choice([[], ["X1"], ["X5"]]), "missing": ["m"],
+                                          "regressed": rnd.random() < 0.3, "reason": "r"})
+                        waivers = []
+                        gate = [x.rsplit(" (", 1)[0] for x in v.gate.get("regressions") or []]
+                        if rnd.random() < 0.6:
+                            waivers = [{"tests": gate if gate and rnd.random() < 0.7 else [rnd.choice([MUL, Z, W])],
+                                        "reason": "contradicts",
+                                        "quote": rnd.choice(["make mul handle negative numbers correctly", "nope"])}]
+                        s.review(v.id, {"merge": rnd.random() < 0.8, "reason": "r", "summary": "s",
+                                        "requirements": items, "waivers": waivers,
+                                        "score": rnd.choice([None, None, rnd.random()]), "feedback": "f"},
+                                 runs=rnd.choice([[], [{"id": "X1", "cmd": "c", "rc": 0}]]))
             elif op == "locate_diff":
                 for loc in [l for l in s.g.locates.values() if l.status == "concluded"][:1]:
                     for i in range(len(loc.groups)):
                         s.do(R.record_located, loc.id, i, [("pkg/mod.py", 1, 1)], None)
-            elif op == "promote":
-                s.do(R.schedule_promotion)
-            elif op == "waive":
-                s.do(R.waive_checks, "w1", [rnd.choice([MUL, Z, W])], "make mul handle negative numbers correctly",
-                     "the old test asserts the old behaviour", rnd.choice([None, "R2"]))
         except Rejected:
             pass
         s.ref_ok = True if rnd.random() < 0.7 else s.ref_ok
@@ -180,20 +199,22 @@ def test_fuzz_actually_exercises_the_rules():
     types: set[str] = set()
     reasons: set[str] = set()
     statuses: set[str] = set()
+    levels: set[str] = set()
     for seed in range(40):
         s, _ = drive(seed)
         types |= {e.type for e in s.log}
-        reasons |= {e.get("reason") for e in s.log if e.type in ("requirement_reopened", "checkpoint_rejected")}
+        reasons |= {e.get("reason") for e in s.log if e.type in ("requirement_judged", "merge_rejected")}
         statuses |= {e.get("status") for e in s.log if e.type == "submit_updated"}
-    must = {"requirement_verified", "requirement_submitted", "requirement_blocked", "requirement_reopened",
-            "todos_updated", "todo_completed", "todo_anchored", "todo_invalidated", "submit_requested",
-            "submit_updated", "checkpoint_attempted", "checkpoint_advancing", "checkpoint_created",
-            "checkpoint_rejected", "rollback", "stall_detected", "job_started", "job_finished", "session_started",
-            "session_ended", "snapshot_taken", "deadline_reserve", "delivered", "attempt_superseded",
-            "checkpoint_confirmed", "checkpoint_demoted", "locate_started", "locate_concluded", "regression_located",
-            "diagnosis_requested", "diagnosis_recorded", "review_started", "review_recorded",
-            "persistent_regression", "finalize_started", "job_preempted", "checkpoint_marked", "check_waived"}
+        levels |= {e.get("level") for e in s.log if e.type == "requirement_judged" and e.get("status") == "done"}
+    must = {"requirement_judged", "todos_updated", "todo_completed", "todo_anchored", "todo_invalidated",
+            "submit_requested", "submit_updated", "merge_requested", "merge_advancing", "merged", "merge_rejected",
+            "merge_superseded", "rollback", "stall_detected", "job_started", "job_finished", "session_started",
+            "session_ended", "snapshot_taken", "deadline_reserve", "delivered", "locate_started", "locate_concluded",
+            "regression_located", "diagnosis_requested", "diagnosis_recorded", "review_started", "merge_reviewed",
+            "review_decided", "review_cancelled", "waiver_granted", "persistent_regression", "finalize_started",
+            "job_preempted"}
     assert must <= types, must - types
-    assert {"regression", "cas_conflict", "precheck", "review_missing", "review_reading", "rolled_back"} <= reasons, \
-        reasons
-    assert {"reviewing", "accepted", "returned"} <= statuses, statuses
+    assert {"regression", "cas_conflict", "precheck", "review", "rolled_back", "reassessed", "self_report",
+            "requirement_regression"} <= reasons, reasons
+    assert {"accepted", "returned"} <= statuses, statuses
+    assert {"E0", "E1", "E2", "E3"} <= levels, levels

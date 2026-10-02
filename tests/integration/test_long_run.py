@@ -1,7 +1,8 @@
 """长程场景的端到端测试（LocalEnv + ScriptedLLM + 真实 git / pytest，不需要容器和模型）。
 
   模块 A  验证槽位：验证进行中 worker 修改同一文件不丢；导入隔离（破坏探针、sys.path 映射、基线双跑）；抢占
-  模块 B  自动快照与后台存档（在 test_belay_run 里也覆盖）
+  模块 B  自动快照与后台合并请求（在 test_belay_run 里也覆盖）
+  模块 E、F  诊断者只解释；复核者判定并给出反馈
   模块 D  被拒信息：原因、failure_log、定位与只撤销这一段
   模块 G  runtime 重启时重新接上仍在运行的作业；删掉影子仓库与工作区后 resume --rebuild
   模块 H  到软阈值后等下一个自然停顿点（勾掉 todo）再交接；恢复后开场带 todo 与部分改动
@@ -17,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from belay.core.config import BelayConfig
-from belay.core.invariants import check, check_log
+from belay.core.invariants import check, check_log, llm_effects
 from belay.core.model import Job
 from belay.core.reduce import replay
 from belay.env import LocalEnv
@@ -29,6 +30,7 @@ from belay.runtime.verifier import RunnerVerifier, VerifierSpec
 from tests.integration.test_belay_run import (ADD, ADD_SUB, BLOCK_SUB, FIX_ADD, MUL, PLANNER, READ, SPEC, SUBMIT,
                                               TASK, assert_sub_blocked, call, first_message, results, say,
                                               tool_outputs, tu)
+from tests.integration.fakes import FakeAux
 
 MOD = "def add(a, b):\n    return a - b\n\n\ndef mul(a, b):\n    return a * b\n"
 TESTS = ("from pkg.mod import add, mul\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\n"
@@ -65,8 +67,9 @@ class H:
         self.logs: list[str] = []
 
     def make(self, llm, cls=BelayRun, **kw) -> BelayRun:
+        self.aux = kw.pop("aux", None) or FakeAux()
         return cls(llm, LocalEnv(str(self.repo)), self.settings, self.cfg, self.spec,
-                   aux_llm=kw.pop("aux", ScriptedLLM([])), log=self.logs.append, **kw)
+                   aux_llm=self.aux, log=self.logs.append, **kw)
 
     def events(self):
         store = EventStore(self.settings.run_dir)
@@ -79,7 +82,7 @@ class H:
         events = self.events()
         g = replay(events)
         assert g == run.rt.graph
-        assert not check(g) and not check_log(events)
+        assert not check(g) and not check_log(events) and not llm_effects(events)
         return events
 
 
@@ -176,7 +179,7 @@ def test_degraded_mode_has_no_background_verification(tmp_path):
     g = run.rt.graph
     assert g.degraded
     assert_sub_blocked(run, res)
-    assert all(a.lane == "fg" for a in g.attempts.values())             # 编辑之后没有后台存档（只验证交接快照）
+    assert all(a.lane == "fg" for a in g.attempts.values())             # 编辑之后没有后台合并（只在交接时）
     assert all(j.where in ("workspace", "live") for j in g.jobs.values() if j.purpose != "baseline")
     h.verify_log(run)
 
@@ -203,8 +206,8 @@ def test_worker_edits_during_verification_are_not_lost(tmp_path):
     first = g.checkpoints[1]
     shown = subprocess.run(["git", f"--git-dir={h.settings.git_dir}", "show", f"{first.tree}:pkg/mod.py"],
                            capture_output=True, text=True).stdout
-    assert "return a + b" in shown and "def sub" not in shown             # 结果记在它验证的那棵树上
-    assert first.kind == "todo" and first.label == "fix add" and g.todos["P1"].status == "anchored"
+    assert "return a + b" in shown and "def sub" not in shown             # 结果记在它复核的那棵树上
+    assert first.review is not None and g.todos["P1"].status == "anchored" and g.todos["P1"].checkpoint == 1
     h.verify_log(run)
 
 
@@ -306,7 +309,7 @@ class CrashDuringJob(BelayRun):
 
     async def _eff_launch_job(self, job: str) -> None:
         j = self.rt.graph.jobs[job]
-        if j.purpose == "verify":
+        if j.purpose == "gate":
             await self.verifier.setup()
             slot = self.verifier.slots[0]
             await self.verifier.launch(j, self.verifier.runner_spec(j, slot, 4))   # 作业进程已经起来了
@@ -344,7 +347,7 @@ def test_runtime_restart_reattaches_a_running_job(tmp_path):
     rec = next(e for e in events if e.type == "runtime_recovered")
     assert run.rt.graph.sessions["S1"].resumes == ("replay",)                   # 会话也原样接上
     assert any(j.get("reattached") for j in rec.get("reconciled")["jobs"])        # 重新接上，而不是重跑
-    verify = [e for e in events if e.type == "job_started" and e.get("purpose") == "verify"]
+    verify = [e for e in events if e.type == "job_started" and e.get("purpose") == "gate"]
     assert len({e.get("key") for e in verify}) == len(verify)
     assert not [e for e in events if e.type == "job_finished" and e.get("state") == "unknown"]
 
@@ -408,7 +411,7 @@ def test_rebuild_from_bundles_after_losing_the_container_state(tmp_path):
                         == 0 for s in kept)
     text = (h.repo / "pkg/mod.py").read_text()
     assert "return a + b" in text and "def sub(a, b)" in text               # 工作区 = 最新一张已导出快照
-    assert_sub_blocked(run, res)
+    assert res.status == "DONE" and g.requirements["R3"].status == "done"   # sub 已经在：复核者不认可“受阻”
 
 
 # ======================================================================== 模块 H：交接落在自然停顿点
@@ -487,71 +490,69 @@ def test_killed_mid_work_resumes_with_todos_and_partial_diff(tmp_path):
     h.verify_log(run)
 
 
-# ======================================================================== 模块 E、F：诊断者与复查者（LLM 只能解释、只能收紧）
+# ======================================================================== 模块 E、F：诊断者只解释，复核者判定并给出反馈
 
-class RoleLLM:
-    """按系统提示区分角色的假模型：复查者第一次说没做完，诊断者给出结构化结论，标签给一行说明。"""
-
-    def __init__(self):
-        self.calls: list[str] = []
-        self.reviews = 0
-
-    async def call(self, system, tools, messages, tool_choice=None):
-        from belay.llm import Response
-        from belay.runtime import prompts as PR
-        body = json.dumps(messages)[:200000]
-        if system == PR.REVIEW_SYSTEM:
-            self.calls.append("review")
-            self.reviews += 1
-            assert "Requirements to review" in body and "def sub" not in body or self.reviews > 1
-            ids = sorted(set(re.findall(r"- (R\d+): ", messages[0]["content"])))
-            text = json.dumps({"requirements": [{"id": i, "implemented": "no" if self.reviews == 1 else "yes",
-                                                 "missing": ["sub() is not defined"], "evidence": []} for i in ids]})
-        elif system == PR.DIAGNOSE_SYSTEM:
-            self.calls.append("diagnose")
-            assert "test_mul" in body and "Located change" in body              # 输入来自图：测试源码、定位出的 diff
-            text = json.dumps({"suspects": [{"file": "pkg/mod.py", "hunk": "@@", "confidence": 0.9,
-                                             "reason": "mul now adds"}],
-                               "intentional": {"likely": True, "requirement": "R2", "quote": "not in the task"},
-                               "suggestion": "restore a * b", "flaky_suspect": False})
-        elif system == PR.LABEL_SYSTEM:
-            self.calls.append("label")
-            text = "fixed add"
-        else:
-            self.calls.append("other")
-            text = "summary"
-        return Response([{"type": "text", "text": text}], "end_turn")
-
-
-def test_diagnoser_and_reviewer_only_explain_or_tighten(tmp_path):
+def test_diagnoser_explains_and_the_reviewer_judges(tmp_path):
     h = H(tmp_path, BelayConfig(confirm_regressions=False))
     break_mul = tu("bm", "edit_file", file_path="pkg/mod.py", old_string="return a * b", new_string="return a + b + 0")
     fix_mul = tu("fm", "edit_file", file_path="pkg/mod.py", old_string="return a + b + 0", new_string="return a * b")
     llm = ScriptedLLM([PLANNER, call(READ), call(break_mul), call(tu("c", "submit", summary="try")),
                        call(tu("w", "bash", command="sleep 1")), call(READ), call(fix_mul), call(FIX_ADD),
                        call(SUBMIT), call(READ), call(ADD_SUB), call(SUBMIT)])
-    aux = RoleLLM()
+    aux = FakeAux()
     run = h.make(llm, aux=aux)
     res = asyncio.run(run.start(TASK))
     g = run.rt.graph
     d = next(iter(g.diagnoses.values()))
     assert d.status == "recorded" and d.result["intentional"]["likely"] is False   # 引文不在原文里：丢弃这一项
+    diag_in = next(r for r in aux.requests if r["system"].startswith("You explain"))
+    assert "test_mul" in json.dumps(diag_in["messages"]) and "Located change" in json.dumps(diag_in["messages"])
     notices = json.dumps([r["messages"][-1]["content"] for r in llm.requests])
     assert "Diagnosis of tests/test_mod.py::test_mul" in notices and "restore a * b" in notices
-    returned = [o for o in tool_outputs(run, "submit") if "not accepted yet" in o]
+    returned = [o for o in tool_outputs(run, "submit") if "still open" in o]
     assert returned and "sub() is not defined" in returned[0]
     r3 = g.requirements["R3"]
-    assert r3.status == "submitted" and r3.review_reopens == 1 and aux.reviews == 1   # 第二次提交不再复查
+    assert r3.status == "done" and r3.level == "E1"
+    last = aux.openings[-1]
+    assert "def sub" in last and "missing last time: sub() is not defined" in last   # 复核者看到账本与这次的改动
     events = h.verify_log(run)
     llm_events = [e for e in events if e.source == "llm" and e.type not in ("plan_proposed", "compacted")]
-    assert {e.type for e in llm_events} <= {"diagnosis_recorded", "review_recorded", "checkpoint_labeled"}
+    assert {e.type for e in llm_events} <= {"diagnosis_recorded", "merge_reviewed"}
     assert res.status == "DONE"
 
 
+def test_reviewer_rejection_in_the_background_is_reported_to_the_worker(tmp_path):
+    def policy(opening, review_dir):
+        mod = (review_dir / "pkg" / "mod.py").read_text()
+        if "print(" in mod:
+            return {"merge": False, "reason": "debug print left in add()", "requirements": [],
+                    "feedback": "remove the print from add()"}
+        from tests.integration.fakes import oracle
+        return oracle(opening, review_dir)
+    h = H(tmp_path, BelayConfig(merge_min_interval_sec=0))
+    noisy = tu("n", "edit_file", file_path="pkg/mod.py", old_string="return a - b",
+               new_string="print('debug')\n    return a + b")
+    quiet = tu("q", "edit_file", file_path="pkg/mod.py", old_string="print('debug')\n    return a + b",
+               new_string="return a + b")
+    llm = ScriptedLLM([PLANNER, call(READ), call(noisy), call(tu("w", "bash", command="sleep 3")),
+                       call(tu("w2", "bash", command="sleep 1")), call(quiet), call(ADD_SUB), call(SUBMIT)])
+    run = h.make(llm, aux=FakeAux(policy))
+    res = asyncio.run(run.start(TASK))
+    assert res.status == "DONE"
+    notices = json.dumps([r["messages"][-1]["content"] for r in llm.requests])
+    assert "The reviewer did not merge your snapshot" in notices and "remove the print from add()" in notices
+    g = run.rt.graph
+    assert any(a.reason == "review" and a.lane == "bg" for a in g.attempts.values())
+    patch = (Path(h.settings.run_dir) / "deliverable.diff").read_text()
+    assert "print(" not in patch
+    h.verify_log(run)
+
+
 def test_bundles_are_consolidated_and_restore_every_checkpoint(tmp_path):
-    """G3：增量 bundle 够数后合并成一份完整的；只用宿主机上的 bundle 就能还原全部快照与存档，
-    后台存档的提交可以从快照的树原样重做。"""
-    h = H(tmp_path, BelayConfig(mirror_consolidate=2, mirror_every=1, snapshot_bash_every=1))
+    """G3：增量 bundle 够数后合并成一份完整的；只用宿主机上的 bundle 就能还原全部快照与合并点，
+    合并点的提交可以从快照的树原样重做（提交说明由图决定）。"""
+    h = H(tmp_path, BelayConfig(mirror_consolidate=2, mirror_every=1, snapshot_bash_every=1,
+                                merge_min_interval_sec=0))
     edit = lambda i, a, b: tu(f"e{i}", "edit_file", file_path="pkg/mod.py", old_string=a, new_string=b)  # noqa: E731
     wait = lambda i: call(tu(f"w{i}", "bash", command="sleep 1.5"))        # noqa: E731
     llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), wait(1),
@@ -593,13 +594,13 @@ def test_prepare_then_run_starts_the_budget_clock_late(tmp_path):
 
     async def prepare():
         run = BelayRun(ScriptedLLM([PLANNER]), LocalEnv(str(h.repo)), h.settings, h.cfg, h.spec,
-                       aux_llm=ScriptedLLM([]), clock=lambda: 1000.0, log=h.logs.append)
+                       aux_llm=FakeAux(), clock=lambda: 1000.0, log=h.logs.append)
         await run.prepare(TASK)
         run.store.close()
 
     async def run_phase():
         llm = ScriptedLLM([call(READ), call(FIX_ADD), call(BLOCK_SUB)])
-        run = BelayRun(llm, LocalEnv(str(h.repo)), h.settings, h.cfg, h.spec, aux_llm=ScriptedLLM([]),
+        run = BelayRun(llm, LocalEnv(str(h.repo)), h.settings, h.cfg, h.spec, aux_llm=FakeAux(),
                        log=h.logs.append)
         assert run.prepared(TASK) and not run.prepared(TASK + " more")
         return run, await run.run_prepared()

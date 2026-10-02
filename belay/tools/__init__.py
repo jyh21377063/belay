@@ -1,7 +1,7 @@
 """工具注册表。
 
 DEFAULT_TOOLS 是 B 组（FlatAgent）的工具集；BELAY_TOOLS = B 组的工具，其中 submit 换成 Belay 的版本（提交后由
-runtime 判定需求、复查，必要时把还没做完的清单交还 worker），再加 board 与几个反应式工具（见 belay/tools/belay.py）。
+runtime 发起合并请求、由复核者判定需求，必要时把还没做完的清单交还 worker），再加 board 与几个反应式工具（见 belay/tools/belay.py）。
 """
 from __future__ import annotations
 

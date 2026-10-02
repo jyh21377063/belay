@@ -7,7 +7,7 @@ from belay.core import rules as R
 from belay.core.config import BelayConfig
 from belay.core.context import PROTECTED, build_context, resume_reminder
 from belay.core.render import render_board
-from tests.sim import Sim
+from tests.sim import MANUAL, Sim, judge
 
 A, B = "tests/test_a.py::test_a", "tests/test_b.py::test_b"
 BASE = {A: "FAILED", B: "PASSED"}
@@ -64,20 +64,25 @@ def test_prefix_is_stable_when_requirement_status_changes():
     after = build_context(s.g, "w1", 100_000, s.now, s.cfg, mode="first").text
     cut = before.index("## Requirement status")
     assert after[:cut] == before[:cut]                       # 任务原文 + 需求索引逐字不变（前缀缓存）
-    assert "blocked" not in after[:cut] and "R4 [blocked]" in after[cut:]
+    assert "blocked" not in after[:cut] and "R4 [blocked, self-reported]" in after[cut:]
 
 
-def test_reopened_requirements_show_why():
-    s = sim(cfg=BelayConfig(background="off"))
+def test_judged_requirements_show_level_and_what_is_missing():
+    s = Sim(BASE, cfg=BelayConfig(background="off"), reviewer=MANUAL)
+    s.setup(TASK, PLAN)
+    s.do(R.start_session, "w1", "first", {})
     s.world.define("t1", {})
     s.submit("t1")
-    s.review("V1", {"R3": {"implemented": "no", "missing": ["feature two is not registered"]},
-                    "R4": {"implemented": "yes"}, "R5": {"implemented": "yes"}})
+    vid = next(iter(s.g.reviews))
+    s.review(vid, judge(True, {"R3": {"status": "partial", "level": "E1", "missing": ["feature two is not "
+                                                                                       "registered"]},
+                               "R4": ("done", "E1"), "R5": {"status": "done", "level": "E2", "runs": ["X1"]}})(
+        s, s.g.reviews[vid]))
     text = build_context(s.g, "w1", 100_000, s.now, s.cfg, mode="resume").text
     sec = text.split("## Requirement status")[1].split("\n## ")[0]
-    assert "R2 [open]" in sec and f"{A} (FAILED)" in sec                 # 证据失败
-    assert "R3 [open, reopened]" in sec and "feature two is not registered" in sec
-    assert "Submitted earlier: R4–R5" in sec
+    assert "R2 [open]" in sec
+    assert "R3 [open, judged partial]" in sec and "feature two is not registered" in sec
+    assert "Done (E2): R5" in sec and "Done (E1): R4" in sec
 
 
 def test_big_graph_keeps_protected_sections_within_budget_and_folds_the_rest():
@@ -114,10 +119,10 @@ def test_board_filters_and_pagination():
     assert "Requirements: open 4" in out and "board(requirement=" in out and "R1" not in out
     assert "R3 [open]" in render_board(s.g, "w1", s.now, s.cfg, status="open")
     detail = render_board(s.g, "w1", s.now, s.cfg, requirement="R2")
-    assert "Task text:" in detail and A in detail and "decide when it is verified" in detail
+    assert "Task text:" in detail and A in detail and "Linked checks" in detail
     assert "context, not on the checklist" in render_board(s.g, "w1", s.now, s.cfg, requirement="R1")
     assert "fail on the original code" in render_board(s.g, "w1", s.now, s.cfg, view="failures")
-    assert "Checkpoint chain" in render_board(s.g, "w1", s.now, s.cfg, view="checkpoints")
+    assert "Merge chain" in render_board(s.g, "w1", s.now, s.cfg, view="merges")
     assert "Requirements (all, 4)" in render_board(s.g, "w1", s.now, s.cfg, view="requirements")
 
 

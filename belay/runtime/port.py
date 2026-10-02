@@ -3,17 +3,18 @@
 每个请求 = 外壳先观察（需要时给工作区拍快照）→ Runtime.submit(规则) → 需要等结果的请求（submit）等图满足条件
 → 渲染给模型看的文字。规则拒绝的请求以 {"error": True} 返回。
 
-通知（只推 worker 能据此行动的信息）：提交的存档被降级且问题仍在、定位结果、诊断结论、同一回归反复被拒。
-后台验证被拒只是链头不动，记在图里（board 可见），不通知：中间态测不过是常态。复查者重开的需求随 submit 的结果返回。
-通知不含剩余时间或已用时间：时间只由 runtime 用来决定何时收尾；也没有按时间提醒存档。
+通知（只推 worker 能据此行动的信息）：后台的合并请求没被复核者批准（带原因与反馈）、同一需求连续被判为没做完、
+持续性回归、定位结果、诊断结论、同一问题反复被拒。后台回归门上的中间态测不过不通知：那是常态。
+submit 触发的复核结论总是随 submit 的结果返回。通知不含剩余时间或已用时间。
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
 from belay.core import rules as R
-from belay.core.model import JOB_FINISHED, SUB_ACCEPTED, SUB_FINAL
-from belay.core.render import render_board, render_diagnosis, render_located, render_submit
+from belay.core.model import JOB_FINISHED, REQ_OPEN, SUB_ACCEPTED, SUB_FINAL
+from belay.core.render import (render_board, render_diagnosis, render_located, render_review_notice,
+                               render_submit)
 from belay.core.rules import Rejected
 from belay.runtime.verifier import extract_failure
 
@@ -38,28 +39,41 @@ class WorkerPort:
     def _on_events(self, events, g) -> None:
         for e in events:
             t = e.type
-            if (t == "stall_detected" and e.get("worker") == self.w and e.get("action") != "stop"
-                    and e.get("kind") == "repeated_failure"):
-                self._notices.append(f"Your recent submits were all rejected for the same reason "
-                                     f"({e.get('detail')}). If your current approach is not converging, it may "
-                                     "help to look at those regressions from a different angle, or undo the change "
-                                     "that introduced them.")
-            elif t == "persistent_regression" and e.get("trigger") == "demoted":
-                tests = ", ".join(e.get("tests")[:5])
-                cp = g.checkpoints.get(e.get("checkpoint"))
-                self._notices.append(f"Checkpoint {e.get('checkpoint')} failed the full test suite on {tests} "
-                                     "(the related tests did not select them). Your current changes still make "
-                                     f"{tests} fail. The harness is locating where it started; "
-                                     + ("the checkpoint is no longer part of what would be delivered."
-                                        if cp is not None and cp.demoted else ""))
+            if t == "stall_detected" and e.get("worker") == self.w and e.get("action") != "stop":
+                if e.get("kind") == "repeated_failure":
+                    self._notices.append(f"Your recent submits were all rejected for the same reason "
+                                         f"({e.get('detail')}). If your current approach is not converging, it may "
+                                         "help to look at those regressions from a different angle, or undo the "
+                                         "change that introduced them.")
+                elif e.get("kind") == "review_rejections":
+                    head = g.head
+                    self._notices.append(f"{e.get('detail')}. The reviewer keeps finding the same kind of problem: "
+                                         f"fix it before adding more. Merge point {head} is still what would be "
+                                         "delivered, so nothing is lost if you undo the problematic change.")
             elif t == "persistent_regression" and e.get("trigger") == "background":
                 tests = ", ".join(e.get("tests")[:5])
                 self._notices.append(f"Your recent changes make {tests} fail: the background checks saw it on two "
-                                     "snapshots in a row, and new checkpoints stop until it passes again. The "
+                                     "snapshots in a row, and nothing new is merged until it passes again. The "
                                      "harness is locating where it started and will tell you what it finds.")
+            elif t == "review_decided" and e.get("merge") is False:
+                v = g.reviews.get(e.get("review"))
+                if v is not None and v.trigger not in ("submit", "judge"):   # submit 的结论随 submit 返回
+                    txt = render_review_notice(g, v.id)
+                    if txt:
+                        self._notices.append(txt)
+            elif t == "requirement_judged" and e.get("status") == REQ_OPEN and \
+                    e.get("judgement") in ("partial", "not_done"):
+                r = g.requirements.get(e.get("requirement"))
+                v = g.reviews.get(e.get("review") or "")
+                if r is not None and r.misses == self.run.cfg.notify_misses and v is not None and \
+                        v.trigger not in ("submit", "judge"):
+                    miss = "; ".join(r.missing[:4])[:600]
+                    self._notices.append(f"{r.id} has been judged {r.judgement.replace('_', ' ')} "
+                                         f"{r.misses} times in a row by the reviewer" + (f"; missing: {miss}"
+                                                                                       if miss else "") + ".")
             elif t == "regression_located":
                 loc = g.locates.get(e.get("locate"))
-                if loc is None or loc.id in self._returned_locates or loc.epoch != g.epoch:
+                if loc is None or loc.id in self._returned_locates or loc.epoch != g.epoch or loc.trigger == "review":
                     continue
                 self._notices.append(render_located(g, loc.id, e.get("group")))
             elif t == "diagnosis_recorded" and not e.get("failed"):
@@ -80,16 +94,19 @@ class WorkerPort:
         return render_board(rt.graph, self.w, rt.now(), self.run.cfg, status=status, requirement=requirement,
                             view=view, page=page)
 
-    async def _r_submit(self, summary: str = "", blocked: list = (), implicit: bool = False) -> str:
-        """提交：强制拍快照 → 前台存档 → 判定需求 → 复查 → 接受或交还清单。等结果（最多 submit_wait_sec）。"""
-        text, _ok = await self.submit(summary, blocked, implicit)
+    async def _r_submit(self, summary: str = "", blocked: list = (), implicit: bool = False,
+                        waivers: list = ()) -> str:
+        """提交：强制拍快照 → 前台合并请求（回归门 + 复核）→ 接受或交还清单。等结果（最多 submit_wait_sec）。"""
+        text, _ok = await self.submit(summary, blocked, implicit, waivers)
         return text
 
-    async def submit(self, summary: str = "", blocked: list = (), implicit: bool = False) -> tuple[str, bool]:
+    async def submit(self, summary: str = "", blocked: list = (), implicit: bool = False,
+                     waivers: list = ()) -> tuple[str, bool]:
         n = await self.run.take_snapshot("submit")
         if n is None:
             raise Rejected("The harness is still setting up; try again shortly.")
-        sid = await self._submit(R.request_submit, self.w, n, summary, list(blocked or ()), implicit)
+        sid = await self._submit(R.request_submit, self.w, n, summary, list(blocked or ()), implicit,
+                                 list(waivers or ()))
         await self.run.rt.wait_until(lambda g: g.submits[sid].status in SUB_FINAL,
                                      timeout=self.run.cfg.submit_wait_sec)
         g = self.run.rt.graph
@@ -110,11 +127,6 @@ class WorkerPort:
             return {"text": text, "error": False, "accepted": self._accepted}
         except Rejected as e:
             return {"text": str(e), "error": True}
-
-    async def _r_waive_check(self, tests: list, quote: str, reason: str, requirement=None) -> str:
-        waived = await self._submit(R.waive_checks, self.w, tests, quote, reason, requirement)
-        return (f"Waived {len(waived)} check(s) from the regression gate: {', '.join(waived[:10])}. They are listed "
-                "in the final report. Call submit again to record your change.")
 
     async def _with_located(self, aid) -> str:
         """被拒时最多等 locate_wait_sec，让定位结果随拒绝消息一起返回。"""

@@ -1,24 +1,26 @@
-"""Belay 组：自研 worker + 任务状态图 runtime（v6，`belay.runtime.driver.BelayRun`）。
+"""Belay 组：自研 worker + 任务状态图 runtime（v8，`belay.runtime.driver.BelayRun`）。
 Belay 特有的接入逻辑只在这一个文件里。
 
 setup 阶段（不计入 agent 预算，runs.yaml 的 setup_timeout_min）：
-  补丁快照（与所有组相同）→ 有任务原文时（pass_instruction: true）BelayRun.prepare：影子仓库与 0 号存档、
+  补丁快照（与所有组相同）→ 有任务原文时（pass_instruction: true）BelayRun.prepare：影子仓库与 0 号合并点、
   基线双跑（工作区一次、验证槽位一次）与导入隔离判定、规划并冻结需求。状态全部写进宿主机上的 run_dir。
 run 阶段：对同一个 run_dir 新建 BelayRun（不跨事件循环复用对象）→ run_prepared：预算从这里开始计时，会话循环、
-  后台存档、收尾，交付最新的确认点（工作区被检出为交付点）。没有在 setup 阶段准备时，在 run() 里完整地 start()，
-  准备耗时计入预算。
-结束时（asyncio.shield，评测框架超时取消也会执行）：被取消就走 emergency_deliver（停 worker 与作业、把工作区检出为
-  交付点、写账本）→ 照常导出补丁。交付的永远是通过回归门的存档，补丁里没有测试路径下的改动。
+  后台合并请求（回归门 + 复核者）、收尾，交付合并链的链头（工作区被检出为交付点）。没有在 setup 阶段准备时，在 run()
+  里完整地 start()，准备耗时计入预算。
+结束时（asyncio.shield，评测框架超时取消也会执行）：被取消就走 emergency_deliver（停 worker、复核者与作业、把工作区
+  检出为交付点、写账本）→ 照常导出补丁。交付的永远是复核者批准的合并点，补丁里没有测试路径下的改动。
+没有 gate.json（例如 LHTB）时同样启用复核者：合并只靠复核者读代码、运行程序、按任务自测分数（分数不下降）。
 
 runs.yaml 中除 FlatAgent 的参数外还可用：
-  gate_spec         由 runner 按任务目录的 gate.json 传入（agent 定义里写 gate: true）；没有时运行不带测试验证
+  gate_spec         由 runner 按任务目录的 gate.json 传入（agent 定义里写 gate: true）；没有时没有回归门，只靠复核者
   task_instruction  由 runner 在 setup 前传入的任务原文（agent 定义里写 pass_instruction: true）
   runtime           belay.core.config.BelayConfig 的字段（未知字段报错），例如 {locate: false}
-  aux_model         诊断者、复查者、存档标签用的模型（默认与 worker 相同）
+  aux_model         复核者与诊断者用的模型（默认与 worker 相同；复核者用自己的客户端，录制在 llm_record_aux.jsonl）
   state_dir         容器内的状态目录（影子仓库、作业、验证槽位），默认 /opt/belay；必须在仓库之外
   finalize_margin_sec   预算里留给收尾的余量（截止之后 runtime 还会等最后的验证一小段时间），默认 150
 日志（trial 的 agent 日志目录下 belay/）：events.sqlite / events.jsonl（唯一真相）、sessions/S*.jsonl、
-ledger.json / ledger.md、deliverable.diff、worktree.diff、checkpoints/、git/*.bundle、setup.json、llm_record.jsonl。
+ledger.json / ledger.md、deliverable.diff、worktree.diff、checkpoints/（每个合并点的补丁）、reviews/V*.jsonl（复核会话）、
+git/*.bundle、setup.json、llm_record.jsonl。
 """
 from __future__ import annotations
 
@@ -60,7 +62,7 @@ class BelayAgent(FlatAgent):
         return "belay"
 
     def version(self) -> str:
-        return "0.6"
+        return "0.8"
 
     @property
     def belay_dir(self) -> Path:
@@ -78,11 +80,13 @@ class BelayAgent(FlatAgent):
                            tools=tools)
 
     def _aux_llm(self):
-        if not self.aux_model or self.replay:
+        """复核者与诊断者的模型客户端：与 worker 分开（它们和 worker 并发调用；录制分开，worker 的回放不受影响）。"""
+        if self.replay:
             return None
         llm = self._make_llm()
-        llm.model = self.aux_model
-        llm.record_path = None
+        if self.aux_model:
+            llm.model = self.aux_model
+        llm.record_path = Path(self.logs_dir) / "llm_record_aux.jsonl" if self.record else None
         return llm
 
     async def _make_run(self, environment) -> BelayRun:
@@ -154,6 +158,10 @@ class BelayAgent(FlatAgent):
             u = run.usage
             if run.session is not None:                      # 被取消时当前会话的用量还没累计进去
                 u.add(run.session.usage)
+            ru = run.review_usage                            # 复核者的用量也计入（单独列在 metadata 里）
+            meta["review_tokens"] = {"input": ru.input_tokens + ru.cache_read_tokens + ru.cache_write_tokens,
+                                     "cache": ru.cache_read_tokens, "output": ru.output_tokens}
+            u.add(ru)
             context.n_input_tokens = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens
             context.n_cache_tokens = u.cache_read_tokens
             context.n_output_tokens = u.output_tokens
@@ -166,9 +174,9 @@ class BelayAgent(FlatAgent):
                 context.summarization_count = sum(len(s.compactions) for s in g.sessions.values())
                 meta.update(belay_status="DONE" if g.run and g.run.status == "done" else "INCOMPLETE",
                             belay_status_reasons=L["status_reasons"], delivered=L["delivered_checkpoint"],
-                            delivered_level=L["delivered_level"], head=L["head"], confirmed=L["confirmed"],
-                            degraded=L["degraded"], categories=L["categories"], sessions=len(g.sessions),
-                            snapshots=L["snapshots"], checkpoints=len(g.checkpoints) - 1,
+                            delivered_score=L["delivered_score"], head=L["head"], degraded=L["degraded"],
+                            categories=L["categories"], done_counted=L["done_counted"], sessions=len(g.sessions),
+                            snapshots=L["snapshots"], merges=len(g.checkpoints) - 1, reviews=len(L["reviews"]),
                             prepared_in_setup=self.prepared_sec is not None)
         meta["belay_shutdown_sec"] = round(time.time() - t0, 1)
         context.metadata = meta

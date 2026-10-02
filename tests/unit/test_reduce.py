@@ -31,16 +31,18 @@ def ev(g: Graph, type_: str, source: str = "rule", actor: str = "runtime", **pay
 def test_validate_format():
     with pytest.raises(EventError):
         validate(Event(1, 0, "no_such_event", "runtime", "rule", {}))
-    with pytest.raises(EventError):                        # 验证通过不能来自自述
-        validate(Event(1, 0, "requirement_verified", "worker:w1", "self_report",
-                       {"requirement": "R1", "checkpoint": 1, "evidence": {}}))
-    with pytest.raises(EventError):                        # 提交的需求是自述，不能伪装成规则
-        validate(Event(1, 0, "requirement_submitted", "worker:w1", "rule",
-                       {"requirement": "R1", "checkpoint": 1, "submit": "U1"}))
+    with pytest.raises(EventError):                        # 复核者的结论不能伪装成规则的决定
+        validate(Event(1, 0, "review_decided", "reviewer", "llm", {"review": "V1", "merge": True, "reasons": []}))
+    with pytest.raises(EventError):                        # 需求判定不能直接来自 llm
+        validate(Event(1, 0, "requirement_judged", "reviewer", "llm",
+                       {"requirement": "R1", "status": "done", "by": "review"}))
     with pytest.raises(EventError):
         validate(Event(1, 0, "submit_requested", "worker:w1", "rule", {"submit": "U1"}))
-    with pytest.raises(EventError):                        # 存档只能来自观察
-        validate(Event(1, 0, "checkpoint_created", "runtime", "llm", {"checkpoint": 1, "commit": "c", "tree": "t"}))
+    with pytest.raises(EventError):                        # 合并点只能来自观察
+        validate(Event(1, 0, "merged", "runtime", "llm", {"checkpoint": 1, "commit": "c", "tree": "t"}))
+    with pytest.raises(EventError):                        # 豁免只能来自规则（复核者的提议经过校验）
+        validate(Event(1, 0, "waiver_granted", "reviewer", "llm", {"tests": [], "quote": "q", "reason": "r",
+                                                                   "review": "V1"}))
 
 
 def test_apply_is_pure_and_seq_must_follow():
@@ -67,38 +69,45 @@ def test_snapshot_roundtrip():
     assert graph_from_json(json.loads(json.dumps(to_json(g)))) == g
 
 
-@pytest.mark.parametrize("case", ["verified_without_evidence", "verified_failing", "submitted_wrong_checkpoint",
-                                  "reopen_open", "created_no_adv", "freeze_twice", "freeze_no_actionable",
-                                  "confirm_confirmed", "delivered_not_on_chain", "todo_new_completed",
-                                  "todo_unknown_req", "job_key_dup", "todo_complete_unknown", "snapshot_gap",
-                                  "submit_twice_open", "context_submitted"])
+@pytest.mark.parametrize("case", ["done_without_level", "e3_failing", "done_off_chain", "self_report_e2",
+                                  "created_no_adv", "freeze_twice", "freeze_no_actionable", "advance_unapproved",
+                                  "delivered_not_on_chain", "todo_new_completed", "todo_unknown_req", "job_key_dup",
+                                  "todo_complete_unknown", "snapshot_gap", "submit_twice_open", "context_judged",
+                                  "two_reviews", "decided_unrecorded", "waive_non_gate"])
 def test_illegal_transitions(case):
     s = ready_sim()
     g = s.g
-    if case == "verified_without_evidence":
-        e = ev(g, "requirement_verified", requirement="R2", checkpoint=0, evidence={})
-    elif case == "verified_failing":
-        e = ev(g, "requirement_verified", requirement="R1", checkpoint=0, evidence={})    # 基线上 test_add 是失败的
-    elif case == "submitted_wrong_checkpoint":
-        e = ev(g, "requirement_submitted", source="self_report", actor="worker:w1", requirement="R2",
-               checkpoint=0, submit="U9")
-    elif case == "reopen_open":
-        e = ev(g, "requirement_reopened", requirement="R2", reason="review_missing")
+    if case == "done_without_level":
+        e = ev(g, "requirement_judged", requirement="R2", status="done", by="review", checkpoint=0)
+    elif case == "e3_failing":                                     # 基线上 test_add 是失败的
+        e = ev(g, "requirement_judged", requirement="R1", status="done", level="E3", by="checks", checkpoint=0,
+               tests=["tests/test_mod.py::test_add"])
+    elif case == "done_off_chain":
+        e = ev(g, "requirement_judged", requirement="R2", status="done", level="E1", by="review", checkpoint=7)
+    elif case == "self_report_e2":                                 # 自述只能是 E0（规则层的来源纪律在 check_log）
+        e = ev(g, "requirement_judged", source="rule", requirement="R2", status="done", level="E0", by="self_report",
+               checkpoint=0)
     elif case == "created_no_adv":
-        e = ev(g, "checkpoint_created", source="observed", checkpoint=1, attempt="A9", commit="c", tree="t")
+        e = ev(g, "merged", source="observed", checkpoint=1, attempt="A9", commit="c", tree="t")
     elif case == "freeze_twice":
         e = ev(g, "requirement_frozen", requirements=[{"id": "R9", "quote": "q"}])
     elif case == "freeze_no_actionable":
-        g = Graph()
         s2 = Sim(BASE)
         s2.do(__import__("belay.core.rules", fromlist=["start_run"]).start_run, "r", TASK, 100)
         g = s2.g
         e = ev(g, "requirement_frozen", requirements=[{"id": "R1", "quote": "q", "kind": "context"}])
-    elif case == "confirm_confirmed":
-        e = ev(g, "checkpoint_confirmed", source="observed", checkpoint=0)       # 0 号基线本来就是确认点
+    elif case == "advance_unapproved":                             # 复核者没批准的合并请求不能推进
+        from tests.sim import MANUAL
+        s4 = Sim(BASE, reviewer=MANUAL)
+        s4.setup(TASK, PLAN)
+        s4.world.define("t1", {})
+        s4.snap("t1")
+        a = next(iter(s4.g.attempts.values()))
+        g = s4.g
+        e = ev(g, "merge_advancing", attempt=a.id, parent_commit=g.head_cp.commit, date=1.0)
     elif case == "todo_new_completed":
         e = ev(g, "todos_updated", source="self_report", worker="w1",
-               todos=[{"id": "P1", "n": 1, "title": "x", "status": "completed"}])  # 完成只能经 todo_completed
+               todos=[{"id": "P1", "n": 1, "title": "x", "status": "completed"}])
     elif case == "todo_unknown_req":
         e = ev(g, "todos_updated", source="self_report", worker="w1",
                todos=[{"id": "P1", "n": 1, "title": "x", "status": "pending", "requirements": ["R77"]}])
@@ -111,19 +120,30 @@ def test_illegal_transitions(case):
         e = ev(g, "delivered", checkpoint=5, status="DONE")
     elif case == "job_key_dup":
         j = next(iter(g.jobs.values()))
-        e = ev(g, "job_started", job="J99", key=j.key, tree=j.tree, selection=None, purpose="dev")
+        e = ev(g, "job_started", job="J99", key=j.key, tree=j.tree, selection=None, purpose="gate")
     elif case == "submit_twice_open":
         g = apply(g, ev(g, "submit_requested", actor="worker:w1", submit="U1", worker="w1", snapshot=0, checkpoint=0))
         e = ev(g, "submit_requested", actor="worker:w1", submit="U2", worker="w1", snapshot=0, checkpoint=0)
-    elif case == "context_submitted":
+    elif case == "context_judged":
         s3 = Sim(BASE)
         plan = {"requirements": [{"id": "c", "kind": "context", "quote": "Fix the add function so that it returns "
                                   "the sum."}, {"id": "b", "quote": "Also make mul handle negative numbers correctly."}]}
         s3.setup(TASK, plan)
         g = s3.g
-        g = apply(g, ev(g, "submit_requested", actor="worker:w1", submit="U1", worker="w1", snapshot=0, checkpoint=0))
-        e = ev(g, "requirement_submitted", source="self_report", actor="worker:w1", requirement="R1", checkpoint=0,
-               submit="U1")
+        e = ev(g, "requirement_judged", requirement="R1", status="done", level="E1", by="review", checkpoint=0)
+    elif case == "two_reviews":
+        g = apply(g, ev(g, "review_started", review="V1", trigger="judge", checkpoint=0, tree=g.head_cp.tree,
+                        snapshot=0, focus=[]))
+        e = ev(g, "review_started", review="V2", trigger="judge", checkpoint=0, tree=g.head_cp.tree, snapshot=0,
+               focus=[])
+    elif case == "decided_unrecorded":
+        g = apply(g, ev(g, "review_started", review="V1", trigger="judge", checkpoint=0, tree=g.head_cp.tree,
+                        snapshot=0, focus=[]))
+        e = ev(g, "review_decided", review="V1", merge=None, reasons=[])
+    elif case == "waive_non_gate":                                 # 原始代码上就失败的测试不在回归门里
+        g = apply(g, ev(g, "review_started", review="V1", trigger="judge", checkpoint=0, tree=g.head_cp.tree,
+                        snapshot=0, focus=[]))
+        e = ev(g, "waiver_granted", tests=["tests/test_mod.py::test_add"], quote="q", reason="r", review="V1")
     with pytest.raises(IllegalEvent):
         apply(g, e)
 

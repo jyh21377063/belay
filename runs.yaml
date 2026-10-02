@@ -115,10 +115,10 @@ agents:
       # policy: {git_write: audit, network: audit, disk_search: audit, harness_paths: deny}   # 默认值
     pricing: *claude_code_pricing
 
-  belay: &belay               # Belay 组：自研 worker + 任务状态图 runtime（v7：worker 只做自然的事，状态由图从观察推出）
+  belay: &belay               # Belay 组：自研 worker + 任务状态图 runtime（v8：合并为关口、复核者为裁判、交付合并链的链头）
     <<: *flat
     import_path: "eval.agents.belay_agent:BelayAgent"
-    gate: true                          # runner 读取任务目录下的 gate.json 作为测试配置；没有时不带测试验证运行
+    gate: true                          # runner 读取任务目录下的 gate.json 作为回归门；没有时（LHTB）只靠复核者
     pass_instruction: true              # setup 阶段就把任务原文交给 agent：基线双跑与规划不占 90 分钟
     setup_timeout_min: 150              # setup 阶段：影子仓库、基线（工作区一次 + 验证槽位一次）、导入隔离探针、规划
     kwargs: &belay_kwargs
@@ -127,9 +127,10 @@ agents:
       finalize_margin_sec: 150          # 预算里留给收尾的余量（runtime 截止后还会等最后的验证最多 60 秒）
       runtime: &belay_runtime           # belay/core/config.py 的 BelayConfig；未知字段会报错；每个机制都可以关掉
         verify_slots: 1                 # 验证槽位数（并发验证作业数）；8 vCPU / 并发 2 题时建议 1
-        background: latest              # 后台空闲时验证最新的可测快照（handoff = v6 的只验交接快照；off = 只在提交时验证）
+        background: latest              # 后台空闲时对最新的可测快照发起合并请求（handoff = 只在交接时；off = 只在提交与收尾时）
+        merge_min_interval_sec: 600     # 两次后台复核之间至少隔 10 分钟（勾掉 todo 时 3 分钟；交接、submit、收尾不受限）
         diagnoser: true
-        reviewer: true                  # 提交时复查没有证据检查的需求（只能重开，不能判定完成）
+        reviewer: true                  # 复核者：合并的裁判，逐条判定需求并给出证据等级（E3 测试 / E2 运行 / E1 审读）
         # 压缩阈值默认按 Claude Code 的量级（L1 50 万 / L2 70 万 / 硬交接 76 万 token），与 flat 的 clear / reset 对齐
 
   # 消融：同一套 runtime 关掉某个机制
@@ -141,11 +142,11 @@ agents:
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, graph_context: false}}
 
-  belay-no-llm-help:          # 没有诊断者与复查者（只有规则定位；提交的需求按自述接受）
+  belay-no-llm-help:          # 没有诊断者与复核者（合并只看回归门；需求只由测试 E3 或自述 E0 记下）
     <<: *belay
-    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, diagnoser: false, reviewer: false, labeler: false}}
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, diagnoser: false, reviewer: false}}
 
-  belay-handoff-only:         # 后台只验证交接快照（v6 的做法）：看持续存档带来多少收益
+  belay-handoff-only:         # 后台只在交接时合并：看后台复核带来多少收益
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, background: handoff}}
 
