@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from belay.core import rules as R
-from belay.core.model import ACTIONABLE, JOB_RUNNING, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_RUNNING
+from belay.core.config import BelayConfig
+from belay.core.model import ACTIONABLE, BG_TRIGGERS, JOB_RUNNING, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_RUNNING
 from belay.core.queries import actionable, last_score, latest_handoff_summary, todos_in_order
 from belay.core.render import checkpoint_line, render_job, render_located, requirement_state
 from belay.core.verify import (B_PASS, PASSED, PT_FAIL, active_guard, guard_set, point_status, reasons_for_tree,
@@ -37,8 +38,10 @@ from belay.worker.transcript import Transcript
 if TYPE_CHECKING:
     from belay.runtime.driver import BelayRun
 
-WRAPUP = ("Your time for this review is up. Call verdict now with what you have found (merge, the requirements you "
-          "judged with their evidence levels, feedback). Do not call any other tool.")
+# 不提时间、轮数或 token（提了模型会敷衍）；上限只由 runtime 执行
+WRAPUP = ("Stop reviewing now and call verdict with what you have found (merge, the changes to existing behaviour with "
+          "their quotes, the requirements you judged with their evidence levels, feedback). Do not call any other "
+          "tool.")
 TRIGGER_TEXT = {
     "auto": "a background check of the agent's latest snapshot (the agent keeps working meanwhile)",
     "todo": "a background check right after the agent ticked off a todo item",
@@ -46,9 +49,16 @@ TRIGGER_TEXT = {
     "session_end": "a check at the end of a session",
     "submit": "the agent called submit: it believes the requirements are done and waits for your verdict",
     "final": "the final check before delivery",
-    "deadline": "the final check before delivery (the time budget is used up)",
+    "deadline": "the final check before delivery",
     "judge": "the agent called submit without new changes: judge the requirements on the latest merge point",
 }
+
+
+def review_limits(cfg: BelayConfig, trigger: str) -> tuple[int, float]:
+    """(轮数, 秒)：后台复核只看增量，预算小；提交、收尾、只判定的复核预算大。"""
+    if trigger in BG_TRIGGERS:
+        return cfg.review_bg_max_turns, cfg.review_bg_max_sec
+    return cfg.review_max_turns, cfg.review_max_sec
 
 
 class SubdirEnv(Env):
@@ -84,6 +94,16 @@ VERDICT_SCHEMA = {"type": "object", "properties": {
         "regressed": {"type": "boolean", "description": "A requirement that was done is broken by this change"},
         "reason": {"type": "string"}},
         "required": ["id", "status", "level"]}},
+    "behavior_changes": {"type": "array", "description": "Every way the changes since the previous merge point alter "
+                         "what EXISTING code already did (a different result, precedence, default, error or output "
+                         "for inputs the old code already handled). Purely new behaviour for inputs the old code did "
+                         "not handle is not listed. Empty when there is none.",
+                         "items": {"type": "object", "properties": {
+                             "what": {"type": "string", "description": "Old behaviour -> new behaviour"},
+                             "quote": {"type": "string", "description": "Verbatim task text that demands exactly this "
+                                                                        "change; empty if there is none"},
+                             "requirement": {"type": "string"}},
+                             "required": ["what", "quote"]}},
     "waivers": {"type": "array", "items": {"type": "object", "properties": {
         "tests": {"type": "array", "items": {"type": "string"}},
         "quote": {"type": "string", "description": "Verbatim task text that asks for the new behaviour"},
@@ -92,7 +112,7 @@ VERDICT_SCHEMA = {"type": "object", "properties": {
     "score": {"type": ["number", "null"], "description": "Measured objective, higher is better; null if none"},
     "score_note": {"type": "string", "description": "How the score was measured"},
     "feedback": {"type": "string", "description": "For the agent: concrete missing items, failing tests, commands"}},
-    "required": ["merge", "reason", "requirements", "feedback"]}
+    "required": ["merge", "reason", "requirements", "behavior_changes", "feedback"]}
 
 
 class Reviewer:
@@ -133,11 +153,11 @@ class Reviewer:
                 raise RuntimeError("no model for the reviewer")
             await run.repo.export_to(self.review_dir, v.tree, seed_index=run.repo.index(run.w))
             opening = await self.opening(vid)
+            turns, sec = review_limits(cfg, v.trigger)
             from belay.worker.loop import Worker, WorkerConfig
             worker = Worker(run.aux_llm, SubdirEnv(run.env, self.review_dir), tools=self.tools(vid, state),
-                            config=WorkerConfig(max_turns=cfg.review_max_turns, clear_tokens=cfg.l1_trigger_tokens,
-                                                reset_tokens=10 ** 12,
-                                                deadline=time.monotonic() + cfg.review_max_sec),
+                            config=WorkerConfig(max_turns=turns, clear_tokens=cfg.l1_trigger_tokens,
+                                                reset_tokens=10 ** 12, deadline=time.monotonic() + sec),
                             policy=self.policy(), transcript=Transcript(tpath), role="main",
                             system_prompt=REVIEWER_SYSTEM)
             res = await worker.run(opening)
@@ -237,7 +257,27 @@ class Reviewer:
             how.append("No test command is configured for this task: verify by running the code (run) and reading "
                        "it.")
         parts.append("## How to work\n" + "\n".join(how))
+        parts.append(self._scope_text(vid, base.id))
         return "\n\n".join(parts)
+
+    def _scope_text(self, vid: str, base: int) -> str:
+        g = self.run.rt.graph
+        v = g.reviews[vid]
+        done = [r.id for r in actionable(g) if r.status == REQ_DONE]
+        lines = ["## Scope"]                       # 只说范围；轮数与时间的上限由 runtime 执行，从不写进提示词
+        if v.trigger in BG_TRIGGERS:
+            lines.append(f"This is a background check of the changes since merge point {base}, not a full audit. "
+                         "Decide the merge from the gate result and these changes. Judge only the requirements in "
+                         "focus that these changes work on; leave the others out of the verdict (their status stays "
+                         "as it is). Verify what these changes do with targeted commands rather than re-exploring the "
+                         "project.")
+        elif v.attempt is not None:
+            lines.append(f"Decide the merge from the gate result and the changes since merge point {base}, and judge "
+                         "every requirement in focus.")
+        if done:
+            lines.append("Already done (do not re-verify them; check one only if these changes touch the code it "
+                         "relies on, and then report it only if it broke): " + ", ".join(done))
+        return "\n".join(lines)
 
     def _gate_text(self, vid: str) -> str:
         g = self.run.rt.graph
@@ -274,7 +314,7 @@ class Reviewer:
             mark = "*" if r.id in v.focus else " "
             line = f"{mark} {r.id} [{requirement_state(r)}" + (f", merge point {r.checkpoint}" if r.status != REQ_OPEN
                                                               and r.checkpoint is not None else "") + \
-                f"] \"{r.quote[:600]}\""
+                f"] \"{r.quote[:150 if r.status == REQ_DONE else 600]}\""
             extra = []
             if r.acceptance:
                 extra.append(f"acceptance: {r.acceptance[:300]}")

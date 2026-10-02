@@ -888,3 +888,66 @@ def test_only_a_declared_block_can_be_accepted():
     r3 = s.g.requirements["R3"]
     assert r3.status == REQ_OPEN and "cannot be done here" in r3.missing[-1]
     assert s.g.submits[sid].status == "returned"
+
+
+# ======================================================================== 已有行为的改变要有原文明确要求
+
+def test_changing_existing_behaviour_needs_task_text_that_demands_it():
+    s = sim(cfg=fg(), reviewer=MANUAL)
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    v = s.g.reviews[s.running_review()]
+    change = {"what": "mul(0, x) now raises instead of returning 0", "quote": ""}
+    s.review(v.id, judge(True, {"R1": ("done", "E1")}, behavior_changes=[change])(s, v))
+    a = s.g.attempts[s.g.submits[sid].attempt]
+    assert a.status == "rejected" and a.reason == "review" and "no task text asks for" in a.detail
+    assert s.g.head == 0 and s.g.requirements["R1"].status == REQ_OPEN
+
+    sid = s.submit("t1")                                            # 原文明确要求：可以合并，记在决定里
+    v = s.g.reviews[s.running_review()]
+    change = {"what": "mul(-2, 3) returns -6 instead of 6", "quote": MUL_QUOTE, "requirement": "R2"}
+    s.review(v.id, judge(True, {"R1": ("done", "E1")}, behavior_changes=[change])(s, v))
+    g = s.g
+    assert g.head == 1 and g.reviews[v.id].decision["behavior_changes"][0]["quote"] == MUL_QUOTE
+    s.check_log()
+
+
+def test_cut_off_task_text_does_not_justify_overriding_existing_behaviour():
+    task = TASK + "\n* \"Use field description for the schema description when there is `…`\" by @someone in #1"
+    s = Sim(BASE, cfg=fg(), reviewer=MANUAL)
+    cut = "Use field description for the schema description when there is `…`"
+    s.setup(task, {"requirements": PLAN["requirements"] + [{"id": "d", "quote": cut, "summary": "schema"}]})
+    s.do(R.start_session, "w1", "first", {})
+    s.world.define("t1", {ADD: "PASSED"})
+    sid = s.submit("t1")
+    v = s.g.reviews[s.running_review()]
+    change = {"what": "the field description now takes precedence over the docstring",
+              "quote": "Use field description for the schema description when there is"}
+    s.review(v.id, judge(True, {}, behavior_changes=[change])(s, v))
+    a = s.g.attempts[s.g.submits[sid].attempt]
+    assert a.status == "rejected" and "cut off" in a.detail and "only where the old code had none" in a.detail
+    assert R.quote_is_cut("schema description when there is", task)
+    assert not R.quote_is_cut(MUL_QUOTE, task)
+
+
+def test_judge_only_reviews_do_not_check_behaviour_changes():
+    s = sim(cfg=fg(), reviewer=MANUAL)
+    s.world.define("t1", {ADD: "PASSED"})
+    s.submit("t1")
+    v = s.g.reviews[s.running_review()]
+    s.review(v.id, judge(True, {"R1": ("done", "E1")})(s, v))
+    assert s.g.head == 1
+    s.submit("t1")                                                  # 快照就是链头：只判定
+    v = s.g.reviews[s.running_review()]
+    assert v.attempt is None
+    s.review(v.id, judge(False, {"R2": ("done", "E1")}, behavior_changes=[{"what": "x", "quote": ""}])(s, v))
+    assert s.g.reviews[v.id].decision["merge"] is None and s.g.requirements["R2"].status == REQ_DONE
+
+
+def test_background_reviews_get_a_smaller_budget():
+    from belay.runtime.reviewer import review_limits
+    cfg = BelayConfig()
+    assert review_limits(cfg, "auto") == (20, 480) and review_limits(cfg, "todo") == (20, 480)
+    assert review_limits(cfg, "submit") == (40, 900) and review_limits(cfg, "judge") == (40, 900)
+    with pytest.raises(ValueError, match="review_bg_max_turns"):
+        BelayConfig.from_dict({"review_bg_max_turns": 1})

@@ -659,8 +659,8 @@ def _review_decided(g: Graph, e: Event) -> Graph:
     v = g.reviews[vid]
     merge = e.get("merge")
     _need((merge is None) == (v.attempt is None), "only a review of a merge request decides a merge")
-    d = {k: e.get(k) for k in ("merge", "reasons", "notes", "judgements", "mentioned", "score", "score_note", "label",
-                                "feedback")}
+    d = {k: e.get(k) for k in ("merge", "reasons", "notes", "judgements", "mentioned", "behavior_changes", "score",
+                                "score_note", "label", "feedback")}
     return _set_review(g, replace(v, status=REV_DECIDED, decision=d))
 
 

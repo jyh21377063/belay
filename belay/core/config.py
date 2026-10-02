@@ -48,8 +48,10 @@ class BelayConfig:
     diagnose_input_tokens: int = 30_000
     # ---- 复核者（模块 F）
     reviewer: bool = True
-    review_max_turns: int = 40              # 一次复核会话的轮数上限
-    review_max_sec: float = 900             # 一次复核会话的时间上限
+    review_max_turns: int = 40              # 一次复核会话的轮数上限（提交、收尾、只判定）
+    review_max_sec: float = 900             # 一次复核会话的时间上限（提交、收尾、只判定）
+    review_bg_max_turns: int = 20           # 后台复核（auto / todo / handoff / session_end）的轮数上限：只看增量
+    review_bg_max_sec: float = 480          # 后台复核的时间上限
     review_run_timeout_sec: float = 600     # 复核者的单条命令的超时
     review_retries: int = 1                 # 复核失败（没有给出结论）后重试的次数；仍失败就按复核者不可用处理
     review_input_chars: int = 60_000        # 复核者开场里 diff 的长度上限（按需求预排序）
@@ -143,8 +145,8 @@ class BelayConfig:
             raise ValueError("snapshot_bash_every 至少为 1")
         if cfg.verify_slots < 1:
             raise ValueError("verify_slots 至少为 1")
-        if cfg.review_retries < 0 or cfg.review_max_turns < 2:
-            raise ValueError("review_retries 不能为负，review_max_turns 至少为 2")
+        if cfg.review_retries < 0 or cfg.review_max_turns < 2 or cfg.review_bg_max_turns < 2:
+            raise ValueError("review_retries 不能为负，review_max_turns / review_bg_max_turns 至少为 2")
         return cfg
 
     def with_(self, **kw) -> "BelayConfig":

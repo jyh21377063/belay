@@ -147,6 +147,12 @@ worker 每条车道至多一个合并请求，整个运行同一时刻只有一�
 - 已完成的需求没有被这次改动弄坏：复核者说一条已完成的需求不再成立，必须有 E2 / E3 的证据；`regressed=true` →
   不合并；不是这次弄坏的（重新评估）→ 合并，需求退回 open（`reason=reassessed`）。只凭阅读（E1）的否定判断不改变
   已完成的需求（记为 note，防止复核者在同一棵树上来回改判）。证据等级只升不降。
+- 已有行为的改变：复核者在 `behavior_changes` 里列出这次改动改变的已有行为（原代码对同样输入给出的结果、优先级、
+  默认值、错误、输出；对原代码不处理的输入新增行为不算），每条附上要求这一改变的任务原文。没有逐字原文 → 不合并；
+  原文所在的那一行被截断（`…`，或引号 / 反引号前的 `...`，`rules.quote_is_cut`）→ 不合并，并告诉 worker：截断的原文
+  说不清条件，原代码已经给出结果的地方保持原行为，新行为只用在原代码没有结果的地方（做成兜底，不做成新的优先级）。
+  动机：隐藏的验收测试同时检查新行为和“其余照旧”，后者常常没有现成测试，回归门看不到（pydantic v2.7.1 的
+  RootModel 描述优先级就是这样丢分的）。只判定的复核不检查这一条。
 - 分数：复核者执行过命令时报告的 `score` 不比链上最近一次测到的低超过 `score_tolerance`（相对，默认 2%）；没测分数
   的合并点不会把门槛清零。
 - 合并不要求任何需求已经完成。
@@ -160,8 +166,14 @@ worker 每条车道至多一个合并请求，整个运行同一时刻只有一�
 
 ## 5. 复核者（`runtime/reviewer.py`）
 
-- 每个复核开一个带工具的短会话，复用 worker 的循环（`belay/worker/loop.py`），轮数（`review_max_turns`）与时间
-  （`review_max_sec`）有上限；用完还没给结论就再给一轮只要求 verdict，仍没有就记为失败。
+- 每个复核开一个带工具的短会话，复用 worker 的循环（`belay/worker/loop.py`），轮数与时间有上限：后台复核
+  （auto / todo / handoff / session_end）`review_bg_max_turns` / `review_bg_max_sec`（默认 20 轮、8 分钟），提交、收尾、
+  只判定 `review_max_turns` / `review_max_sec`（默认 40 轮、15 分钟）；用完还没给结论就再给一轮只要求 verdict，仍没有
+  就记为失败。
+- 提示词里从不提轮数、时间或 token 预算（提了模型会敷衍）：上限只由 runtime 执行，到点时只说“现在给出结论”。
+- 增量：复核只看相对上一个合并点的改动。开场的“Scope”一节只写范围；后台复核只判定这次改动涉及的 focus
+  需求，其余不写进结论（状态不变）；已完成的需求只列编号、不要求重验（只有改动碰到它依赖的代码、并且确实坏了才报告），
+  清单里已完成需求的原文只给 150 字。
 - 复核目录（默认 `<state>/review`）：`ShadowRepo.export_to` 把被复核的候选树增量导出（上次复核改过的已跟踪文件恢复、
   未跟踪的输出清掉、被忽略的构建缓存保留，第一次从工作区复制被忽略的文件作为种子）。复核结束杀掉工作目录在复核目录
   里的进程。
@@ -171,7 +183,7 @@ worker 每条车道至多一个合并请求，整个运行同一时刻只有一�
 - 开场（全部来自图）：任务原文；触发与上一个合并点；上次测到的分数与测法；回归门结果（含没通过的测试与原因、
   原始代码上失败现在通过的测试）；需求清单（账本状态、验收方法、关联测试的结果、上次的缺失项，focus 标星）；worker
   的自述（提交摘要、受阻声明、豁免提议、todo、交接摘要，统一标为未核实）；上一次复核的结论；相对上一个合并点的改动
-  （按需求预排序的 diff）；被剔除的测试改动；怎么跑测试。
+  （按需求预排序的 diff）；被剔除的测试改动；怎么跑测试；范围。
 - 防偏差：不共享 worker 的上下文；工作区路径、影子仓库、作业与验证目录、`/logs` 都在保护名单里（读文件与命令都检查）；
   git 写、联网、全盘搜索拒绝。
 - 反馈 worker（`port.py`）：submit 触发的复核结论总是随 submit 返回；后台请求没被批准时以 system-reminder 告诉 worker
@@ -220,7 +232,8 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 
 ## 10. 配置（`core/config.py`，新增与变化）
 
-`merge_min_interval_sec`、`merge_todo_interval_sec`、`review_max_turns`、`review_max_sec`、`review_run_timeout_sec`、
+`merge_min_interval_sec`、`merge_todo_interval_sec`、`review_max_turns`、`review_max_sec`、`review_bg_max_turns`、
+`review_bg_max_sec`、`review_run_timeout_sec`、
 `review_retries`、`review_input_chars`、`review_locate_wait_sec`、`score_tolerance`、`notify_misses`、`reserve_review_sec`。
 取消：`checkpoint_tier`、`deliver_unconfirmed`、`review_batch`、`review_max_reopens`、`labeler`、`label_every`。
 
