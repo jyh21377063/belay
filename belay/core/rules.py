@@ -15,7 +15,6 @@ v8：合并是唯一的正式关口，复核者是唯一的裁判。
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -631,16 +630,9 @@ def clean_verdict(raw) -> dict:
             waivers.append({"tests": _as_list(w.get("tests"), 50, 500), "quote": str(w.get("quote") or "")[:1000],
                             "reason": str(w.get("reason") or "")[:1000],
                             "requirement": str(w.get("requirement") or "").strip()[:20] or None})
-    changes = []
-    for c in v.get("behavior_changes") or []:
-        if isinstance(c, dict) and str(c.get("what") or "").strip():
-            changes.append({"what": str(c["what"]).strip()[:600], "quote": str(c.get("quote") or "")[:1000],
-                            "requirement": str(c.get("requirement") or "").strip()[:20] or None})
-        elif isinstance(c, str) and c.strip():
-            changes.append({"what": c.strip()[:600], "quote": "", "requirement": None})
     return {"merge": _bool_or_none(v.get("merge")), "reason": str(v.get("reason") or "")[:1500],
             "summary": str(v.get("summary") or "").strip().split("\n")[0][:300], "requirements": reqs[:300],
-            "waivers": waivers[:20], "behavior_changes": changes[:20], "score": _num_or_none(v.get("score")),
+            "waivers": waivers[:20], "score": _num_or_none(v.get("score")),
             "score_note": str(v.get("score_note") or "")[:500], "feedback": str(v.get("feedback") or "")[:4000]}
 
 
@@ -662,48 +654,6 @@ def _validated_level(g: Graph, r, item: dict, res: dict, run_ids: set[str]) -> t
     if level == E2 and not runs:
         level = E1
     return level, (tests if level == E3 else []), (runs if level in (E2, E3) else [])
-
-
-_CUT = re.compile(r"…|\.\.\.\s*[`'\"”’)\]]|\.\.\.\s*$")
-
-
-def quote_is_cut(quote: str, task: str) -> bool:
-    """引文所在的任务原文被截断了（省略号）：它说不清要求的条件，不能作为改变已有行为的依据。"""
-    q = normalize_ws(quote)
-    if not q:
-        return False
-    if _CUT.search(q):
-        return True
-    lines = [x for x in (normalize_ws(y) for y in task.splitlines()) if x]
-    text = " ".join(lines)                          # 与 normalize_ws(task) 相同，但记得每行的位置
-    i = text.find(q)
-    if i < 0:
-        return False
-    pos = 0
-    for x in lines:                                 # 引文覆盖到的每一行（可以跨行）
-        if pos < i + len(q) and i < pos + len(x) and _CUT.search(x):
-            return True
-        pos += len(x) + 1
-    return False
-
-
-def _behavior_changes(task: str, verdict: dict) -> tuple[list[str], list[dict]]:
-    """改变已有行为必须有任务原文明确要求：引文逐字存在于任务里，并且那段原文没有被截断。"""
-    reasons, accepted = [], []
-    for c in verdict.get("behavior_changes") or []:
-        q = normalize_ws(c.get("quote") or "")
-        what = c["what"][:300]
-        if len(q.split()) < 3 or not quote_in_text(q, task):
-            reasons.append(f"changes existing behaviour that no task text asks for: {what}. Keep the existing "
-                           "behaviour, or point to the sentence of the task that demands this change")
-        elif quote_is_cut(q, task):
-            reasons.append(f"changes existing behaviour on the strength of task text that is cut off (\"{q[:160]}\"): "
-                           f"{what}. The cut-off text does not say when the new behaviour applies: keep the existing "
-                           "behaviour wherever it already gives a result, and add the new behaviour only where the "
-                           "old code had none")
-        else:
-            accepted.append({"what": what, "quote": q[:1000], "requirement": c.get("requirement")})
-    return reasons, accepted
 
 
 def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: list[dict]) -> dict:
@@ -746,11 +696,6 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
         left = sorted(regs - taken)
         if left:
             reasons.append(f"{len(left)} regression(s) are not waived: " + ", ".join(left[:8]))
-    # ---- 已有行为的改变
-    behavior: list[dict] = []
-    if v.attempt is not None:
-        bad, behavior = _behavior_changes(task, verdict)
-        reasons += bad
     # ---- 需求
     judgements: list[dict] = []
     mentioned: list[str] = []
@@ -824,8 +769,7 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
             reasons.insert(0, "the reviewer did not approve the merge: " + (verdict.get("reason") or "no reason given"))
         merge = not reasons
     return {"merge": merge, "reasons": reasons, "notes": notes, "judgements": judgements, "mentioned": mentioned,
-            "waivers": granted, "behavior_changes": behavior, "score": score,
-            "score_note": verdict.get("score_note") or "",
+            "waivers": granted, "score": score, "score_note": verdict.get("score_note") or "",
             "label": verdict.get("summary") or "", "feedback": verdict.get("feedback") or ""}
 
 

@@ -331,9 +331,6 @@ def render_chain(ev: dict, ch: Chain) -> list[str]:
             out.append(f"       摘要：{short(v['summary'], 140)}")
         if v.get("merge") is False and v.get("reason"):
             out.append(f"       理由：{short(v['reason'], 140)}")
-        for c in (v.get("behavior_changes") or [])[:3]:
-            quote = f"（原文：{short(c.get('quote'), 60)}）" if c.get("quote") else "（没有原文依据）"
-            out.append(f"       改变已有行为：{short(c.get('what'), 100)}{quote}")
         return out
     if t == "review_decided":
         notes = p.get("notes") or []

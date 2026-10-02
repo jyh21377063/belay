@@ -188,12 +188,6 @@ def test_happy_path_done(tmp_path):
     assert L["submits"][-1]["status"] == "accepted"
     opening = h.aux.openings[-1]
     assert "## Regression gate" in opening and "def sub" in opening and "Submit summary: fixed add" in opening
-    assert "## Scope" in opening and "judge every requirement in focus" in opening
-    import re
-    from belay.runtime import prompts, reviewer
-    budget = re.compile(r"budget|\bturns?\b|minutes|time is up|your time|tokens|hurry", re.I)
-    for text in (opening, prompts.REVIEWER_SYSTEM, reviewer.WRAPUP, *reviewer.TRIGGER_TEXT.values()):
-        assert not budget.search(text), budget.search(text)              # 提示词里从不提预算
     import argparse
     import contextlib
     import io

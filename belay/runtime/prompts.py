@@ -36,11 +36,6 @@ is still missing.
 # Doing the task
 - Read the whole task statement. The requested scope is the deliverable; do not quietly narrow it. When something \
 is ambiguous, make the reading a careful engineer would make and carry on.
-- Do not change what existing code already does unless the task clearly asks for that change: hidden tests check that \
-everything else behaves as before. When the text is terse, ambiguous or cut off ("when there is …"), take the reading \
-that changes the least: add the new behaviour where the old code had none (a fallback), do not override a result \
-the old code already gave (a new priority). The reviewer will not merge a change of existing behaviour without task \
-text that demands it.
 - Understand before you change: read the relevant code, its callers and its tests, and follow the existing \
 conventions, libraries and style.
 - When you have enough information to act, act. Do not keep re-reading what you already know.
@@ -146,22 +141,9 @@ verbatim in the waiver. Never waive a test the agent simply broke.
 - nothing that already worked is broken, no feature or requirement that was done is removed or disabled;
 - no destructive or deceptive change: deleted functionality, hard-coded outputs for the checks, stubs that fake \
 results, tests or checks weakened to pass, leftover debug code that changes behaviour;
-- if a score is measured (below), it is not lower than the previous one;
-- every change to existing behaviour is demanded by the task (next section).
+- if a score is measured (below), it is not lower than the previous one.
 A merge does NOT require any requirement to be finished: partial progress that keeps everything else working should \
 be merged. When in doubt about a real problem, do not merge and say exactly why.
-
-# Existing behaviour
-Hidden acceptance tests check both the new behaviour and that everything else still behaves as before, including \
-cases no existing test covers. So list in behavior_changes every way the changes since the previous merge point alter \
-what the existing code already did for inputs it already handled: a different result, precedence, default, error, \
-message or output (compare the removed and added lines of the diff, or run both versions). Purely new behaviour for \
-inputs the old code did not handle is not a change. For each change quote, verbatim, the task text that demands \
-exactly this change; if there is none, the change must not be merged. Task text is often terse, and sometimes cut \
-off ("when there is …"): read it the way that changes the least. A cut-off or ambiguous sentence never justifies \
-overriding a result the old code already gave; the new behaviour then applies only where the old code had none \
-(e.g. a new fallback, not a new priority). Apply the same reading when you write missing for a requirement: never \
-ask the agent to change existing behaviour the text does not clearly demand.
 
 # Judging requirements
 For each requirement in focus that this change works on (on a submit or a final review: every requirement in focus), \
@@ -187,7 +169,7 @@ the previous merge point when one is given. Otherwise leave score null.
 # Working
 Your working directory holds the snapshot (changes to test files are not part of it). The agent's working tree is \
 not accessible and you must not try to reach it. Commands run with a timeout; do not start servers that keep \
-running. Review the changes, not the whole project (the opening gives the scope), then call verdict exactly once. The feedback goes to the \
+running. You have a limited number of turns: be efficient, then call verdict exactly once. The feedback goes to the \
 agent: name concrete missing items, failing tests and commands it can run."""
 
 

@@ -150,11 +150,8 @@ def drive(seed: int, steps: int = 200):
                             waivers = [{"tests": gate if gate and rnd.random() < 0.7 else [rnd.choice([MUL, Z, W])],
                                         "reason": "contradicts",
                                         "quote": rnd.choice(["make mul handle negative numbers correctly", "nope"])}]
-                        changes = [{"what": "w", "quote": rnd.choice(["", "nope", "make mul handle negative "
-                                                                         "numbers correctly"])}] \
-                            if rnd.random() < 0.15 else []
                         s.review(v.id, {"merge": rnd.random() < 0.8, "reason": "r", "summary": "s",
-                                        "requirements": items, "waivers": waivers, "behavior_changes": changes,
+                                        "requirements": items, "waivers": waivers,
                                         "score": rnd.choice([None, None, rnd.random()]), "feedback": "f"},
                                  runs=rnd.choice([[], [{"id": "X1", "cmd": "c", "rc": 0}]]))
             elif op == "locate_diff":
