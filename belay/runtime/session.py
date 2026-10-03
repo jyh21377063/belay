@@ -6,9 +6,11 @@
     L4 交接；到软阈值时若有进行中的 todo，暂缓 L2，等下一个自然停顿点（勾掉一条 todo、模型要跑测试、拿到提交结果）
     再交接；
   - 工具边界上的钩子：模型跑测试前拍快照、写类工具之后拍快照、todo 列表镜像到图上；
-  - submit 被接受时会话结束；模型停下不调用工具时先追问一次，再次停下就当作提交（结果交还给它，会话继续）；
+  - submit 被接受时会话结束（after_accept=improve 的改进阶段里不结束：回复带着复核者的改进项，会话继续）；模型停下
+    不调用工具时先追问一次，再次停下就当作提交（结果交还给它，会话继续）；
   - todo 提醒（学 Claude Code，但按事件）：第一次改文件时还没有 todo 提醒一次；刚跑完测试、有进行中的条目、之后改过
-    文件时提醒一句“做完了就勾掉”（勾掉是后台合并的时机；同一条目有上限）；之后长时间没更新再提醒，有上限；
+    文件时提醒一句“做完了就勾掉”（勾掉是后台合并的时机；同一组进行中的条目有上限）；改了文件却很久没更新 todo 时再
+    提醒（纯探索期不计时；不限次数，被忽略就拉长间隔）；多项同时进行中时按“这一组”说，不点名其中一项；
   - 每条追加进对话的消息都写进轨迹（message 记录），整体替换时写 messages_checkpoint：runtime 崩溃后可以读盘重放；
   - 模型接口多次重试仍失败时抛 ModelCallFailed：驱动可以在内存里原样重试同一个会话。
 会话返回时给出结束原因：submitted（提交被接受）| done（模型不再调用工具，隐式提交用完）| handoff（L4 / 自然停顿点）|
@@ -38,14 +40,33 @@ TEST_CMD = re.compile(r"\b(pytest|py\.test|nosetests|tox|cargo\s+test|go\s+test|
 NUDGE = "If every requirement is done, call submit; otherwise continue working."
 TODO_FIRST = ("Keeping a todo list (todo_write) is how your progress survives a context reset; for a simple change "
               "you can skip it.")
+# 提醒文字的开头保持稳定（统计脚本按开头分类：stale / done / first）
 TODO_STALE = ("The todo list has not been updated recently. If it no longer matches what you are doing, update it; "
               "if it is not useful for this task, ignore this note.")
+TODO_STALE_NONE = ("The todo list has not been written yet, and you have been changing files for a while. For "
+                   "multi-step work, a todo list (todo_write) is what you get back after a context reset, and ticking "
+                   "an item is when the harness reviews and merges your work; for a simple change, ignore this note.")
 TODO_STALE_ACTIVE = ("The todo list has not been updated recently. If \"{title}\" (in progress) is fully done, mark it "
                      "completed: ticking an item is when the harness reviews and merges your work. If the list no "
                      "longer matches what you are doing, update it; otherwise ignore this note.")
+TODO_STALE_GROUP = ("The todo list has not been updated recently. {items}: mark each one that is fully done as "
+                    "completed (items finished together can be ticked together); ticking an item is when the harness "
+                    "reviews and merges your work. If the list no longer matches what you are doing, update it; "
+                    "otherwise ignore this note.")
 TODO_DONE = ("You just ran tests while \"{title}\" is in progress. If it is now fully done, mark it completed with "
              "todo_write: ticking an item is when the harness reviews and merges your work. If it is not done yet, "
              "carry on and ignore this note.")
+TODO_DONE_GROUP = ("You just ran tests while {items}. Mark each one that is now fully done as completed with "
+                   "todo_write: ticking an item is when the harness reviews and merges your work. If none is done yet, "
+                   "carry on and ignore this note.")
+GROUP_SHOWN = 3                                   # 多项进行中时提醒里最多列几个标题
+
+
+def in_progress_phrase(titles: list[str], width: int = 120) -> str:
+    """多项进行中：'3 todo items are in progress ("A"; "B"; "C")'，超过 GROUP_SHOWN 项时写“还有 k 项”。"""
+    shown = "; ".join(f"\"{t[:width]}\"" for t in titles[:GROUP_SHOWN])
+    more = len(titles) - GROUP_SHOWN
+    return f"{len(titles)} todo items are in progress ({shown}" + (f"; and {more} more)" if more > 0 else ")")
 
 
 class ModelCallFailed(RuntimeError):
@@ -72,7 +93,7 @@ class SessionHooks(Protocol):
     def write_guard(self): ...                          # 降级模式下写类工具与切换工作区的验证互斥（异步上下文管理器）
     def boundary_count(self) -> int: ...               # 自然停顿点计数：勾掉 todo、模型要跑测试、拿到提交结果
     def has_active_todo(self) -> bool: ...
-    def active_todo_title(self) -> Optional[str]: ...  # 图上进行中的 todo（会话刚开始、模型还没写过列表时用）
+    def active_todo_titles(self) -> list[str]: ...     # 图上全部进行中的 todo（会话刚开始、模型还没写过列表时用）
     def has_todos(self) -> bool: ...
     async def implicit_submit(self, summary: str) -> tuple[str, bool]: ...   # 模型停下不调用工具时当作提交
 
@@ -120,9 +141,12 @@ class BelaySession:
         self._nudged = False                           # 模型停下后已经追问过一次
         self.implicit_submits = 0
         self._last_todo_turn = 0
-        self._todo_reminders = 0
+        self._first_reminded = False                   # “还没有 todo”的提醒（每个会话一次）
+        self._stale_reminders = 0                      # “很久没更新”的提醒次数（todo_reminder_max 为 0 时不限）
+        self._stale_from: Optional[int] = None         # 上次更新 todo（或上次提醒）之后第一次成功改文件的轮次
+        self._stale_gap = cfg.todo_reminder_turns      # 当前间隔：提醒被忽略就退避，模型更新 todo 就恢复
         self._writes_since_todo = 0                    # 上次更新 todo 之后成功改文件的次数
-        self._done_nudges: dict[str, int] = {}         # 进行中的条目 → 已提醒“做完就勾掉”的次数
+        self._done_nudges: dict[frozenset, int] = {}   # 进行中的那一组条目 → 已提醒“做完就勾掉”的次数
         self._last_done_nudge = -10**9
 
     # ---------------------------------------------------------------- 主循环
@@ -230,54 +254,78 @@ class BelaySession:
             f"result:\n{reply}</system-reminder>")}]})
         return None
 
-    def _active_title(self) -> Optional[str]:
-        """进行中的 todo：先看模型这个会话写的列表；还没写过时看图（交接后新会话的开场里有列表）。"""
+    def _active_titles(self) -> list[str]:
+        """进行中的 todo（可能有几项）：先看模型这个会话写的列表；还没写过时看图（交接后新会话的开场里有列表）。"""
         if self.ctx.todos:
-            return next((t["content"] for t in self.ctx.todos if t.get("status") == "in_progress"), None)
-        title = getattr(self.hooks, "active_todo_title", lambda: None)()
-        return title or None
+            return [str(t.get("content") or "") for t in self.ctx.todos
+                    if t.get("status") == "in_progress" and str(t.get("content") or "").strip()]
+        fn = getattr(self.hooks, "active_todo_titles", None)
+        return [t for t in (fn() if fn is not None else []) or [] if t]
 
     def _todo_notes(self, tool_uses: list[dict], results: list) -> list[str]:
         """todo 提醒（学 Claude Code，但按事件而不是只按轮数）：
           - 第一次改文件时还没有 todo，提醒一次；
           - 刚跑完测试、有进行中的条目、上次更新 todo 之后改过文件：提醒一句“做完了就勾掉”——勾掉是后台合并的时机。
-            最近几轮刚更新过 todo 时不提醒；同一条目最多 todo_done_nudge_max 次，两次之间至少隔几轮；
-          - 很久没更新：再提醒（带上进行中的条目），有上限。"""
+            最近几轮刚更新过 todo 时不提醒；同一组进行中的条目最多 todo_done_nudge_max 次，两次之间至少隔几轮；
+          - 很久没更新：从上次更新 todo（或上次提醒）之后第一次成功改文件起计轮数，纯探索（只读不写）不计；
+            不限次数，但提醒被忽略时间隔按 todo_reminder_backoff 拉长，模型更新 todo 就恢复。
+        多项同时进行中时提醒按“进行中的这一组”说，不点名其中某一项。"""
         if "todo_write" not in self.tools:
             return []
+        cfg = self.cfg
         if any(tu["name"] == "todo_write" for tu in tool_uses):
             self._last_todo_turn = self.turns
             self._writes_since_todo = 0
+            self._stale_from = None
+            self._stale_gap = cfg.todo_reminder_turns           # 模型理会了 todo：间隔恢复
             return []
         wrote = any(tu["name"] in ("edit_file", "write_file") and not err
                     for tu, (_out, err) in zip(tool_uses, results))
         if wrote:
             self._writes_since_todo += 1
-        cfg = self.cfg
+            if self._stale_from is None:
+                self._stale_from = self.turns
         tested = any(tu["name"] == "bash" and not err and TEST_CMD.search(str((tu.get("input") or {}).get("command") or ""))
                      for tu, (_out, err) in zip(tool_uses, results))
         if cfg.todo_done_nudge and tested and self._writes_since_todo > 0 and \
                 self.turns - self._last_todo_turn > cfg.todo_done_nudge_quiet_turns and \
                 self.turns - self._last_done_nudge >= cfg.todo_done_nudge_gap_turns:
-            title = self._active_title()
-            if title and self._done_nudges.get(title, 0) < cfg.todo_done_nudge_max:
-                self._done_nudges[title] = self._done_nudges.get(title, 0) + 1
+            titles = self._active_titles()
+            key = frozenset(" ".join(t.lower().split()) for t in titles)
+            if titles and self._done_nudges.get(key, 0) < cfg.todo_done_nudge_max:
+                self._done_nudges[key] = self._done_nudges.get(key, 0) + 1
                 self._last_done_nudge = self.turns
                 self._last_todo_turn = self.turns           # 很久没更新的提醒从这里重新计时
-                return [TODO_DONE.format(title=title[:200])]
-        if self._todo_reminders >= cfg.todo_reminder_max:
-            return []
-        if wrote and self._todo_reminders == 0 and not self.ctx.todos and not self.hooks.has_todos():
-            self._todo_reminders += 1
+                self._stale_from = None
+                if len(titles) == 1:
+                    return [TODO_DONE.format(title=titles[0][:200])]
+                return [TODO_DONE_GROUP.format(items=in_progress_phrase(titles))]
+        has_list = bool(self.ctx.todos) or self.hooks.has_todos()
+        if wrote and not self._first_reminded and not has_list:
+            self._first_reminded = True
             self._last_todo_turn = self.turns
+            self._stale_from = None
             return [TODO_FIRST]
-        if self.turns - self._last_todo_turn >= cfg.todo_reminder_turns and \
-                (self.ctx.todos or self.hooks.has_todos() or self._todo_reminders > 0):
-            self._todo_reminders += 1
-            self._last_todo_turn = self.turns
-            title = self._active_title()
-            return [TODO_STALE_ACTIVE.format(title=title[:200]) if title else TODO_STALE]
-        return []
+        if cfg.todo_reminder_max and self._stale_reminders >= cfg.todo_reminder_max:
+            return []
+        if self._stale_from is None or self.turns - self._stale_from < self._stale_gap:
+            return []
+        if not has_list and not self._first_reminded:
+            return []
+        self._stale_reminders += 1
+        self._last_todo_turn = self.turns
+        self._stale_from = None                             # 下一次要等之后又改过文件
+        if cfg.todo_reminder_backoff > 1:                  # 提醒之后没更新 todo：下一次间隔拉长（更新了就恢复）
+            cap = max(cfg.todo_reminder_turns, cfg.todo_reminder_turns_max)
+            self._stale_gap = min(cap, max(self._stale_gap + 1, int(self._stale_gap * cfg.todo_reminder_backoff)))
+        if not has_list:
+            return [TODO_STALE_NONE]
+        titles = self._active_titles()
+        if len(titles) == 1:
+            return [TODO_STALE_ACTIVE.format(title=titles[0][:200])]
+        if titles:
+            return [TODO_STALE_GROUP.format(items=in_progress_phrase(titles))]
+        return [TODO_STALE]
 
     async def _call(self, tool_choice: Optional[dict] = None, messages: Optional[list[dict]] = None,
                     purpose: str = "turn") -> Response:

@@ -70,6 +70,7 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 | 需求 | `plan_proposed` / `requirement_frozen` | llm / rule | 清单冻结：引文、摘要、kind、checks、acceptance |
 | | `requirement_judged` | rule / self_report | 状态 open / done / blocked，证据等级、证据、缺失项、所在合并点、来源（review / checks / self_report / rollback） |
 | todo | `todos_updated` / `todo_completed` / `todo_anchored` / `todo_invalidated` | self_report / rule | 锚点被链上合并点包含即 anchored |
+| 改进 | `improve_started` / `improvement_proposed` / `improvement_judged` / `improve_closed` | rule | 改进阶段与改进项（after_accept=improve，见 4.5） |
 | 提交 | `submit_requested` / `submit_updated` | rule | pending → accepted / returned；被拒由 `merge_rejected` 推出 |
 | 执行 | `session_*` / `compacted` / `snapshot_taken` / `stall_detected` | | |
 | 验证 | `job_started` / `job_preempted` / `job_finished` / `baseline_recorded` | rule / observed | |
@@ -142,11 +143,14 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 
 | 提醒 | 什么时候 | 上限 |
 | --- | --- | --- |
-| 做完了就勾掉（`todo_done_nudge`） | 这一轮跑了测试命令、有进行中的条目、上次更新 todo 之后成功改过文件、最近 `todo_done_nudge_quiet_turns`（3）轮没碰过 todo；只带上进行中那一条的标题 | 同一条目 `todo_done_nudge_max`（2）次，两次之间至少 `todo_done_nudge_gap_turns`（8）轮 |
+| 做完了就勾掉（`todo_done_nudge`） | 这一轮跑了测试命令、有进行中的条目、上次更新 todo 之后成功改过文件、最近 `todo_done_nudge_quiet_turns`（3）轮没碰过 todo；一项进行中时带上它的标题，几项时按“这一组”说（最多列 3 个标题） | 同一组进行中的条目 `todo_done_nudge_max`（2）次（组变了重新计数），两次之间至少 `todo_done_nudge_gap_turns`（8）轮 |
 | 第一次改文件、还没有 todo | 一次 | 1 |
-| 很久没更新（`todo_reminder_turns`，30 轮） | 有进行中的条目时带上它的标题，并说明勾选会触发复核 | 每个会话 `todo_reminder_max`（3）次 |
+| 很久没更新（`todo_reminder_turns`，30 轮） | 从上次更新 todo（或上次这类提醒）之后**第一次成功改文件**起计轮数：纯探索期（读代码、跑测试复现，没改文件）不计时；有进行中的条目时带上标题（几项时按组说），并说明勾选会触发复核；没有列表时换成“还没写列表”的说法 | 不限次数（`todo_reminder_max`=0）；提醒之后模型没更新 todo，下一次间隔 ×`todo_reminder_backoff`（2）直到 `todo_reminder_turns_max`（240），更新了就恢复 30 |
 
-交接后的新会话里模型还没写过列表时，进行中的条目从图上取。提醒都写进会话轨迹（`notices`），以后可以统计“提醒 → 勾选”
+几项可以同时 in_progress：Belay 的 `todo_write` 描述（`tools.BELAY_OVERRIDES`）写“通常一次一项，一起做的几项可以同时
+进行；每项做完就勾、一起做完的可以一起勾”。B 组 flat worker 共用的定义（`tools/shell.py`）与系统提示保持原样，对比基线
+不变。快照记下拍摄时全部进行中的条目（`snapshot_taken.todos`），定位到的改动归因、诊断者的上下文、交接后预读的文件都按
+这一组来。交接后的新会话里模型还没写过列表时，进行中的条目从图上取。提醒都写进会话轨迹（`notices`），以后可以统计“提醒 → 勾选”
 的转化。worker 不勾时 auto 兜底仍会合并进度，提醒失灵的代价只是合并点不够干净。
 
 ### 4.2 一个合并请求怎么走（`rules.advance_attempt`）
@@ -183,6 +187,31 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 最后的 submit → 最新快照还没合并就发起一次前台请求（`final` / `deadline`）→ 到点还没结束的作业与复核取消 →
 `delivered`。最新快照的复核没做完时交付的仍是链头。截止预留 = max(下限, 全量回归门耗时 × 系数 + 余量 + 一次复核)，
 最多占预算的 `reserve_max_frac`。
+
+### 4.5 需求都做完之后：收尾还是继续改进（`after_accept`）
+
+`after_accept=finalize`（默认）：submit 被接受即收尾，与之前完全相同。`after_accept=improve`（需要复核者）：需求都做完
+不等于不能更好——LHTB 这类按比例计分、隐藏评分器看不到的任务，剩下的预算用来加强已交付的版本。合并链单调，交付的
+永远是链头，所以继续做的风险只在复核者看不到的地方（SWE 的隐藏 P2P 测试、复核者自测的分数与隐藏评分器不一致），
+SWE-EVO 不开。
+
+- **复核者当 leader**：改进项（`Improvement`，I1…）只由复核者提出、只由复核者判定，worker 只做。每条必须挂到任务原文
+  的逐字引文（至少 3 个词，规则校验）或可测的目标（链上测过分数，或这次测了）上；与已有的不重复；同时 open 的最多
+  `improve_max_open`（5）条。只在需求都做完之后提（复核时估计：判完成 / 受阻，或证据检查全部通过；落地时按账本再确认），
+  和需求的判定一样只在合并（或只判定）时落地，没被合并的复核里的改进项不记。
+- **判定**：完成要有证据——链上测过分数时要 E2 / E3（复核者实际运行了），否则 E1 起；E0 只算 partial；放弃（dropped）
+  要写原因。改进项不影响 DONE 的判定。
+- **开始**：需求都做完、submit 走到 `finish_submit` 时写 `improve_started`。还没有 open 的改进项、复核者也没宣布结束时，
+  先在链头上开一次只判定的复核（触发 `improve`）请复核者提改进方向，有了结论再接受 submit——接受的回复里就带着改进项。
+  给不出挂得上的改进项，重试 `review_retries` 次后改进阶段结束（`improve_closed`，原因由规则写）。
+- **改进阶段里**：submit 被接受只是“清单都做完了”，会话不结束（`port.submit`），回复带着改进项；后台复核照常（勾掉
+  todo、交接、兜底），复核者每次都看到改进项并判定、可以补新的；后台复核更新了改进项时提醒 worker。开场与 board 有
+  “Improvements”一节。合并标准不变（不比链头差，分数不降）。
+- **进展**：改进项判完成，或合并点的分数比链上上一次测到的高出 `score_tolerance` 以上（复核决定里的 `improved`；只在
+  improve 模式下算），记到会话上。
+- **结束**（任一）：截止预留；复核者宣布没有值得做的改进了（`no_more_improvements` 写原因；open 的都要先判完成或放弃；
+  不能同时提新的；链上测过分数时这次也要测）；改进阶段开始之后开的会话里连续 `improve_idle_sessions`（2）个没有进展
+  （开始时正在进行的那个会话不算）。之后照常收尾、交付链头。收尾时正在进行的 `improve` 复核直接取消。
 
 ## 5. 复核者（`runtime/reviewer.py`）
 
@@ -248,7 +277,9 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 
 `merge_min_interval_sec`、`merge_todo_interval_sec`、`review_max_turns`、`review_max_sec`、`review_run_timeout_sec`、
 `review_retries`、`review_input_chars`、`review_locate_wait_sec`、`score_tolerance`、`notify_misses`、`reserve_review_sec`、
-`todo_done_nudge`、`todo_done_nudge_max`、`todo_done_nudge_gap_turns`、`todo_done_nudge_quiet_turns`。
+`todo_done_nudge`、`todo_done_nudge_max`、`todo_done_nudge_gap_turns`、`todo_done_nudge_quiet_turns`、
+`todo_reminder_backoff`、`todo_reminder_turns_max`（`todo_reminder_max` 默认改为 0 = 不限）、`after_accept`、
+`improve_idle_sessions`、`improve_max_open`。
 取消：`checkpoint_tier`、`deliver_unconfirmed`、`review_batch`、`review_max_reopens`、`labeler`、`label_every`。
 
 ## 11. 测试（`python -m pytest -q`，不需要容器和模型）
@@ -258,7 +289,8 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 | 事件、推导、非法转换、v7 日志被拒 | `tests/unit/test_reduce.py`、`test_rules.py::test_v7_logs_are_refused_with_a_clear_error` |
 | 合并请求（节流、交接与 todo、回归门、复核）、证据等级校验、单调（已完成不退回、E3 测试、分数）、豁免由复核者裁决、复核失败的重试与降级、只判定的复核、受阻的裁决、没有回归门的路径、收尾、DONE 的条件 | `tests/unit/test_rules.py` |
 | 后台挑快照：todo 锚点优先于之后的改动、合并期间攒下的 todo 合成一次、不抢占进行中的复核、submit 仍然取代、被拒不回退、revert 是屏障、auto 只是兜底 | `tests/unit/test_rules.py`（“边界快照”一节） |
-| todo 提醒的触发与节流（跑完测试、有进行中的条目、改过文件；同一条目上限与间隔；交接后从图上取条目） | `tests/unit/test_todo_reminders.py` |
+| todo 提醒的触发与节流（跑完测试、有进行中的条目、改过文件；同一组上限与间隔、组变了重新计数；探索期不计时；不限次数与退避；多项并行按组说；交接后从图上取条目） | `tests/unit/test_todo_reminders.py` |
+| 改进阶段：finalize 不变；接受后开始、请复核者提方向；提议的校验（引文、目标、去重、上限、需求没做完时不提）；证据等级；分数提高与改进项完成算进展；放弃与宣布结束；重试后结束；空闲会话结束；收尾取消；后台复核更新改进项；被拒的复核不记；回退重新打开 | `tests/unit/test_improve.py`、`tests/integration/test_belay_run.py`（改进阶段一节）、`test_replay.py`（improve 模式） |
 | 重放一致性（随机复核结论：失败、格式坏、豁免、分数、各种等级）；随机交错下后台总是挑最新的边界快照（性质检查） | `tests/unit/test_replay.py` |
 | 开场、等级与缺失项、board | `tests/unit/test_context.py` |
 | 端到端：复核会话（真实的复核目录与工具）、E2、复核失败、回归被拒、后台不批准的提醒、跑完测试后提醒勾掉 todo、交接、恢复、截止 | `tests/integration/test_belay_run.py`、`test_long_run.py` |

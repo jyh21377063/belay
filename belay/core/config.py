@@ -10,6 +10,7 @@
   reviewer=False         没有复核者：合并只看回归门；需求只由测试（E3）或 worker 的自述（E0）记下
   background=handoff     后台只在交接时发起合并请求；off 只在 submit 与收尾时合并
   todo_done_nudge=False  跑完测试后不提醒“做完了就勾掉”（只留第一次与长时间没更新的 todo 提醒）
+  after_accept=improve   需求都做完后不收尾，由复核者提出改进项，继续加强已交付的版本（默认 finalize：收尾）
 
 v8 的节奏：快照照常拍（不打扰 worker）→ 后台空闲时，对最新的边界快照（勾掉 todo 的锚点、交接）发起合并请求，
 很久没有边界快照时才兜底合并最新的可测快照：回归门（全量）→ 复核者 → 合并点。submit、交接与收尾不受间隔限制。
@@ -72,6 +73,12 @@ class BelayConfig:
     reserve_review_sec: float = 300
     reserve_min_sec: float = 120
     reserve_max_frac: float = 0.25
+    # ---- 需求都做完之后：finalize = 收尾交付（默认）；improve = 继续改进已交付的版本，直到截止预留、复核者认为
+    # 没有值得做的改进，或连续 improve_idle_sessions 个（改进阶段开始之后开的）会话没有进展。改进项由复核者提出，
+    # 每条挂到任务原文的引文或可测的目标上；同时 open 的最多 improve_max_open 条。需要复核者（reviewer=True）。
+    after_accept: str = "finalize"
+    improve_idle_sessions: int = 2
+    improve_max_open: int = 5
     # ---- 运行结束与停滞
     max_idle_sessions: int = 2
     max_crash_restarts: int = 3
@@ -86,11 +93,15 @@ class BelayConfig:
     mirror_consolidate: int = 32
     # ---- todo 与交接时机（模块 H）
     handoff_soft_tokens: int = 0
+    # “很久没更新 todo”：上次更新 todo 之后第一次成功改文件起计轮数（纯探索、只读不写时不计）；
+    # 提醒之后模型没有更新 todo，下一次的间隔乘以 backoff（更新了就恢复），最长 todo_reminder_turns_max
     todo_reminder_turns: int = 30
-    todo_reminder_max: int = 3
+    todo_reminder_backoff: float = 2.0
+    todo_reminder_turns_max: int = 240
+    todo_reminder_max: int = 0              # 每个会话最多几次；0 = 不限（靠间隔退避控制密度）
     # 跑完测试、有进行中的 todo、上次更新 todo 之后改过文件时，提醒一句“做完了就勾掉”（勾掉是后台合并的时机）
     todo_done_nudge: bool = True
-    todo_done_nudge_max: int = 2            # 同一条目最多提醒几次
+    todo_done_nudge_max: int = 2            # 同一组进行中的条目最多提醒几次（组变了重新计数）
     todo_done_nudge_gap_turns: int = 8      # 两次提醒之间至少隔这么多轮
     todo_done_nudge_quiet_turns: int = 3    # 最近这么多轮刚更新过 todo 时不提醒
     # ---- 上下文（模块 I）
@@ -127,6 +138,11 @@ class BelayConfig:
         return id(self)
 
     @property
+    def improve(self) -> bool:
+        """改进阶段是否可用：after_accept=improve，且有复核者（改进项由复核者提出和判定）。"""
+        return self.after_accept == "improve" and self.reviewer
+
+    @property
     def soft_handoff_tokens(self) -> int:
         return self.handoff_soft_tokens or self.l2_tokens
 
@@ -153,6 +169,12 @@ class BelayConfig:
             raise ValueError("verify_slots 至少为 1")
         if cfg.review_retries < 0 or cfg.review_max_turns < 2:
             raise ValueError("review_retries 不能为负，review_max_turns 至少为 2")
+        if cfg.after_accept not in ("finalize", "improve"):
+            raise ValueError("after_accept 只能是 finalize / improve")
+        if cfg.improve_idle_sessions < 1 or cfg.improve_max_open < 1:
+            raise ValueError("improve_idle_sessions 与 improve_max_open 至少为 1")
+        if cfg.todo_reminder_turns < 1 or cfg.todo_reminder_backoff < 1 or cfg.todo_reminder_max < 0:
+            raise ValueError("todo_reminder_turns 至少为 1，todo_reminder_backoff 不小于 1，todo_reminder_max 不能为负")
         return cfg
 
     def with_(self, **kw) -> "BelayConfig":

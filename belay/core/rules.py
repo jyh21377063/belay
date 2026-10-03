@@ -23,15 +23,17 @@ from belay.core.config import BelayConfig
 from belay.core.events import (COMPACTOR, DIAGNOSER, LLM, OBSERVED, PLANNER, REVIEWER, RULE, RUNTIME, SELF_REPORT,
                                VERIFIER, Event, worker_actor)
 from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, ATT_REJECTED, BY_CHECKS,
-                              BY_REVIEW, BY_ROLLBACK, BY_SELF, E0, E1, E2, E3, J_BLOCKED, J_DONE, J_NOT_DONE,
-                              J_PARTIAL, JOB_CANCELLED, JOB_FINISHED, JOB_RUNNING, JOB_UNKNOWN, LANE_BG, LANE_FG,
+                              BY_REVIEW, BY_ROLLBACK, BY_SELF, E0, E1, E2, E3, IMP_DONE, IMP_DROPPED, IMP_OPEN,
+                              J_BLOCKED, J_DONE, J_NOT_DONE, J_PARTIAL, JOB_CANCELLED, JOB_FINISHED, JOB_RUNNING,
+                              JOB_UNKNOWN, LANE_BG, LANE_FG,
                               LEVEL_RANK, LEVELS, REQ_BLOCKED, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_FAILED,
                               REV_RECORDED, REV_RUNNING, RUN_RUNNING, SUB_PENDING, TODO_ACTIVE, TODO_ANCHORED,
                               TODO_COMPLETED, TODO_PENDING, WHERE_LIVE, WHERE_SLOT, WHERE_WORKSPACE, Attempt, Graph,
                               Review, Snapshot)
 from belay.core.plan import normalize_ws, quote_in_text
-from belay.core.queries import (actionable, broken_requirements, chain, chain_ids, consecutive_crashes,
-                                current_todo, delivery_checkpoint, evidence_checks, is_ancestor, judged_on_tree,
+from belay.core.queries import (actionable, active_todos, broken_requirements, chain, chain_ids, consecutive_crashes,
+                                delivery_checkpoint, evidence_checks, improve_idle_sessions, improvements_in_order,
+                                improving, is_ancestor, judged_on_tree, open_improvements,
                                 last_bg_review_t, last_score, last_session, latest_snapshot, mentioned_requirements,
                                 next_id, num, open_attempt, open_persistent, open_requirements, open_submit,
                                 remaining_sec, reserve_sec, running_review, sessions_without_progress,
@@ -48,6 +50,8 @@ HANDOFF_REASONS = ("handoff", "session_end")
 FOREGROUND_REASONS = ("submit", "final", "deadline")
 # 有人在等结论的合并请求（被拒时定位、诊断并告诉 worker）
 DECLARED_TRIGGERS = ("submit",)
+# 只判定、不合并的复核：需求都做完、改进阶段里还没有 open 的改进项时，请复核者提出改进方向（after_accept=improve）
+IMPROVE_TRIGGER = "improve"
 
 
 class Rejected(Exception):
@@ -265,12 +269,13 @@ def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
     if same and not (reason in HANDOFF_REASONS and last.reason not in HANDOFF_REASONS):
         return last.n
     n = g.last_snapshot + 1
-    cur = current_todo(g)
+    act = active_todos(g)
     ws = g.workers.get(worker)
     tx.emit("snapshot_taken", RUNTIME, OBSERVED, snapshot=n, worker=worker, tree=obs.tree, raw_tree=obs.raw_tree,
             reason=reason, testable=bool(obs.testable), commit=obs.commit, base=g.head,
             files=[list(x) for x in obs.files][:500], dropped=list(obs.dropped)[:200],
-            todo=cur.id if cur else None, session=obs.session or (ws.session if ws else None),
+            todo=act[0].id if act else None, todos=[t.id for t in act],
+            session=obs.session or (ws.session if ws else None),
             tool_seq=obs.tool_seq, precheck=obs.precheck[:1000])
     if reason != "todo":                            # 勾掉 todo 的锚点快照：update_todos 记下完成之后再发起（触发是 todo）
         schedule_background(tx)
@@ -650,10 +655,43 @@ def clean_verdict(raw) -> dict:
             waivers.append({"tests": _as_list(w.get("tests"), 50, 500), "quote": str(w.get("quote") or "")[:1000],
                             "reason": str(w.get("reason") or "")[:1000],
                             "requirement": str(w.get("requirement") or "").strip()[:20] or None})
-    return {"merge": _bool_or_none(v.get("merge")), "reason": str(v.get("reason") or "")[:1500],
-            "summary": str(v.get("summary") or "").strip().split("\n")[0][:300], "requirements": reqs[:300],
-            "waivers": waivers[:20], "score": _num_or_none(v.get("score")),
-            "score_note": str(v.get("score_note") or "")[:500], "feedback": str(v.get("feedback") or "")[:4000]}
+    out = {"merge": _bool_or_none(v.get("merge")), "reason": str(v.get("reason") or "")[:1500],
+           "summary": str(v.get("summary") or "").strip().split("\n")[0][:300], "requirements": reqs[:300],
+           "waivers": waivers[:20], "score": _num_or_none(v.get("score")),
+           "score_note": str(v.get("score_note") or "")[:500], "feedback": str(v.get("feedback") or "")[:4000]}
+    if any(k in v for k in ("improvements", "new_improvements", "no_more_improvements")):
+        out.update(_clean_improvements(v))
+    return out
+
+
+def _clean_improvements(v: dict) -> dict:
+    """改进项（after_accept=improve）的格式规整：对已有改进项的判定、新提议、“没有值得做的改进了”。"""
+    judged = []
+    for item in v.get("improvements") or []:
+        if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+            continue
+        st = str(item.get("status") or "").strip().lower().replace(" ", "_").replace("-", "_")
+        st = IMP_DROPPED if st in ("dropped", "drop", "abandoned", "not_worth_it", "blocked") else \
+            _STATUS_WORDS.get(st)
+        lv = str(item.get("level") or "").strip().upper()
+        judged.append({"id": str(item["id"]).strip()[:20], "status": st, "level": lv if lv in LEVELS else None,
+                       "evidence": _as_list(item.get("evidence"), 10), "tests": _as_list(item.get("tests"), 20, 500),
+                       "runs": _as_list(item.get("runs"), 20, 20), "missing": _as_list(item.get("missing"), 10),
+                       "reason": str(item.get("reason") or "")[:600]})
+    new = []
+    for p in v.get("new_improvements") or []:
+        if isinstance(p, str):
+            p = {"title": p}
+        if not isinstance(p, dict):
+            continue
+        title = " ".join(str(p.get("title") or "").split())[:300]
+        if title:
+            new.append({"title": title, "why": str(p.get("why") or "")[:800], "quote": str(p.get("quote") or "")[:1000],
+                        "objective": bool(_bool_or_none(p.get("objective")))})
+    raw = v.get("no_more_improvements")
+    return {"improvements": judged[:50], "new_improvements": new[:20],
+            "no_more_improvements": bool(raw) if not isinstance(raw, str) else bool(raw.strip()),
+            "no_more_reason": raw.strip()[:1000] if isinstance(raw, str) else ""}
 
 
 def _validated_level(g: Graph, r, item: dict, res: dict, run_ids: set[str]) -> tuple[str, list[str], list[str]]:
@@ -782,6 +820,10 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
     if v.attempt is not None and score is not None and prev is not None and \
             score < prev - cfg.score_tolerance * abs(prev):
         reasons.append(f"the score dropped from {prev:g} (merge point {prev_cp}) to {score:g}")
+    improved = bool(cfg.improve and v.attempt is not None and score is not None and prev is not None
+                    and score > prev + cfg.score_tolerance * abs(prev))
+    # ---- 改进项（after_accept=improve）
+    improvements = _decide_improvements(g, cfg, v, verdict, res, run_ids, judgements, score, notes)
     # ---- 合并
     merge = None
     if v.attempt is not None:
@@ -790,7 +832,124 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
         merge = not reasons
     return {"merge": merge, "reasons": reasons, "notes": notes, "judgements": judgements, "mentioned": mentioned,
             "waivers": granted, "score": score, "score_note": verdict.get("score_note") or "",
-            "label": verdict.get("summary") or "", "feedback": verdict.get("feedback") or ""}
+            "label": verdict.get("summary") or "", "feedback": verdict.get("feedback") or "",
+            "improvements": improvements, "improved": improved}
+
+
+def _norm_imp(title: str) -> str:
+    return " ".join(str(title).lower().split())
+
+
+def _improve_phase_after(g: Graph, judgements: list[dict], res: dict) -> bool:
+    """这次复核的判定落地之后，是否可以提出改进项（或宣布没有值得做的改进了）：改进阶段已经开始，或者需求都做完了
+    （复核者判完成 / 受阻，或证据检查在这棵树上全部通过——合并时规则会记 E3）。收尾、截止预留、改进阶段已结束时不行。
+    这是复核时的估计；落地时（_apply_improvements）再按账本确认一次。"""
+    run = g.run
+    if run is None or run.finalizing or run.reserve or run.improve_closed:
+        return False
+    if run.improving:
+        return True
+    st = {r.id: r.status for r in actionable(g)}
+    for j in judgements:
+        st[j["requirement"]] = j["status"]
+    for r in actionable(g):
+        ev = evidence_checks(g, r)
+        if st.get(r.id) == REQ_OPEN and ev and all(res.get(c) == PASSED for c in ev) and \
+                not any(j["requirement"] == r.id for j in judgements):
+            st[r.id] = REQ_DONE
+    return bool(st) and not any(s == REQ_OPEN for s in st.values())
+
+
+def _decide_improvements(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, res: dict, run_ids: set[str],
+                         judgements: list[dict], score: Optional[float], notes: list[str]) -> Optional[dict]:
+    """复核者对改进项的结论的校验（纯函数）：
+      - 判定已有的 open 改进项：完成要有证据——链上测过分数（或这次测了）时要 E2 / E3，否则 E1 起；E0 只算 partial；
+        放弃要写原因；
+      - 新提议：只在需求都做完之后（或改进阶段里）；每条挂到任务原文的逐字引文（至少 3 个词）或可测的目标（链上测过
+        分数，或这次测了）上；与已有的不重复；同时 open 的最多 improve_max_open 条；
+      - “没有值得做的改进了”：要写原因；链上测过分数时这次也要测；open 的改进项都要先判完成或放弃；不能同时提新的。
+    返回 {judged, proposed, closed}；没有打开 after_accept=improve 时返回 None。"""
+    if not cfg.improve or g.run is None:
+        return None
+    task = g.run.task
+    scored = score is not None or last_score(g)[0] is not None
+    need = E2 if scored else E1
+    out: dict = {"judged": [], "proposed": [], "closed": None}
+    settled: set[str] = set()
+    seen: set[str] = set()
+    for item in verdict.get("improvements") or []:
+        i = g.improvements.get(item["id"])
+        if i is None or i.status != IMP_OPEN or i.id in seen or item.get("status") is None:
+            continue
+        seen.add(i.id)
+        status = item["status"]
+        missing = list(item.get("missing") or [])
+        base = {"improvement": i.id, "evidence": list(item.get("evidence") or []), "missing": missing,
+                "reason": item.get("reason") or ""}
+        if status == IMP_DROPPED:
+            why = (item.get("reason") or "; ".join(missing)).strip()
+            if not why:
+                notes.append(f"{i.id}: dropping an improvement needs a reason; it stays open")
+                continue
+            out["judged"].append({**base, "status": IMP_DROPPED, "judgement": IMP_DROPPED, "reason": why[:600]})
+            settled.add(i.id)
+        elif status == J_DONE:
+            level, tests, runs = _validated_level(g, None, item, res, run_ids)
+            if LEVEL_RANK[level] < LEVEL_RANK[need]:
+                notes.append(f"{i.id}: judged done with {level} evidence; an improvement needs {need} or better "
+                             + ("(the task has a measured score: run it)" if scored else "") + "; it stays open")
+                out["judged"].append({**base, "status": IMP_OPEN, "judgement": J_PARTIAL,
+                                      "missing": missing + [f"evidence {need} or better"]})
+                continue
+            out["judged"].append({**base, "status": IMP_DONE, "judgement": J_DONE, "level": level, "tests": tests,
+                                  "runs": runs})
+            settled.add(i.id)
+        else:
+            out["judged"].append({**base, "status": IMP_OPEN, "judgement": status if status != J_BLOCKED
+                                  else J_NOT_DONE})
+    proposals = verdict.get("new_improvements") or []
+    claim = bool(verdict.get("no_more_improvements"))
+    if not _improve_phase_after(g, judgements, res):
+        if proposals or claim:
+            notes.append("improvements are proposed only once every requirement on the checklist is done; ignored")
+        return out
+    open_left = [i.id for i in g.improvements.values() if i.status == IMP_OPEN and i.id not in settled]
+    titles = {_norm_imp(i.title) for i in g.improvements.values()}
+    for p in proposals:
+        key = _norm_imp(p["title"])
+        if key in titles:
+            notes.append(f"improvement \"{p['title'][:80]}\" ignored: it is already on the list")
+            continue
+        q = normalize_ws(p.get("quote") or "")
+        quoted = len(q.split()) >= 3 and quote_in_text(q, task)
+        objective = bool(p.get("objective")) and scored
+        if not quoted and not objective:
+            notes.append(f"improvement \"{p['title'][:80]}\" ignored: it is tied neither to verbatim task text nor "
+                         "to a measured score")
+            continue
+        if len(open_left) + len(out["proposed"]) >= cfg.improve_max_open:
+            notes.append(f"at most {cfg.improve_max_open} improvements can be open at a time; the rest were ignored")
+            break
+        out["proposed"].append({"title": p["title"], "why": p.get("why") or "", "quote": q[:1000] if quoted else "",
+                                "objective": objective})
+        titles.add(key)
+    if claim:
+        problems = []
+        reason = (verdict.get("no_more_reason") or "").strip()
+        if not reason:
+            problems.append("give the reason")
+        if out["proposed"]:
+            problems.append("it also proposes new improvements")
+        if open_left:
+            problems.append(f"{', '.join(open_left)} {'is' if len(open_left) == 1 else 'are'} still open: judge "
+                            "them done or drop them")
+        if last_score(g)[0] is not None and score is None:
+            problems.append("the task has a measured score: measure it in this review")
+        if problems:
+            notes.append("no_more_improvements ignored: " + "; ".join(problems))
+        else:
+            out["closed"] = reason[:1000]
+    return out
 
 
 def record_review(tx: Tx, vid: str, verdict: Optional[dict], runs: Iterable[dict] = (), failed: bool = False,
@@ -804,6 +963,9 @@ def record_review(tx: Tx, vid: str, verdict: Optional[dict], runs: Iterable[dict
     if not failed:
         if v.attempt is not None and clean.get("merge") is None:
             failed, error = True, error or "the verdict does not say whether to merge"
+        elif v.attempt is None and v.trigger == IMPROVE_TRIGGER:
+            if not (clean.get("new_improvements") or clean.get("improvements") or clean.get("no_more_improvements")):
+                failed, error = True, error or "the verdict neither proposes improvements nor says there are none"
         elif v.attempt is None and not clean.get("requirements"):
             failed, error = True, error or "the verdict judges no requirement"
     runs = [{"id": str(x.get("id")), "cmd": str(x.get("cmd") or "")[:500],
@@ -818,6 +980,7 @@ def record_review(tx: Tx, vid: str, verdict: Optional[dict], runs: Iterable[dict
             tx.emit("waiver_granted", REVIEWER, RULE, review=vid, **w)
         if v.attempt is None:                       # 只判定：判定落在被判定的合并点上
             _apply_judgements(tx, vid, v.checkpoint)
+            _apply_improvements(tx, vid, v.checkpoint)
             if v.submit is not None:
                 finish_submit(tx, v.submit)
     _cascade(tx)
@@ -841,6 +1004,45 @@ def _apply_judgements(tx: Tx, vid: str, cid: int) -> None:
                 missing=j.get("missing") or [], checkpoint=cid, review=vid, by=BY_REVIEW, reason=j.get("reason"),
                 blocked_kind=j.get("blocked_kind"), blocked_reason=j.get("blocked_reason"),
                 blocked_quote=j.get("blocked_quote"))
+
+
+def _apply_improvements(tx: Tx, vid: str, cid: int) -> None:
+    """复核者对改进项的结论（已在 decide_review 校验）落在合并点上：判定、新提议、宣布没有值得做的改进了。
+    和需求的判定一样，只在合并（或只判定）时落地；没被合并的复核里的改进项不记。在需求的判定与证据检查（E3）都
+    落地之后调用：新提议与“没有值得做的改进了”要求那时需求都做完了（或改进阶段已经开始）。"""
+    g, cfg = tx.g, tx.cfg
+    if not _running_run(g) or cid not in g.checkpoints or not is_ancestor(g, cid, g.head):
+        return
+    d = g.reviews[vid].decision.get("improvements") or {}
+    if not d or not cfg.improve:
+        return
+    for j in d.get("judged") or []:
+        i = tx.g.improvements.get(j["improvement"])
+        if i is None or i.status != IMP_OPEN:
+            continue
+        if j["status"] == IMP_DONE and j.get("level") == E3:   # E3 的测试必须在这个合并点上通过
+            res = results_for_tree(tx.g, tx.g.checkpoints[cid].tree)
+            if not all(res.get(t) == PASSED for t in j.get("tests") or ()):
+                continue
+        tx.emit("improvement_judged", REVIEWER, RULE, improvement=i.id, status=j["status"],
+                judgement=j.get("judgement"), level=j.get("level") if j["status"] == IMP_DONE else None,
+                evidence=j.get("evidence") or [], tests=j.get("tests") or [], runs=j.get("runs") or [],
+                missing=j.get("missing") or [], checkpoint=cid, review=vid, reason=j.get("reason") or "")
+    run = tx.g.run
+    if run.finalizing or run.reserve or run.improve_closed or not (run.improving or not open_requirements(tx.g)):
+        return
+    titles = {_norm_imp(i.title) for i in tx.g.improvements.values()}
+    for p in d.get("proposed") or []:
+        if len(open_improvements(tx.g)) >= cfg.improve_max_open:
+            break
+        if _norm_imp(p["title"]) in titles:
+            continue
+        tx.emit("improvement_proposed", REVIEWER, RULE, improvement=next_id("I", tx.g.improvements),
+                title=p["title"], why=p.get("why") or "", quote=p.get("quote") or "",
+                objective=bool(p.get("objective")), review=vid, checkpoint=cid)
+        titles.add(_norm_imp(p["title"]))
+    if d.get("closed") and not open_improvements(tx.g):
+        tx.emit("improve_closed", REVIEWER, RULE, reason=d["closed"], review=vid, by="reviewer")
 
 
 def _auto_checks(tx: Tx, cid: int) -> None:
@@ -890,6 +1092,8 @@ def _after_merge(tx: Tx, cid: int) -> None:
     if cp.review is not None:
         _apply_judgements(tx, cp.review, cid)
     _auto_checks(tx, cid)
+    if cp.review is not None:
+        _apply_improvements(tx, cp.review, cid)
     if a.submit is not None and tx.g.submits[a.submit].status == SUB_PENDING:
         if cp.review is None:
             _self_report(tx, a.submit, cid)
@@ -1031,7 +1235,8 @@ def advance_locate(tx: Tx, lid: str) -> None:
 def _attribution(g: Graph, p: dict) -> dict:
     if p.get("kind") == "snapshot" and p.get("id") in g.snapshots:
         s = g.snapshots[p["id"]]
-        return {"snapshot": s.n, "todo": s.todo, "session": s.session}
+        return {"snapshot": s.n, "todo": s.todo, "todos": list(s.todos) or ([s.todo] if s.todo else []),
+                "session": s.session}
     return {"checkpoint": p.get("id")}
 
 
@@ -1252,7 +1457,9 @@ def _judge_on_head(tx: Tx, sid: str) -> None:
 
 
 def finish_submit(tx: Tx, sid: str) -> None:
-    """提交的结论：合并（或只判定）之后还有没完成的 actionable 需求 → 交还清单；没有 → 接受（运行可以收尾）。"""
+    """提交的结论：合并（或只判定）之后还有没完成的 actionable 需求 → 交还清单；没有 → 接受（运行可以收尾）。
+    after_accept=improve：需求都做完时改进阶段开始（第一次）；还没有 open 的改进项、复核者也没说“没有值得做的改进了”
+    时，先请复核者在链头上提出改进方向（只判定、不合并），有了结论再接受——这样接受的回复里就带着改进项。"""
     g = tx.g
     s = g.submits.get(sid)
     if s is None or s.status != SUB_PENDING:
@@ -1262,8 +1469,40 @@ def finish_submit(tx: Tx, sid: str) -> None:
     if s.review is not None and g.reviews[s.review].status in (REV_RUNNING, REV_RECORDED):
         return
     left = [r.id for r in open_requirements(g)]
+    if not left and tx.cfg.improve and _running_run(g) and not g.run.finalizing and not g.run.reserve:
+        if not g.run.improving:
+            tx.emit("improve_started", RUNTIME, RULE, submit=sid, checkpoint=g.head)
+        if not _improvements_ready(tx, sid):
+            return
+        g = tx.g
     tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned" if left else "accepted", open=left,
             checkpoint=s.checkpoint if s.checkpoint is not None else g.head)
+
+
+def _improvements_ready(tx: Tx, sid: str) -> bool:
+    """改进阶段里接受一次提交之前：有 open 的改进项，或改进阶段已经结束 → 可以接受。否则请复核者提出改进方向；
+    复核者给不出挂得上任务原文或可测目标的改进项（重试 review_retries 次之后），或复核者不可用 → 改进阶段结束。"""
+    g, cfg = tx.g, tx.cfg
+    if g.run.improve_closed or open_improvements(g):
+        return True
+    mine = sorted((v for v in g.reviews.values() if v.submit == sid and v.trigger == IMPROVE_TRIGGER),
+                  key=lambda v: v.seq)
+    if any(v.status in (REV_RUNNING, REV_RECORDED) for v in mine):
+        return False
+    if len(mine) > cfg.review_retries:
+        decided = [v for v in mine if v.status == REV_DECIDED]
+        reason = ("the reviewer proposed no improvement tied to the task text or to a measured objective"
+                  if decided else "the reviewer could not propose improvements")
+        tx.emit("improve_closed", RUNTIME, RULE, reason=reason, review=mine[-1].id, by="rule")
+        return True
+    if not _review_slot(tx, LANE_FG):
+        return False                                # 复核者在忙：复核结束时级联会再来
+    head = tx.g.head_cp
+    s = tx.g.submits[sid]
+    tx.emit("review_started", RUNTIME, RULE, review=next_id("V", tx.g.reviews), trigger=IMPROVE_TRIGGER,
+            checkpoint=tx.g.head, tree=head.tree, snapshot=s.snapshot, base=tx.g.head, submit=sid, focus=[],
+            gate={}, retry_of=mine[-1].id if mine else None)
+    return False
 
 
 # ======================================================================== 作业
@@ -1340,6 +1579,11 @@ def rollback(tx: Tx, worker: str, to: Optional[int] = None) -> int:
             tx.emit("requirement_judged", worker_actor(worker), RULE, requirement=r.id, status=REQ_OPEN,
                     judgement=None, by=BY_ROLLBACK, reason="rolled_back", checkpoint=to,
                     missing=[f"merge point {r.checkpoint} was rolled back"])
+    for i in improvements_in_order(tx.g):
+        if i.status == IMP_DONE and i.checkpoint in abandoned:
+            tx.emit("improvement_judged", worker_actor(worker), RULE, improvement=i.id, status=IMP_OPEN,
+                    judgement=None, checkpoint=to, reason="rolled_back",
+                    missing=[f"merge point {i.checkpoint} was rolled back"])
     keep = [c for c in chain(tx.g) if c.id not in abandoned]
     for t in sorted(tx.g.todos.values(), key=lambda t: t.n):
         if t.status not in (TODO_COMPLETED, TODO_ANCHORED):
@@ -1488,11 +1732,15 @@ def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str,
         return "wait", "merge in progress"
     if open_submit(g, worker) is not None:
         return "wait", "submit in progress"
-    if submit_accepted(g, worker):
+    imp = improving(g, cfg)                          # after_accept=improve：需求都做完了也不收尾，继续改进
+    if submit_accepted(g, worker) and not imp:
         return "finalize", "complete"
     if consecutive_crashes(g, worker) >= cfg.max_crash_restarts:
         return "finalize", "crashes"
-    if sessions_without_progress(g, worker) >= cfg.max_idle_sessions:
+    if imp:
+        if improve_idle_sessions(g, worker) >= cfg.improve_idle_sessions:
+            return "finalize", "improve_idle"
+    elif sessions_without_progress(g, worker) >= cfg.max_idle_sessions:
         return "finalize", "no_progress"
     return "start_session", session_reason(g, worker)
 
@@ -1505,6 +1753,9 @@ def begin_finalize(tx: Tx, reason: str) -> None:
     for a in list(tx.g.attempts.values()):
         if a.status == ATT_PENDING and a.lane == LANE_BG:
             supersede_attempt(tx, a.id, "finalize")
+    v = running_review(tx.g)                        # 请复核者提改进方向的复核：收尾时不再需要
+    if v is not None and v.trigger == IMPROVE_TRIGGER:
+        _cancel_review(tx, v.id, "the run is finalizing")
     _cascade(tx)                                    # 复核者空出来了：在等它的前台请求（submit）接着走
 
 

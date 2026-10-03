@@ -28,8 +28,8 @@ from belay.core.effects import Effect
 from belay.core.model import (ATT_ADVANCING, ATT_PENDING, JOB_RUNNING, LANE_BG, LANE_FG, REV_DECIDED, WHERE_SLOT,
                               WHERE_WORKSPACE)
 from belay.core.plan import renumber, validate_plan
-from belay.core.queries import (current_todo, delivery_checkpoint, last_ended_session, latest_snapshot, next_id,
-                                open_attempt, open_submit, resume_point)
+from belay.core.queries import (active_todos, current_todo, delivery_checkpoint, last_ended_session,
+                                latest_snapshot, next_id, open_attempt, open_submit, resume_point)
 from belay.core.render import ledger, ledger_markdown
 from belay.core.rules import Rejected, SnapObs
 from belay.core.verify import (guard_set, is_test_path, job_priority, reasons_for_tree, suite_layout, test_files_of,
@@ -142,9 +142,8 @@ class _Hooks:
     def has_active_todo(self) -> bool:
         return current_todo(self.run.rt.graph) is not None
 
-    def active_todo_title(self) -> Optional[str]:
-        t = current_todo(self.run.rt.graph)
-        return t.title if t is not None else None
+    def active_todo_titles(self) -> list[str]:
+        return [t.title for t in active_todos(self.run.rt.graph)]
 
     def has_todos(self) -> bool:
         return bool(self.run.rt.graph.todos)
@@ -631,10 +630,14 @@ class BelayRun:
                 base = g.checkpoints[rp["base"]].tree
                 if base != snap.raw_tree:
                     pre = [p for p, _a, _d in await self.repo.numstat(base, snap.raw_tree)][:3]
-            todo = g.todos.get(rp.get("todo") or "")
-            if todo is not None:                                        # 当前 todo 中提到且存在的路径
+            for tid in rp.get("todos") or ():                           # 进行中的 todo 中提到且存在的路径
+                todo = g.todos.get(tid)
+                if todo is None:
+                    continue
                 for tok in re.findall(r"[\w./-]+\.\w+|[\w.-]+/[\w./-]+", todo.title):
-                    if tok not in pre and len(pre) < self.cfg.l2_reread_files and \
+                    if len(pre) >= self.cfg.l2_reread_files:
+                        break
+                    if tok not in pre and \
                             (await self.env.run(f"test -f {shlex.quote(tok)}", timeout=10)).return_code == 0:
                         pre.append(tok)
         return ctx.text, ctx.summary(), pre
@@ -1093,10 +1096,16 @@ class BelayRun:
             diff = self.store.read_blob(rec["diff"], 20000) if rec.get("diff") else ""
             parts.append(f"## Located change ({rec['good'].get('id')} -> {rec['bad'].get('id')})\n```diff\n{diff}\n```")
             att = rec.get("attribution") or {}
-            todo = g.todos.get(att.get("todo") or "")
-            if todo is not None:
-                parts.append(f"## What the agent was working on then (its todo item): {todo.title}")
-                for rid in todo.requirements:
+            working = [g.todos[t] for t in (att.get("todos") or ([att["todo"]] if att.get("todo") else []))
+                       if t in g.todos]
+            if working:
+                head = "its todo item" if len(working) == 1 else "the todo items it had in progress"
+                parts.append(f"## What the agent was working on then ({head}): "
+                             + "; ".join(t.title for t in working[:5]))
+                rids = []
+                for t in working[:5]:
+                    rids += [r for r in t.requirements if r not in rids]
+                for rid in rids[:10]:
                     parts.append(f"- {rid}: \"{g.requirements[rid].quote[:800]}\"")
             sess = att.get("session")
             for c in [c for c in g.compactions if c.session == sess and c.summary][-1:]:

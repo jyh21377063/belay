@@ -4,12 +4,13 @@ from __future__ import annotations
 from typing import Optional
 
 from belay.core.config import BelayConfig
-from belay.core.model import (ACTIONABLE, ATT_REJECTED, ATT_SUPERSEDED, BY_CHECKS, BY_SELF, E0, JOB_FINISHED,
+from belay.core.model import (ACTIONABLE, ATT_REJECTED, ATT_SUPERSEDED, BY_CHECKS, BY_SELF, E0, IMP_DONE, IMP_DROPPED,
+                              IMP_OPEN, JOB_FINISHED,
                               REQ_BLOCKED, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_FAILED, SUB_ACCEPTED, SUB_REJECTED,
                               SUB_RETURNED, TODO_ANCHORED, TODO_COMPLETED, Graph, Requirement)
 from belay.core.queries import (accepted_blocked, actionable, chain, counted_done, delivery_checkpoint,
-                                evidence_checks, id_ranges, latest_submit, num, open_requirements, status_reasons,
-                                todos_in_order)
+                                evidence_checks, id_ranges, improvements_in_order, improving, latest_submit, num,
+                                open_requirements, status_reasons, todos_in_order)
 from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, active_guard, checkpoint_full_ok, full_verified,
                                reasons_for_tree, regression_ids, results_for_tree, tree_regressions)
 
@@ -49,6 +50,33 @@ def requirement_line(g: Graph, rid: str, width: int = 120) -> str:
         if failing:
             extra.append("its checks fail: " + "; ".join(failing[:3])[:300])
     return line + (f" ({'; '.join(extra)})" if extra else "")
+
+
+def improvement_line(g: Graph, iid: str, width: int = 160) -> str:
+    """I2 [open, judged partial] 标题 — 为什么（task: "引文" / objective: the measured score）。"""
+    i = g.improvements[iid]
+    if i.status == IMP_DONE:
+        state = f"done {i.level}"
+    elif i.status == IMP_DROPPED:
+        state = "dropped"
+    else:
+        state = "open" + (f", judged {i.judgement.replace('_', ' ')}" if i.judgement in ("partial", "not_done") else "")
+    line = f"{i.id} [{state}] {i.title[:width]}"
+    tie = f"task: \"{i.quote[:120]}\"" if i.quote else "objective: the measured score" if i.objective else ""
+    extra = [x for x in (i.why[:200] if i.why else "", tie) if x]
+    if i.status == IMP_OPEN and i.missing:
+        extra.append("missing: " + "; ".join(i.missing[:3])[:300])
+    if i.status == IMP_DROPPED and i.reason:
+        extra.append(f"dropped: {i.reason[:200]}")
+    if i.status == IMP_DONE and i.checkpoint is not None:
+        extra.append(f"merge point {i.checkpoint}")
+    return line + (f" — {' | '.join(extra)}" if extra else "")
+
+
+def improvement_lines(g: Graph, include_closed: bool = True, limit: int = 30) -> list[str]:
+    items = [i for i in improvements_in_order(g) if include_closed or i.status == IMP_OPEN]
+    items = sorted(items, key=lambda i: (i.status != IMP_OPEN, i.n))[:limit]
+    return ["  - " + improvement_line(g, i.id) for i in items]
 
 
 def checkpoint_line(g: Graph, cid: int) -> str:
@@ -110,6 +138,11 @@ def render_board(g: Graph, worker: str, now: float, cfg: BelayConfig, status: Op
     done = [r.id for r in reqs if r.status == REQ_DONE]
     if done:
         out.append(f"Done: {id_ranges(done)} (board(status=\"done\") for evidence)")
+    if g.improvements or (g.run is not None and g.run.improving):
+        state = "in progress" if improving(g) else (f"over ({g.run.improve_closed[:200]})" if g.run.improve_closed
+                                                    else "not started")
+        out.append(f"\nImprovement phase: {state}")
+        out.extend(improvement_lines(g))
     out.append("\nMore: board(requirement=\"R3\"), board(status=...), board(view=\"merges\"), "
                "board(view=\"failures\").")
     return "\n".join(out)
@@ -240,6 +273,16 @@ def _review_lines(g: Graph, vid: Optional[str], focus_only: bool = False) -> lis
             out.append(f"  - {rid}: {(j.get('judgement') or 'open').replace('_', ' ')}"
                        + (f" ({why})" if why else "")
                        + (f" — missing: {'; '.join(j.get('missing')[:4])[:400]}" if j.get("missing") else ""))
+    for j in (d.get("improvements") or {}).get("judged") or []:
+        iid = j["improvement"]
+        if j["status"] == IMP_DONE:
+            out.append(f"  - {iid}: done ({j.get('level')})" + (f" — {'; '.join(j.get('evidence')[:2])[:200]}"
+                                                                  if j.get("evidence") else ""))
+        elif j["status"] == IMP_DROPPED:
+            out.append(f"  - {iid}: dropped — {str(j.get('reason') or '')[:300]}")
+        else:
+            out.append(f"  - {iid}: {(j.get('judgement') or 'open').replace('_', ' ')}"
+                       + (f" — missing: {'; '.join(j.get('missing')[:4])[:400]}" if j.get("missing") else ""))
     if out:
         out.insert(0, "Reviewer's judgements:")
     for n in (d.get("notes") or [])[:5]:
@@ -247,6 +290,14 @@ def _review_lines(g: Graph, vid: Optional[str], focus_only: bool = False) -> lis
     if d.get("feedback"):
         out.append(f"Reviewer's feedback: {d['feedback'][:2500]}")
     return out
+
+
+IMPROVE_PHASE_TEXT = (
+    "The run does not stop here: the remaining time goes to making the delivered version better. Work on the open "
+    "improvement items below (keeping a todo item per improvement helps); ticking a todo item or calling submit gets "
+    "your work reviewed, and only merged work is delivered, so nothing that already works may break. The reviewer "
+    "judges each item and may add new ones; if you believe an item is not worth doing or cannot be done here, say why "
+    "in your submit summary and the reviewer decides.")
 
 
 def render_submit(g: Graph, sid: str) -> str:
@@ -273,6 +324,8 @@ def render_submit(g: Graph, sid: str) -> str:
         if snap is not None and snap.dropped:
             out.append("Not included (test paths are restored to the original): " + ", ".join(snap.dropped[:10]))
         out.extend(_review_lines(g, cp.review))
+        if s.review is not None and s.review != cp.review:          # 合并之后请复核者提改进方向的那次复核
+            out.extend(_review_lines(g, s.review))
     elif cp is not None:
         out.append(f"No new changes since merge point {cp.id}.")
         out.extend(_review_lines(g, s.review))
@@ -290,6 +343,18 @@ def render_submit(g: Graph, sid: str) -> str:
             out.append(f"Done ({lv}, {label}): {id_ranges(by_level[lv])}")
         if blk:
             out.append(f"Blocked: {id_ranges(blk)}")
+        if improving(g):
+            out.append(IMPROVE_PHASE_TEXT)
+            lines = improvement_lines(g)
+            if any(i.status == IMP_OPEN for i in g.improvements.values()):
+                out.append("The reviewer's improvement items:")
+                out.extend(lines)
+            else:
+                out.append("No improvement item is open right now; the reviewer will propose more when it reviews "
+                           "your next change." + ("\nEarlier items:\n" + "\n".join(lines) if lines else ""))
+            return "\n".join(out)
+        if g.run is not None and g.run.improving and g.run.improve_closed:
+            out.append(f"The improvement phase is over: {g.run.improve_closed[:400]}")
         out.append("The harness now finalizes the run; you can stop.")
         return "\n".join(out)
     if s.status == SUB_RETURNED:
@@ -496,6 +561,13 @@ def ledger(g: Graph) -> dict:
                       "compactions": len(s.compactions), "resumes": list(s.resumes)}
                      for s in sorted(g.sessions.values(), key=lambda s: num(s.id))],
         "stalls": [{"kind": s.kind, "action": s.action} for s in g.stalls],
+        "improve": {"started": bool(g.run and g.run.improving), "closed": g.run.improve_closed if g.run else "",
+                    "items": [{"id": i.id, "title": i.title, "status": i.status, "level": i.level,
+                               "quote": i.quote, "objective": i.objective, "review": i.review,
+                               "judged_review": i.judged_review, "checkpoint": i.checkpoint, "reason": i.reason}
+                              for i in improvements_in_order(g)],
+                    "merges_after_start": sum(1 for c in g.checkpoints.values() if g.run and g.run.improve_seq
+                                              and c.created_seq > g.run.improve_seq and not c.abandoned)},
         "recoveries": g.run.recoveries if g.run else 0,
         "rebuilds": g.run.rebuilds if g.run else 0,
     }
@@ -552,6 +624,16 @@ def ledger_markdown(g: Graph) -> str:
                                                                           "gate only"))
         out.append(f"- {m['id']} ({tag}" + (f", score {m['score']:g}" if m["score"] is not None else "") + ")"
                    + (f" — {m['label']}" if m["label"] else ""))
+    imp = L["improve"]
+    if imp["started"] or imp["items"]:
+        out += ["", "## Improvement phase", "",
+                f"- {'started' if imp['started'] else 'not started'}"
+                + (f"; closed: {imp['closed']}" if imp["closed"] else "")
+                + f"; {imp['merges_after_start']} merge point(s) after it started"]
+        for i in imp["items"]:
+            out.append(f"- {i['id']} [{i['status']}{' ' + i['level'] if i['level'] else ''}] {i['title'][:160]}"
+                       + (f" (merge point {i['checkpoint']})" if i["status"] == "done" else "")
+                       + (f" — dropped: {i['reason'][:200]}" if i["status"] == "dropped" else ""))
     if L["waived"]:
         out += ["", "## Waived regression checks", "",
                 "Existing tests taken out of the regression gate because the reviewer found task text asking for "

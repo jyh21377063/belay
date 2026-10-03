@@ -19,6 +19,7 @@ from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_CREATED, ATT_PENDIN
                               WHERE_SLOT, Attempt, Checkpoint, Compaction, Diagnosis, Graph, Job, Locate, Persistent,
                               Requirement, Review, Run, Session, Snapshot, Stall, Submit, Todo, Waiver, Wip,
                               WorkerState)
+from belay.core.model import IMP_DONE, IMP_DROPPED, IMP_STATUSES, Improvement
 from belay.core.queries import evidence_checks, is_ancestor, last_session
 from belay.core.verify import PASSED, results_for_tree
 
@@ -239,6 +240,68 @@ def _requirement_judged(g: Graph, e: Event) -> Graph:
     return g
 
 
+# ======================================================================== 改进阶段（after_accept=improve）
+
+def _improve_started(g: Graph, e: Event) -> Graph:
+    _running(g)
+    _need(not g.run.improving, "improve_started twice")
+    _need(e.get("submit") in g.submits, f"improve_started for unknown submit {e.get('submit')}")
+    return replace(g, run=replace(g.run, improving=True, improve_seq=e.seq))
+
+
+def _improve_closed(g: Graph, e: Event) -> Graph:
+    _running(g)
+    _need(not g.run.improve_closed, "improve_closed twice")
+    _need(bool(str(e.get("reason") or "").strip()), "improve_closed needs a reason")
+    return replace(g, run=replace(g.run, improve_closed=str(e.get("reason"))[:1000]))
+
+
+def _improvement_proposed(g: Graph, e: Event) -> Graph:
+    _running(g)
+    iid = e.get("improvement")
+    _need(iid not in g.improvements, f"improvement {iid} exists")
+    _need(bool(str(e.get("title") or "").strip()), f"improvement {iid} has no title")
+    _need(e.get("review") in g.reviews, f"improvement {iid} from unknown review {e.get('review')}")
+    _need(not g.run.improve_closed, "improvement proposed after the improvement phase was closed")
+    n = max([i.n for i in g.improvements.values()] + [0]) + 1
+    imp = Improvement(id=iid, n=n, title=str(e.get("title"))[:300], why=str(e.get("why") or "")[:800],
+                      quote=str(e.get("quote") or "")[:1000], objective=bool(e.get("objective")),
+                      review=e.get("review"), seq=e.seq, proposed_checkpoint=e.get("checkpoint"))
+    return replace(g, improvements=_put(g.improvements, iid, imp))
+
+
+def _improvement_judged(g: Graph, e: Event) -> Graph:
+    _running(g)
+    iid = e.get("improvement")
+    _need(iid in g.improvements, f"unknown improvement {iid}")
+    i = g.improvements[iid]
+    status = e.get("status")
+    _need(status in IMP_STATUSES, f"bad improvement status {status}")
+    judgement = e.get("judgement")
+    _need(judgement is None or judgement in JUDGEMENTS + (IMP_DROPPED,), f"bad judgement {judgement}")
+    cp = e.get("checkpoint")
+    level = e.get("level")
+    tests = tuple(e.get("tests") or ())
+    if status == IMP_DONE:
+        _need(_on_chain(g, cp), f"{iid}: merge point {cp} is not on the chain")
+        _need(level in LEVELS and level != "E0", f"{iid}: done needs evidence beyond the agent's claim ({level})")
+        if level == "E3":
+            _need(bool(tests), f"{iid}: E3 needs tests")
+            res = results_for_tree(g, g.checkpoints[cp].tree)
+            _need(all(res.get(t) == PASSED for t in tests), f"{iid}: E3 tests do not pass on merge point {cp}")
+    else:
+        level, tests = None, ()
+    i2 = replace(i, status=status, judgement=judgement, level=level,
+                 evidence=tuple(str(x) for x in (e.get("evidence") or ()))[:20], tests=tests,
+                 runs=tuple(e.get("runs") or ()) if status == IMP_DONE else (),
+                 missing=tuple(str(x) for x in (e.get("missing") or ()))[:20], checkpoint=cp,
+                 judged_review=e.get("review"), reason=str(e.get("reason") or "")[:1000])
+    g = replace(g, improvements=_put(g.improvements, iid, i2))
+    if i.status != IMP_DONE and status == IMP_DONE:
+        g = _progress(g, e, None)
+    return g
+
+
 # ======================================================================== todo
 
 def _todos_updated(g: Graph, e: Event) -> Graph:
@@ -403,7 +466,7 @@ def _snapshot_taken(g: Graph, e: Event) -> Graph:
     snap = Snapshot(n=n, seq=e.seq, t=e.t, worker=w, tree=e.get("tree"), raw_tree=e.get("raw_tree"), epoch=g.epoch,
                     reason=e.get("reason"), testable=bool(e.get("testable")), commit=e.get("commit", ""), base=base,
                     files=tuple(tuple(f) for f in (e.get("files") or ())), dropped=tuple(e.get("dropped") or ()),
-                    todo=e.get("todo"), session=e.get("session"),
+                    todo=e.get("todo"), todos=tuple(e.get("todos") or ()), session=e.get("session"),
                     tool_seq=int(e.get("tool_seq") or 0), precheck=e.get("precheck", ""))
     prev = g.wips.get(w)
     wip = Wip(worker=w, base=base, tree=snap.tree, raw_tree=snap.raw_tree, files=snap.files, dropped=snap.dropped,
@@ -559,7 +622,10 @@ def _merged(g: Graph, e: Event) -> Graph:
     wip = g.wips.get(a.worker)
     if wip is not None and wip.tree == a.tree:
         g = replace(g, wips=_put(g.wips, a.worker, replace(wip, base=cid, files=(), last_rejection=None)))
-    # 合并本身不算进展：进展只来自需求完成、证据检查第一次通过、todo 被锚定（见 _requirement_judged）
+    # 合并本身不算进展：进展只来自需求完成、证据检查第一次通过（见 _requirement_judged、_check_passes）；
+    # after_accept=improve 时还有：分数比链上上一次测到的高出容差以上（复核决定里的 improved）、改进项完成
+    if d.get("improved"):
+        g = _progress(g, e, None)
     return _check_passes(g, e, a.tree)
 
 
@@ -603,6 +669,9 @@ def _rollback(g: Graph, e: Event) -> Graph:
     for r in g.requirements.values():
         _need(not (r.status in (REQ_DONE, REQ_BLOCKED) and r.checkpoint in chain_ids),
               f"requirement {r.id} is {r.status} on abandoned merge point {r.checkpoint}; reopen it first")
+    for i in g.improvements.values():
+        _need(not (i.status == IMP_DONE and i.checkpoint in chain_ids),
+              f"improvement {i.id} is done on abandoned merge point {i.checkpoint}; reopen it first")
     for t in g.todos.values():
         _need(not (t.status == TODO_ANCHORED and t.checkpoint in chain_ids),
               f"todo {t.id} is anchored on abandoned merge point {t.checkpoint}; invalidate it first")
@@ -660,7 +729,7 @@ def _review_decided(g: Graph, e: Event) -> Graph:
     merge = e.get("merge")
     _need((merge is None) == (v.attempt is None), "only a review of a merge request decides a merge")
     d = {k: e.get(k) for k in ("merge", "reasons", "notes", "judgements", "mentioned", "score", "score_note", "label",
-                                "feedback")}
+                                "feedback", "improvements", "improved")}
     return _set_review(g, replace(v, status=REV_DECIDED, decision=d))
 
 
@@ -746,6 +815,8 @@ HANDLERS: dict[str, Callable[[Graph, Event], Graph]] = {
     "delivered": _delivered,
     "plan_proposed": _plan_proposed, "requirement_frozen": _requirement_frozen,
     "requirement_judged": _requirement_judged,
+    "improve_started": _improve_started, "improve_closed": _improve_closed,
+    "improvement_proposed": _improvement_proposed, "improvement_judged": _improvement_judged,
     "todos_updated": _todos_updated, "todo_completed": _todo_completed, "todo_anchored": _todo_anchored,
     "todo_invalidated": _todo_invalidated,
     "submit_requested": _submit_requested, "submit_updated": _submit_updated,

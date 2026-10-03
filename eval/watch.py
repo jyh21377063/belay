@@ -237,7 +237,7 @@ def render_belay(ev: dict, st: State) -> list[str]:
         lines.append(f"{when}       ✋ 模型停下没调工具：追问一次")
     elif t == "implicit_submit":
         lines.append(f"{when}       📮 再次停下，当作提交（第 {ev.get('n')} 次）："
-                     + ("被接受" if ev.get("accepted") else "交还清单，会话继续"))
+                     + ("被接受" if ev.get("accepted") else "交还清单（或改进阶段里接受），会话继续"))
     elif t == "end" and st.review:
         st.done = True
         lines.append(f"── 复核会话结束：{ev.get('status') or ev.get('reason')}  轮数={ev.get('turns')}  "

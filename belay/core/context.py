@@ -19,10 +19,10 @@ from belay.core.config import BelayConfig
 from belay.core.events import Event
 from belay.core.model import (E0, REQ_BLOCKED, REQ_DONE, REQ_OPEN, TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED,
                               Graph)
-from belay.core.queries import (actionable, chain, id_ranges, last_score, latest_handoff_summary, num,
+from belay.core.queries import (actionable, chain, id_ranges, improving, last_score, latest_handoff_summary, num,
                                 open_persistent, todos_in_order)
-from belay.core.render import (checkpoint_line, render_diagnosis, render_located, requirement_line,
-                               requirement_state)
+from belay.core.render import (checkpoint_line, improvement_lines, render_diagnosis, render_located,
+                               requirement_line, requirement_state)
 from belay.core.verify import (B_FAIL, B_FLAKY, active_guard, check_unit, reasons_for_tree, regression_ids,
                                related_units, test_files_of)
 
@@ -45,6 +45,10 @@ INTRO = {
 PROTECTED = ("task", "requirements", "pending", "todos", "summary", "workspace")
 SUBMIT_LINE = ("When you believe every requirement on the checklist is done, call submit: the harness tests your "
                "work, a reviewer checks each requirement and you get back what is still missing.")
+IMPROVE_LINE = ("Every requirement on the checklist is done; the run continues to improve the delivered version until "
+                "the time is up or the reviewer finds nothing more worth doing. Work on the open improvement items; "
+                "tick a todo item or call submit to get your work reviewed and merged. Only merged work is delivered, "
+                "so nothing that already works may break.")
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,7 @@ def _pending(g: Graph, worker: str) -> str:
 
 _IMPORTANCE = {"persistent_regression": 0, "regression_located": 0, "diagnosis_recorded": 0,
                "requirement_judged": 0, "rollback": 0, "submit_updated": 0, "review_decided": 0,
+               "improvement_proposed": 0, "improvement_judged": 0, "improve_closed": 0, "improve_started": 0,
                "merge_rejected": 1, "merged": 1, "todo_anchored": 2, "job_finished": 3, "runtime_recovered": 1}
 
 
@@ -201,6 +206,15 @@ def _away_line(g: Graph, e: Event) -> Optional[str]:
     if t == "submit_updated" and e.get("status") in ("accepted", "returned"):
         return f"submit {e.get('submit')} was {e.get('status')}" + \
             (f"; still open: {id_ranges(e.get('open'))}" if e.get("open") else "")
+    if t == "improvement_proposed":
+        return f"the reviewer proposed improvement {e.get('improvement')}: {str(e.get('title'))[:160]}"
+    if t == "improvement_judged" and e.get("status") != "open":
+        return f"improvement {e.get('improvement')} was judged {e.get('status')}" + \
+            (f" ({e.get('level')})" if e.get("level") else "")
+    if t == "improve_closed":
+        return f"the improvement phase is over: {str(e.get('reason'))[:200]}"
+    if t == "improve_started":
+        return "every requirement on the checklist is done: the improvement phase started"
     if t == "todo_anchored":
         td = g.todos.get(e.get("todo"))
         return f"todo \"{td.title[:60] if td else e.get('todo')}\" is in merge point {e.get('checkpoint')}"
@@ -265,6 +279,23 @@ def _progress(g: Graph, cap_chars: int) -> str:
     if rest:
         out.append("Not done yet:\n" + body)
     return "\n".join(out)
+
+
+def _improvements(g: Graph, cfg: BelayConfig) -> str:
+    """改进阶段（after_accept=improve）：复核者提出的改进项。还没开始、也没有改进项时为空。"""
+    if not g.improvements and not improving(g, cfg):
+        return ""
+    run = g.run
+    if improving(g, cfg):
+        head = "Improvement phase: in progress. The reviewer's items (open first):"
+    elif run is not None and run.improve_closed:
+        head = f"Improvement phase: over ({run.improve_closed[:300]})."
+    else:
+        head = "Improvement items proposed by the reviewer:"
+    lines = improvement_lines(g)
+    if improving(g, cfg) and not any(i.status == "open" for i in g.improvements.values()):
+        lines.append("  (none open right now; the reviewer proposes more when it reviews your next change)")
+    return "\n".join([head] + lines)
 
 
 def _todos(g: Graph) -> str:
@@ -367,15 +398,17 @@ def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: Be
                 _requirement_index(g), True),
         Section("pending", "Open problems", "observed", "" if fresh else _pending(g, worker), True),
         Section("progress", "Requirement status", "rule", _progress(g, int(cfg.cap("progress") * cpt * 0.8))),
+        Section("improvements", "Improvements", "rule", _improvements(g, cfg)),
         Section("todos", "Your todo list", "self_report", _todos(g), True),
         Section("summary", "Your notes from earlier", "llm",
                 "" if fresh else _summary(g, worker, recent_calls if mode == "resume" else ()), True),
         Section("workspace", "Working tree", "observed", _workspace(g, worker, blobs, cfg, mode), True),
         Section("away", "While you were away", "observed", _away(g, away, blobs, cfg) if mode == "resume" else ""),
         Section("gate", "Regression gate", "observed", _gate(g, worker)),
-        Section("next", "Finishing", "rule", SUBMIT_LINE),
+        Section("next", "Finishing", "rule", IMPROVE_LINE if improving(g, cfg) else SUBMIT_LINE),
     ]
     entries = {"pending": "board() and failure_log(test=...)", "progress": "board(status=...)", "todos": "",
+               "improvements": "board()",
                "summary": "", "workspace": "board()", "away": "board()", "gate": "board(view=\"failures\")"}
     secs = [s for s in secs if s.text.strip()]
     trimmed = []
@@ -413,6 +446,7 @@ def resume_reminder(g: Graph, worker: str, now: float, cfg: BelayConfig, blobs: 
              "before editing them."]
     for key, title, text in (("pending", "Open problems", _pending(g, worker)),
                              ("progress", "Requirement status", _progress(g, int(cfg.cap("progress") * 3))),
+                             ("improvements", "Improvements", _improvements(g, cfg)),
                              ("away", "While you were away", _away(g, away, blobs, cfg))):
         if text.strip():
             parts.append(f"## {title}\n" + _clip(text, int(cfg.cap(key) * cfg.chars_per_token)))

@@ -7,10 +7,10 @@ from typing import Iterable, Optional
 
 from belay.core.config import BelayConfig
 from belay.core.verify import B_PASS, PASSED, PT_PASS, jobs_by_tree, point_status, results_for_tree
-from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_PENDING, COUNTED_LEVELS, E0, REQ_BLOCKED, REQ_DONE,
-                              REQ_OPEN, REQ_RESOLVED, REV_DECIDED, REV_RUNNING, SUB_ACCEPTED, SUB_OPEN, TODO_ACTIVE,
-                              TODO_ANCHORED, TODO_COMPLETED, Attempt, BY_SELF, Checkpoint, Graph, Requirement, Review,
-                              Session, Snapshot, Submit, Todo)
+from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_PENDING, COUNTED_LEVELS, E0, IMP_OPEN, REQ_BLOCKED,
+                              REQ_DONE, REQ_OPEN, REQ_RESOLVED, REV_DECIDED, REV_RUNNING, SUB_ACCEPTED, SUB_OPEN,
+                              TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED, Attempt, BY_SELF, Checkpoint, Graph,
+                              Improvement, Requirement, Review, Session, Snapshot, Submit, Todo)
 
 REQ_ID = re.compile(r"\bR(\d+)\b")
 
@@ -73,6 +73,40 @@ def mentioned_requirements(g: Graph, text: str) -> list[str]:
         if rid in g.requirements and rid not in out:
             out.append(rid)
     return out
+
+
+# ---------------------------------------------------------------- 改进阶段（after_accept=improve）
+
+def improvements_in_order(g: Graph) -> list[Improvement]:
+    return sorted(g.improvements.values(), key=lambda i: i.n)
+
+
+def open_improvements(g: Graph) -> list[Improvement]:
+    return [i for i in improvements_in_order(g) if i.status == IMP_OPEN]
+
+
+def improving(g: Graph, cfg: Optional[BelayConfig] = None) -> bool:
+    """改进阶段进行中：开关打开（有复核者）、需求都做完后开始了、复核者还没说“没有值得做的改进了”、没有在收尾。
+    不给 cfg 时只看图（improve_started 只在开关打开时才会写）。"""
+    return bool((cfg is None or cfg.improve) and g.run is not None and g.run.improving and not g.run.improve_closed
+                and not g.run.finalizing and not g.run.reserve)
+
+
+def improve_idle_sessions(g: Graph, worker: str) -> int:
+    """改进阶段开始之后开的会话里，最近连续几个结束了却没有进展（进展：改进项完成、分数提高、需求完成）。
+    开始改进时正在进行的那个会话不算：至少给一个新会话按改进项开场的机会。"""
+    if g.run is None or g.run.improve_seq is None:
+        return 0
+    n = 0
+    for s in reversed(sessions_of(g, worker)):
+        if s.started_seq < g.run.improve_seq:
+            break
+        if s.ended_t is None:
+            continue
+        if s.progress:
+            break
+        n += 1
+    return n
 
 
 def all_resolved(g: Graph) -> bool:
@@ -214,10 +248,16 @@ def todos_in_order(g: Graph) -> list[Todo]:
 
 
 def current_todo(g: Graph) -> Optional[Todo]:
+    """第一项进行中的 todo（单值的地方用：快照归因的主条目）。worker 可以同时进行几项，见 active_todos。"""
     for t in todos_in_order(g):
         if t.status == TODO_ACTIVE:
             return t
     return None
+
+
+def active_todos(g: Graph) -> list[Todo]:
+    """全部进行中的 todo（按列表顺序）。"""
+    return [t for t in todos_in_order(g) if t.status == TODO_ACTIVE]
 
 
 def completed_todos(g: Graph) -> int:
@@ -225,10 +265,11 @@ def completed_todos(g: Graph) -> int:
 
 
 def resume_point(g: Graph, worker: str) -> dict:
-    """恢复点 = (基底合并点, 部分快照, 当前 todo)：基底就是链头。"""
+    """恢复点 = (基底合并点, 部分快照, 进行中的 todo)：基底就是链头。todo 是第一项，todos 是全部。"""
     snap = latest_snapshot(g, worker)
-    cur = current_todo(g)
-    return {"base": g.head, "partial": snap.n if snap else None, "todo": cur.id if cur else None}
+    act = active_todos(g)
+    return {"base": g.head, "partial": snap.n if snap else None, "todo": act[0].id if act else None,
+            "todos": [t.id for t in act]}
 
 
 # ---------------------------------------------------------------- 会话与时间

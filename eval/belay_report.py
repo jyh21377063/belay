@@ -247,6 +247,18 @@ def report(trial: Optional[Path], bdir: Path) -> str:
             f"{rel(dl[-1].t) if dl else '-'}；状态 {L['status']}"
             + (f"；未 DONE 的原因：{'; '.join(L['status_reasons'])}" if L["status_reasons"] else ""),
             f"- 会话 {len(g.sessions)} 个；恢复 {run.recoveries} 次，停机 {int(run.downtime_sec)}s", ""]
+    if run.improving or g.improvements:                       # after_accept=improve
+        st = by_type.get("improve_started", [])
+        after = [c for c in merges if run.improve_seq and c.created_seq > run.improve_seq]
+        before = [c for c in merges if not run.improve_seq or c.created_seq <= run.improve_seq]
+        s0 = next((c.score for c in reversed(before) if c.score is not None), None)
+        s1 = delivered.score if delivered is not None else None
+        out.insert(-1, f"- 改进阶段：开始 {rel(st[0].t) if st else '-'}；"
+                       + (f"结束：{short(run.improve_closed, 100)}；" if run.improve_closed else "")
+                       + f"改进项 {len(g.improvements)} 条（"
+                       + "，".join(f"{k} {v}" for k, v in Counter(i.status for i in g.improvements.values()).items())
+                       + f"）；开始后合并点 {len(after)} 个"
+                       + (f"；分数 {s0:g} → {s1:g}" if s0 is not None and s1 is not None else ""))
 
     # ---- 规划器
     acts = [r for r in g.requirements.values() if r.kind == "actionable"]

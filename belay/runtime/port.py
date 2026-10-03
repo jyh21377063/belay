@@ -13,8 +13,9 @@ from typing import TYPE_CHECKING, Any
 
 from belay.core import rules as R
 from belay.core.model import JOB_FINISHED, REQ_OPEN, SUB_ACCEPTED, SUB_FINAL
-from belay.core.render import (render_board, render_diagnosis, render_located, render_review_notice,
-                               render_submit)
+from belay.core.queries import improvements_in_order, improving
+from belay.core.render import (improvement_line, render_board, render_diagnosis, render_located,
+                               render_review_notice, render_submit)
 from belay.core.rules import Rejected
 from belay.runtime.verifier import extract_failure
 
@@ -37,6 +38,7 @@ class WorkerPort:
 
     # ---------------------------------------------------------------- 通知
     def _on_events(self, events, g) -> None:
+        self._improvement_notice(events, g)
         for e in events:
             t = e.type
             if t == "stall_detected" and e.get("worker") == self.w and e.get("action") != "stop":
@@ -81,6 +83,33 @@ class WorkerPort:
                 if txt:
                     self._notices.append(txt)
 
+    def _improvement_notice(self, events, g) -> None:
+        """改进阶段：后台复核（勾掉 todo、交接、兜底）更新了改进项时提醒 worker；submit 触发的随 submit 的结果返回。"""
+        lines, closed, vid = [], None, None
+        for e in events:
+            if e.type not in ("improvement_proposed", "improvement_judged", "improve_closed"):
+                continue
+            v = g.reviews.get(e.get("review") or "")
+            if v is None or v.trigger in ("submit", "judge", "improve"):
+                continue
+            vid = v.id
+            if e.type == "improvement_proposed":
+                lines.append(f"new: {e.get('improvement')} {str(e.get('title'))[:160]}")
+            elif e.type == "improvement_judged" and e.get("status") != "open":
+                lines.append(f"{e.get('improvement')} {e.get('status')}"
+                             + (f" ({e.get('level')})" if e.get("level") else ""))
+            elif e.type == "improve_closed":
+                closed = str(e.get("reason") or "")
+        if closed is not None:
+            self._notices.append(f"The reviewer found nothing more worth improving ({closed[:400]}). Your merged work "
+                                 "is what will be delivered: call submit to finish.")
+        elif lines:
+            opened = [i for i in improvements_in_order(g) if i.status == "open"]
+            text = f"The reviewer updated the improvement items ({vid}, a background check): " + "; ".join(lines)
+            if opened:
+                text += ".\nOpen now:\n" + "\n".join("  - " + improvement_line(g, i.id) for i in opened[:10])
+            self._notices.append(text)
+
     def drain_notices(self) -> list[str]:
         out, self._notices = [n for n in self._notices if n], []
         return out
@@ -114,7 +143,8 @@ class WorkerPort:
         text = render_submit(g, sid)
         if s.status == "rejected" and s.attempt:
             text += await self._with_located(s.attempt)
-        self._accepted = s.status == SUB_ACCEPTED
+        # 被接受时会话结束、运行收尾；改进阶段里接受只是“清单都做完了”，会话继续（回复里带着改进项）
+        self._accepted = s.status == SUB_ACCEPTED and not improving(self.run.rt.graph, self.run.cfg)
         return text, self._accepted
 
     async def request(self, name: str, /, **p: Any) -> dict:

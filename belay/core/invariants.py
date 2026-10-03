@@ -7,15 +7,16 @@ from __future__ import annotations
 from typing import Iterable
 
 from belay.core.events import LLM, SELF_REPORT, Event
-from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, BY_SELF, E3, JOB_FINISHED,
-                              JOB_RUNNING, LEVELS, REQ_BLOCKED, REQ_DONE, REQ_KINDS, REQ_OPEN, REQ_STATUSES,
-                              REV_RUNNING, SUB_OPEN, TODO_ANCHORED, Graph)
+from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_CREATED, ATT_PENDING, BY_SELF, E3, IMP_DONE,
+                              IMP_STATUSES, JOB_FINISHED, JOB_RUNNING, LEVELS, REQ_BLOCKED, REQ_DONE, REQ_KINDS,
+                              REQ_OPEN, REQ_STATUSES, REV_RUNNING, SUB_OPEN, TODO_ANCHORED, Graph)
 from belay.core.queries import chain, is_ancestor
 from belay.core.verify import PASSED, regression_ids, results_for_tree
 
 AFTER_DELIVERY_OK = {"session_ended", "job_finished", "job_preempted", "runtime_recovered", "compacted"}
 # 合并、判定、豁免、交付：只能来自规则或观察（需求的自述判定只能是 E0 或自述受阻）
-EVIDENCE_EVENTS = ("merged", "merge_advancing", "todo_anchored", "delivered", "review_decided", "waiver_granted")
+EVIDENCE_EVENTS = ("merged", "merge_advancing", "todo_anchored", "delivered", "review_decided", "waiver_granted",
+                   "improvement_proposed", "improvement_judged", "improve_closed")
 
 
 def check(g: Graph) -> list[str]:
@@ -47,6 +48,18 @@ def check(g: Graph) -> list[str]:
                     bad.append(f"{r.id} is done with E0 by {r.by}: only a self-report is E0")
         elif r.level is not None:
             bad.append(f"{r.id} is {r.status} with an evidence level")
+    # 改进项：完成的在链上的合并点上、有证据等级（E1 及以上）
+    for i in g.improvements.values():
+        if i.status not in IMP_STATUSES:
+            bad.append(f"{i.id} has a bad status {i.status}")
+        if i.status == IMP_DONE:
+            cp = g.checkpoints.get(i.checkpoint) if i.checkpoint is not None else None
+            if cp is None or cp.abandoned or not is_ancestor(g, cp.id, g.head):
+                bad.append(f"{i.id} is done on a merge point that is not on the chain ({i.checkpoint})")
+            if i.level not in LEVELS or i.level == "E0":
+                bad.append(f"{i.id} is done without evidence ({i.level})")
+        elif i.level is not None:
+            bad.append(f"{i.id} is {i.status} with an evidence level")
     # 提交：每个 worker 至多一个在判定中的提交
     for w in g.workers:
         n = [s.id for s in g.submits.values() if s.worker == w and s.status in SUB_OPEN]
@@ -165,6 +178,7 @@ def llm_effects(events: list[Event]) -> list[str]:
             bad.append(f"merge_reviewed at {e.seq} is not followed by its rule decision")
     for e in events:
         if e.source == LLM and e.type in ("requirement_judged", "merged", "merge_advancing", "waiver_granted",
-                                          "todo_anchored", "review_decided"):
+                                          "todo_anchored", "review_decided", "improvement_proposed",
+                                          "improvement_judged", "improve_closed"):
             bad.append(f"{e.type} at {e.seq} comes from the llm")
     return bad

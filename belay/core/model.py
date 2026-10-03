@@ -39,6 +39,10 @@ JUDGEMENTS = (J_DONE, J_PARTIAL, J_NOT_DONE, J_BLOCKED)
 # 判定的来源（requirement_judged.by）
 BY_REVIEW, BY_CHECKS, BY_SELF, BY_ROLLBACK = "review", "checks", "self_report", "rollback"
 
+# ---- 改进项（after_accept=improve：需求都做完之后，复核者提出、复核者判定）
+IMP_OPEN, IMP_DONE, IMP_DROPPED = "open", "done", "dropped"
+IMP_STATUSES = (IMP_OPEN, IMP_DONE, IMP_DROPPED)
+
 # ---- todo（运行级，镜像 worker 的 todo_write）
 TODO_PENDING, TODO_ACTIVE, TODO_COMPLETED, TODO_ANCHORED = "pending", "in_progress", "completed", "anchored"
 
@@ -96,6 +100,32 @@ class Requirement:
     reason: Optional[str] = None             # rule：最近一次状态变化的原因（reassessed / rolled_back / ...）
     passed_checks: tuple[str, ...] = ()      # obs：在某个合并点上第一次通过过的证据检查（进展）
     history: tuple[tuple[int, str, str], ...] = ()   # rule：(序号, 状态, 原因)，最多保留最近 30 条
+
+
+@dataclass(frozen=True)
+class Improvement:
+    """改进项（after_accept=improve）：需求清单都判完成之后，复核者提出的“还能怎样加强已交付的版本”。
+    每条挂到任务原文的引文（规则逐字校验）或可测的目标（链上测过分数）上。不影响 DONE 的判定；做完它（或分数提高）
+    算进展。只由复核者判定，规则校验证据等级。"""
+    id: str                                  # I1
+    n: int
+    title: str                               # llm（已校验）：要做什么
+    why: str = ""                            # llm：为什么值得做
+    quote: str = ""                          # llm（规则校验逐字存在于任务原文）：它服务的那段原文
+    objective: bool = False                  # llm（规则校验链上测过分数）：它是为了提高测得的分数
+    review: str = ""                         # 提出它的复核
+    seq: int = 0
+    proposed_checkpoint: Optional[int] = None
+    status: str = IMP_OPEN                   # rule：open | done | dropped
+    judgement: Optional[str] = None          # rule：最近一次判定 done | partial | not_done | dropped
+    level: Optional[str] = None              # rule：done 的证据等级
+    evidence: tuple[str, ...] = ()
+    tests: tuple[str, ...] = ()
+    runs: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
+    checkpoint: Optional[int] = None         # rule：最近一次判定所在的合并点
+    judged_review: Optional[str] = None
+    reason: str = ""                         # rule：放弃的原因 / 重新打开的原因
 
 
 @dataclass(frozen=True)
@@ -219,7 +249,8 @@ class Snapshot:
     base: int = 0
     files: tuple[tuple[str, int, int], ...] = ()
     dropped: tuple[str, ...] = ()
-    todo: Optional[str] = None
+    todo: Optional[str] = None               # 拍快照时第一项进行中的 todo
+    todos: tuple[str, ...] = ()              # 拍快照时全部进行中的 todo（worker 可以同时进行几项）
     session: Optional[str] = None
     tool_seq: int = 0
     precheck: str = ""
@@ -404,6 +435,10 @@ class Run:
     suspended: int = 0
     delivered: Optional[int] = None
     status_reasons: tuple[str, ...] = ()
+    # 改进阶段（after_accept=improve）：需求都做完、submit 被接受之后开始；复核者认为没有值得做的改进了就结束
+    improving: bool = False
+    improve_seq: Optional[int] = None
+    improve_closed: str = ""                 # 结束的原因（空 = 没结束）
     recoveries: int = 0
     rebuilds: int = 0
     downtime_sec: float = 0.0
@@ -417,6 +452,7 @@ class Graph:
     requirements: dict[str, Requirement] = field(default_factory=dict)
     frozen: bool = False
     todos: dict[str, Todo] = field(default_factory=dict)
+    improvements: dict[str, Improvement] = field(default_factory=dict)
     submits: dict[str, Submit] = field(default_factory=dict)
     reviews: dict[str, Review] = field(default_factory=dict)
     baseline: dict[str, str] = field(default_factory=dict)

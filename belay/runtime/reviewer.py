@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Optional
 from belay.core import rules as R
 from belay.core.model import ACTIONABLE, JOB_RUNNING, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_RUNNING
 from belay.core.queries import actionable, last_score, latest_handoff_summary, todos_in_order
-from belay.core.render import checkpoint_line, render_job, render_located, requirement_state
+from belay.core.render import checkpoint_line, improvement_lines, render_job, render_located, requirement_state
 from belay.core.verify import (B_PASS, PASSED, PT_FAIL, active_guard, guard_set, point_status, reasons_for_tree,
                                regression_ids, results_for_tree, units)
 from belay.env import Env, ExecOutput
@@ -50,6 +50,31 @@ TRIGGER_TEXT = {
     "final": "the final check before delivery",
     "deadline": "the final check before delivery (the time budget is used up)",
     "judge": "the agent called submit without new changes: judge the requirements on the latest merge point",
+    "improve": "every requirement on the checklist is judged done and the run continues: propose how the delivered "
+               "version (the latest merge point) can be made better",
+}
+IMPROVE_SCHEMA = {
+    "improvements": {"type": "array", "description": "Your judgement of open improvement items this change works on",
+                     "items": {"type": "object", "properties": {
+                         "id": {"type": "string", "description": "Improvement id, e.g. I2"},
+                         "status": {"type": "string", "enum": ["done", "partial", "not_done", "dropped"]},
+                         "level": {"type": "string", "enum": ["E3", "E2", "E1"]},
+                         "evidence": {"type": "array", "items": {"type": "string"}},
+                         "tests": {"type": "array", "items": {"type": "string"}},
+                         "runs": {"type": "array", "items": {"type": "string"}},
+                         "missing": {"type": "array", "items": {"type": "string"}},
+                         "reason": {"type": "string", "description": "Required for dropped"}},
+                         "required": ["id", "status"]}},
+    "new_improvements": {"type": "array", "description": "New improvement items (only once every requirement is "
+                                                         "done)",
+                         "items": {"type": "object", "properties": {
+                             "title": {"type": "string", "description": "What to do, concretely (one line)"},
+                             "why": {"type": "string", "description": "Why it makes the delivered version better"},
+                             "quote": {"type": "string", "description": "Verbatim task text this serves"},
+                             "objective": {"type": "boolean", "description": "It raises the measured score"}},
+                             "required": ["title", "why"]}},
+    "no_more_improvements": {"type": "string", "description": "Only when nothing more is worth doing: why. Leave it "
+                                                              "out otherwise"},
 }
 
 
@@ -95,6 +120,27 @@ VERDICT_SCHEMA = {"type": "object", "properties": {
     "score_note": {"type": "string", "description": "How the score was measured"},
     "feedback": {"type": "string", "description": "For the agent: concrete missing items, failing tests, commands"}},
     "required": ["merge", "reason", "requirements", "feedback"]}
+
+
+def verdict_schema(improve: bool) -> dict:
+    """after_accept=improve 时 verdict 多三个字段（改进项）；默认模式下与原来完全相同。"""
+    if not improve:
+        return VERDICT_SCHEMA
+    return {**VERDICT_SCHEMA, "properties": {**VERDICT_SCHEMA["properties"], **IMPROVE_SCHEMA}}
+
+
+IMPROVE_GUIDE = """## Improvements (this run does not stop when the checklist is done)
+Once every requirement on the checklist is done, the remaining time goes to making the delivered version better, \
+and you lead that work: you judge the improvement items and propose new ones. Each item must serve the task: give \
+quote (verbatim task text it serves, at least a few words) or set objective=true when it raises the measured score \
+(then measure the score in this review). Propose only what would make the delivered result clearly better for what \
+the task asks (coverage of the task text, correctness on inputs the task implies, robustness, the measured objective); \
+not style, comments, refactoring or features nobody asked for. At most {max_open} items can be open at a time.
+- improvements: judge the open items this change works on: done (evidence E3 / E2 / E1 as for requirements{need}), \
+partial or not_done with what is missing, or dropped with the reason (not worth it, or impossible here).
+- new_improvements: only when every requirement is done after your judgements (or the phase has started).
+- no_more_improvements: only when nothing more is worth doing: give the reason; every open item must be judged done \
+or dropped first, and you propose no new one.{score_rule} The run then finalizes and the agent stops."""
 
 
 class Reviewer:
@@ -197,6 +243,12 @@ class Reviewer:
         if v.attempt is not None:
             parts.append(f"## Merge request\nThis review is {TRIGGER_TEXT.get(v.trigger, v.trigger)}. Snapshot "
                          f"s{v.snapshot} against the previous merge point {checkpoint_line(g, base.id)}.")
+        elif v.trigger == R.IMPROVE_TRIGGER:
+            parts.append(f"## Improvement directions\nThis review is {TRIGGER_TEXT['improve']} "
+                         f"({checkpoint_line(g, base.id)}). There is nothing to merge: give merge=false and "
+                         "requirements []. Read and run the delivered version, then either give new_improvements (each tied to "
+                         "the task text or to the measured score) or, if nothing more is worth doing, "
+                         "no_more_improvements with the reason.")
         else:
             parts.append(f"## Judge only\nThis review is {TRIGGER_TEXT['judge']} ({checkpoint_line(g, base.id)}). "
                          "There is nothing to merge: give merge=false and judge the requirements in focus.")
@@ -207,6 +259,8 @@ class Reviewer:
         parts.append("## Regression gate (run by the harness on this snapshot)\n" + self._gate_text(vid))
         parts.append("## Requirements\nStatus is the ledger before this review. Focus: "
                      + (", ".join(v.focus) or "(none open)") + "\n" + self._requirements_text(vid))
+        if cfg.improve:
+            parts.append(self._improve_text(vid))
         parts.append(self._claims_text(vid))
         prev = [x for x in sorted(g.reviews.values(), key=lambda x: x.seq)
                 if x.id != vid and x.status == REV_DECIDED][-1:]
@@ -291,6 +345,31 @@ class Reviewer:
                 extra.append(f"blocked ({r.blocked_kind}): {(r.blocked_reason or '')[:200]}")
             out.append(line + "".join(f"\n    {x}" for x in extra))
         return "\n".join(out)
+
+    def _improve_text(self, vid: str) -> str:
+        """after_accept=improve：改进项的说明、现有的改进项、上一次请复核者提改进方向时被忽略的部分。"""
+        g = self.run.rt.graph
+        cfg = self.run.cfg
+        scored = last_score(g)[0] is not None
+        guide = IMPROVE_GUIDE.format(
+            max_open=cfg.improve_max_open,
+            need="; with a measured score, done needs E2 or E3: measure it" if scored else "",
+            score_rule=" The task has a measured score: measure it in this review too." if scored else "")
+        run = g.run
+        state = ("The improvement phase has started." if run.improving else
+                 "The improvement phase has not started: some requirements are still open, so propose nothing unless "
+                 "your judgements leave none open.")
+        lines = [guide, state]
+        items = improvement_lines(g)
+        lines.append("Improvement items so far:\n" + "\n".join(items) if items else "Improvement items so far: none.")
+        v = g.reviews[vid]
+        prev = [x for x in sorted(g.reviews.values(), key=lambda x: x.seq)
+                if x.id != vid and x.status == REV_DECIDED and x.trigger == R.IMPROVE_TRIGGER and x.submit == v.submit]
+        for p in prev[-1:]:
+            notes = [n for n in p.decision.get("notes") or [] if "improvement" in n.lower()]
+            if notes:
+                lines.append("Your previous proposal was not usable:\n" + "\n".join(f"- {n[:300]}" for n in notes[:5]))
+        return "\n".join(lines)
 
     def _claims_text(self, vid: str) -> str:
         g = self.run.rt.graph
@@ -395,4 +474,5 @@ class Reviewer:
                 Tool("locate", "Find the change after which a test started failing, by bisecting the agent's "
                                "snapshots (the test must fail on this snapshot).",
                      {"type": "object", "properties": {"test": {"type": "string"}}, "required": ["test"]}, locate),
-                Tool("verdict", "Give your verdict. Call it exactly once, at the end.", VERDICT_SCHEMA, verdict)]
+                Tool("verdict", "Give your verdict. Call it exactly once, at the end.", verdict_schema(cfg.improve),
+                     verdict)]

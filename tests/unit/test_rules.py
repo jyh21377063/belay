@@ -943,7 +943,7 @@ def test_todos_are_mirrored_completed_and_anchored():
     assert g.todos["P1"].status == "anchored" and g.todos["P2"].status == "in_progress"
     assert g.checkpoints[g.todos["P1"].checkpoint].trigger == "todo"
     assert all(r.status == REQ_OPEN for r in g.requirements.values())    # todo 只是线索：不改变需求状态
-    assert resume_point(g, "w1") == {"base": g.head, "partial": n, "todo": "P2"}
+    assert resume_point(g, "w1") == {"base": g.head, "partial": n, "todo": "P2", "todos": ["P2"]}
     s.do(R.update_todos, "w1", [{"content": "something else", "status": "pending"}])
     assert set(s.g.todos) == {"P1", "P3"}
 

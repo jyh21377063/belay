@@ -692,3 +692,57 @@ def test_repeated_rejected_submits_get_a_hint_without_time(tmp_path):
     assert "rejected for the same reason" in notices
     assert not re.search(r"\d+ min\b|minutes|time budget|[Tt]ime left", notices)   # 时间不进给模型的文字
     h.verify_log(run)
+
+
+# ======================================================================== 改进阶段（after_accept=improve）
+
+SUB_DOC = tu("sd", "edit_file", file_path="pkg/mod.py", old_string="def sub(a, b):\n    return a - b",
+             new_string="def sub(a, b):\n    \"\"\"Return a minus b.\"\"\"\n    return a - b")
+SUBMIT2 = tu("sm2", "submit", summary="documented sub")
+
+
+def test_improve_mode_keeps_the_session_going_until_the_reviewer_has_nothing_more(tmp_path):
+    """需求都做完、submit 被接受后会话不结束：回复里带着复核者的改进项；做完之后复核者说没有值得做的了，才收尾。"""
+    def lead(opening, review_dir):
+        v = oracle(opening, review_dir)
+        mod = (review_dir / "pkg" / "mod.py").read_text()
+        if "## Improvements" not in opening or not ("called submit" in opening or "## Improvement directions"
+                                                    in opening):
+            return v
+        if "Return a minus b" in mod:
+            v.update(improvements=[{"id": "I1", "status": "done", "level": "E1", "evidence": ["sub has a docstring"]}],
+                     no_more_improvements="sub and add are complete for what the task asks")
+        elif "Improvement items so far: none" in opening:
+            v["new_improvements"] = [{"title": "Document sub", "why": "callers should know the order of operands",
+                                      "quote": "returns a minus b"}]
+        return v
+    h = Harness(tmp_path, cfg=BelayConfig(after_accept="improve"))
+    llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(ADD_SUB), call(SUBMIT), call(SUB_DOC), call(SUBMIT2)])
+    run = h.make(llm, aux=FakeAux(lead))
+    res = asyncio.run(run.start(TASK))
+    g = run.rt.graph
+    assert res.status == "DONE", g.run.status_reasons
+    assert [s.status for s in g.submits.values()] == ["accepted", "accepted"]
+    assert len(g.sessions) == 1 and g.sessions["S1"].end_reason == "submitted"   # 第一次接受没有结束会话
+    assert g.run.improving and g.run.improve_closed.startswith("sub and add")
+    i1 = g.improvements["I1"]
+    assert i1.status == "done" and i1.quote == "returns a minus b" and i1.checkpoint == g.run.delivered
+    out = tool_outputs(run, "submit")
+    assert "does not stop here" in out[0] and "I1 [open] Document sub" in out[0] and "you can stop" not in out[0]
+    assert "you can stop" in out[1] and "I1: done (E1)" in out[1]
+    assert '"""Return a minus b."""' in (h.run_dir() / "deliverable.diff").read_text()
+    verdict_tool = next(t for t in h.aux.requests[-1]["tools"] if t["name"] == "verdict")
+    assert "new_improvements" in verdict_tool["input_schema"]["properties"]
+    L = json.loads((h.run_dir() / "ledger.json").read_text())
+    assert L["improve"]["items"][0]["status"] == "done" and L["improve"]["merges_after_start"] >= 1
+    h.verify_log(run)
+
+
+def test_finalize_mode_reviewer_sees_no_improvement_fields(tmp_path):
+    h = Harness(tmp_path)
+    llm = ScriptedLLM([PLANNER, call(READ), call(FIX_ADD), call(ADD_SUB), call(SUBMIT)])
+    run = h.make(llm)
+    asyncio.run(run.start(TASK))
+    verdict_tool = next(t for t in h.aux.requests[-1]["tools"] if t["name"] == "verdict")
+    assert "new_improvements" not in verdict_tool["input_schema"]["properties"]
+    assert all("## Improvements" not in o for o in h.aux.openings)

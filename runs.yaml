@@ -150,6 +150,12 @@ agents:
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, background: handoff}}
 
+  # 变体：需求都做完后不收尾，由复核者提出改进项，继续加强已交付的版本（截止预留、复核者认为没有值得做的改进了、
+  # 或改进阶段里连续 2 个新会话没有进展时收尾）。按题选用：适合 LHTB 这类按比例计分的题；SWE-EVO 不开
+  belay-improve:
+    <<: *belay
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, after_accept: improve}}
+
 # ---------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------

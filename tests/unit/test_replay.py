@@ -44,7 +44,29 @@ FILES = [[("pkg/mod.py", 3, 1)], [("pkg/other.py", 2, 2)], [("setup.py", 1, 0)],
 TODOS = ["read the code", "fix add (R1)", "mul negatives R2", "docstring", "speed up other (R4)"]
 
 
-def drive(seed: int, steps: int = 200, boundaries: bool = False):
+IMP_TITLES = ["cover mul edge cases", "doc examples", "faster other module", "more add tests", "x"]
+IMP_QUOTES = ["make mul handle negative numbers correctly", "Speed up the other module", "not in the task at all", ""]
+
+
+def improve_verdict(r: random.Random, g) -> dict:
+    """随机的改进项结论：判定已有的（含格式坏的）、提新的（挂得上 / 挂不上原文、目标）、宣布没有值得做的了。"""
+    out: dict = {}
+    ids = list(g.improvements) + ["I9"]
+    if r.random() < 0.8:
+        statuses = ["done", "done", "partial", "not_done", "dropped", "maybe"]
+        out["improvements"] = [{"id": i, "status": r.choice(statuses),
+                                "level": r.choice(["E1", "E2", "E3", "E0", None]), "runs": r.choice([[], ["X1"]]),
+                                "tests": r.choice([[], ["tests/test_mod.py::test_add"]]),
+                                "reason": r.choice(["", "not worth it"])} for i in r.sample(ids, min(len(ids), 4))]
+    if r.random() < 0.6:
+        out["new_improvements"] = [{"title": r.choice(IMP_TITLES), "why": "w", "quote": r.choice(IMP_QUOTES),
+                                    "objective": r.random() < 0.3} for _ in range(r.randint(1, 3))]
+    if r.random() < 0.2:
+        out["no_more_improvements"] = r.choice(["nothing left", "", True])
+    return out
+
+
+def drive(seed: int, steps: int = 200, boundaries: bool = False, improve: bool | None = None):
     """boundaries=True：多勾 todo、偶尔撤回（revert），间隔取边界快照的默认量级——用来检查后台怎么挑快照。"""
     rnd = random.Random(seed)
     cfg = BelayConfig(stall_no_progress_sec=900, reserve_min_sec=60, confirm_regressions=rnd.random() < 0.7,
@@ -55,6 +77,11 @@ def drive(seed: int, steps: int = 200, boundaries: bool = False):
                       waive_max_tests=rnd.choice([1, 20]), stall_same_failure=rnd.choice([2, 3]))
     if boundaries:
         cfg = replace(cfg, merge_min_interval_sec=rnd.choice([0, 900]), merge_todo_interval_sec=rnd.choice([0, 60]))
+    # 改进阶段（after_accept=improve）：用单独的随机数，不打乱上面的主序列
+    rimp = random.Random(seed * 7919 + 13)
+    if improve if improve is not None else rimp.random() < 0.4:
+        cfg = replace(cfg, after_accept="improve", improve_max_open=rimp.choice([1, 3, 5]),
+                      improve_idle_sessions=rimp.choice([1, 2]))
     s = Sim(BASE, cfg=cfg, auto_jobs=False, auto_located=rnd.random() < 0.8, reviewer=MANUAL)
     s.setup(TASK, PLAN, budget=rnd.choice([1500, 20000]))
     s.do(R.start_session, "w1", "first", {})
@@ -158,10 +185,12 @@ def drive(seed: int, steps: int = 200, boundaries: bool = False):
                             waivers = [{"tests": gate if gate and rnd.random() < 0.7 else [rnd.choice([MUL, Z, W])],
                                         "reason": "contradicts",
                                         "quote": rnd.choice(["make mul handle negative numbers correctly", "nope"])}]
-                        s.review(v.id, {"merge": rnd.random() < 0.8, "reason": "r", "summary": "s",
-                                        "requirements": items, "waivers": waivers,
-                                        "score": rnd.choice([None, None, rnd.random()]), "feedback": "f"},
-                                 runs=rnd.choice([[], [{"id": "X1", "cmd": "c", "rc": 0}]]))
+                        verdict = {"merge": rnd.random() < 0.8, "reason": "r", "summary": "s",
+                                   "requirements": items, "waivers": waivers,
+                                   "score": rnd.choice([None, None, rnd.random()]), "feedback": "f"}
+                        if s.cfg.improve:
+                            verdict.update(improve_verdict(rimp, s.g))
+                        s.review(v.id, verdict, runs=rnd.choice([[], [{"id": "X1", "cmd": "c", "rc": 0}]]))
             elif op == "locate_diff":
                 for loc in [l for l in s.g.locates.values() if l.status == "concluded"][:1]:
                     for i in range(len(loc.groups)):
@@ -308,3 +337,32 @@ def test_boundary_fuzz_actually_coalesces_todos_and_falls_back_to_auto():
         for k, v in _bg_choice_problems(s.log, s.cfg)[1].items():
             total[k] += v
     assert all(v >= 5 for v in total.values()), total
+
+
+# ======================================================================== 改进阶段（after_accept=improve）
+
+@pytest.mark.parametrize("seed", range(30))
+def test_replay_consistency_in_improve_mode(seed):
+    s, snaps = drive(5000 + seed, steps=250, improve=True)
+    log, g = s.log, s.g
+    assert not check(g) and not check_log(log) and not llm_effects(log)
+    assert replay(log) == g
+    for k in random.Random(seed).sample(range(len(log) + 1), 4):
+        snap = graph_from_json(json.loads(json.dumps(to_json(replay(log[:k])))))
+        assert replay(log[k:], start=snap) == g
+    for i in g.improvements.values():                          # 改进项只由校验过的复核结论产生
+        assert i.review in g.reviews and (i.quote or i.objective)
+
+
+def test_fuzz_actually_exercises_the_improve_phase():
+    types: set[str] = set()
+    statuses: set[str] = set()
+    triggers: set[str] = set()
+    for seed in range(30):
+        s, _ = drive(5000 + seed, steps=250, improve=True)
+        types |= {e.type for e in s.log}
+        statuses |= {e.get("status") for e in s.log if e.type == "improvement_judged"}
+        triggers |= {e.get("trigger") for e in s.log if e.type == "review_started"}
+    assert {"improve_started", "improvement_proposed", "improvement_judged", "improve_closed"} <= types, types
+    assert {"done", "dropped", "open"} <= statuses, statuses
+    assert "improve" in triggers
