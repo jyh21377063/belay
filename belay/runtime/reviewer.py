@@ -284,7 +284,12 @@ class Reviewer:
             parts.append("The agent also changed these test files; they are not part of the snapshot (tests always "
                          "run in their original version): " + ", ".join(snap.dropped[:20]))
         spec = run.spec
-        how = [f"Your working directory is {self.review_dir}: a copy of the snapshot, yours to build and run in."]
+        how = [f"Your working directory is {self.review_dir}: a copy of the snapshot, yours to build and run in.",
+               f"The task text refers to the agent's working tree {run.env.workdir}; your copy of it is this "
+               f"directory ({run.env.workdir.rstrip('/')}/X is ./X here). A program that reads or writes absolute "
+               f"paths under {run.env.workdir} (its default paths, a config file, an environment variable) works on "
+               "the agent's live files, not on this snapshot: point it at your copy (its source is here too; look "
+               f"for an option or environment variable), and never write under {run.env.workdir}."]
         if spec.test_cmd:
             how.append(f"The harness runs tests as: {spec.test_cmd}" + (f" (after: {spec.prelude})" if spec.prelude
                                                                          else "")

@@ -70,6 +70,11 @@ class ShadowRepo:
 
     async def init(self) -> tuple[str, str]:
         g = shlex.quote(self.git_dir)
+        res = await self.env.run("command -v git", timeout=30, cwd="/")
+        if res.return_code != 0:
+            raise GitError("git is not installed in the task container: Belay's shadow repository needs it. "
+                           "Prepare the task with an image that has git (python -m eval.prepare adds it to LHTB / "
+                           "DeepSWE images that lack it).")
         await self._run(f"mkdir -p {g} && {self._git()} init -q && {self._git()} config core.bare false && "
                         f"printf '%s\\n' {shlex.quote(chr(10).join(EXCLUDES))} > {g}/info/exclude")
         await self._run(f"cd {shlex.quote(self.workspace)} && "
