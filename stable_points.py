@@ -2,12 +2,14 @@
 
 不改任何代码与文件。放在 belay/ 目录下运行（需要项目的 venv）：
   python stable_points.py v9-conan v9-spot-improve-2
-  python stable_points.py v9-spot-improve-2 --test-re "simulate (run|score)"   # LHTB：任务自带的验证命令也算自测
-  python stable_points.py v9-conan --lines 80 --quiet-min 3 --min-gap 5 --cap 20
+  python stable_points.py v9-spot-improve-2 --test-re "simulate (run|score)"   # 把任务自带的验证命令也算作测试
+  python stable_points.py v9-conan --lines 80 --min-gap 5 --cap 20
+  python stable_points.py v9-spot-improve-2 --no-generic   # 只认测试命令，对比通用信号的效果
 
-两种稳定点（只看 worker 自己的会话轨迹，不需要模型）：
-  自测通过   bash 跑了测试命令（pytest 等，或 --test-re 匹配的命令）且退出码为 0，并且上次稳定点之后改过文件
-  编辑停顿   一阵改文件之后，至少 --quiet-min 分钟没再成功改文件，期间 worker 还在调用别的工具（读、跑命令）
+稳定点 = 上次稳定点之后改过文件，然后一条命令成功执行（退出码 0）。分两类（只看 worker 自己的会话轨迹）：
+  测试通过   命令是测试命令（pytest 等，或 --test-re 匹配的）
+  运行通过   不是测试命令，但也不是纯读取（ls / cat / grep / find / git diff …）：改完之后第一条真正“跑起来”的命令
+             （LHTB 的 simulate、构建、python 脚本……）。--no-generic 关掉这一类
 每个稳定点取当时最新的快照，看它相对当时链头未合并多少（文件数、增删行数），以及这棵树后来的命运
 （合并 / 被回归门拦下 / 复核不批准 / 从没请求过）。
 
@@ -40,6 +42,29 @@ def table(head: list[str], rows: list[list]) -> list[str]:
 
 
 EXIT = re.compile(r"\[exit code (-?\d+)")
+READ_ONLY = {"ls", "cat", "head", "tail", "grep", "egrep", "rg", "find", "wc", "echo", "pwd", "tree", "file", "stat",
+             "less", "more", "diff", "sort", "uniq", "awk", "cut", "which", "type", "true", "printf", "du", "df",
+             "realpath", "dirname", "basename", "env", "date", "nl", "od", "xxd", "md5sum", "sha256sum", "sleep"}
+SEG = re.compile(r"&&|\|\||;|\||\n")
+
+
+def read_only(cmd: str) -> bool:
+    """命令里每一段都只是读取 / 查看（cd 不算一段）：ls、cat、grep、git diff / log / status / show、sed -n ……"""
+    for seg in SEG.split(cmd):
+        words = seg.strip().split()
+        while words and ("=" in words[0] and not words[0].startswith("=")):       # VAR=x 前缀
+            words = words[1:]
+        if not words or words[0] in ("cd", "(", ")", "{", "}"):
+            continue
+        w0 = words[0].lstrip("(").split("/")[-1]
+        if w0 in READ_ONLY:
+            continue
+        if w0 == "git" and len(words) > 1 and words[1] in ("diff", "log", "status", "show", "blame", "ls-files"):
+            continue
+        if w0 == "sed" and "-n" in words[1:3]:
+            continue
+        return False
+    return True
 
 
 def tool_calls(bdir: Path) -> list[dict]:
@@ -80,6 +105,7 @@ def analyse(bdir: Path, a) -> list[str]:
     w = g.run.workers[0] if g.run.workers else "w1"
     extra = re.compile(a.test_re) if a.test_re else None
     is_test = lambda cmd: bool(TEST_CMD.search(cmd) or (extra and extra.search(cmd)))   # noqa: E731
+    generic = not a.no_generic
     calls = [c for c in tool_calls(bdir) if c["t"] and start <= c["t"] <= end]
 
     # 事件：快照（时间、树、相对链头的改动）、合并点、每棵树的命运
@@ -127,31 +153,37 @@ def analyse(bdir: Path, a) -> list[str]:
     # ---- 找稳定点
     points = []                                          # (时间, 类型, 说明)
     wrote_since = False
-    last_write: Optional[float] = None
-    for i, c in enumerate(calls):
-        ok_write = c["name"] in ("edit_file", "write_file") and not c["error"]
-        if last_write is not None and not ok_write and c["t"] - last_write >= a.quiet_min * 60 and wrote_since:
-            points.append((last_write + a.quiet_min * 60, "编辑停顿", f"{a.quiet_min:g} 分钟没改文件"))
-            wrote_since = False                          # 同一阵改动只算一次停顿
-        if ok_write:
-            last_write, wrote_since = c["t"], True
-        if c["name"] == "bash" and is_test(c["cmd"]):
-            if c["rc"] == 0 and (wrote_since or not points or points[-1][1] != "自测通过"):
-                points.append((c["t"], "自测通过", c["cmd"][:60]))
-                wrote_since = False
-            elif c["rc"] not in (0, None):
-                points.append((c["t"], "自测失败", c["cmd"][:60]))
+    for c in calls:
+        if c["name"] in ("edit_file", "write_file") and not c["error"]:
+            wrote_since = True
+            continue
+        if c["name"] != "bash" or not c["cmd"]:
+            continue
+        test = is_test(c["cmd"]) and not read_only(c["cmd"])     # `cat pytest.ini` 不算跑测试
+        if c["rc"] not in (0, None):
+            if test:
+                points.append((c["t"], "测试失败", c["cmd"][:60]))
+            continue
+        if c["rc"] is None or not wrote_since:
+            continue
+        if test:
+            points.append((c["t"], "测试通过", c["cmd"][:60]))
+            wrote_since = False
+        elif generic and not read_only(c["cmd"]):
+            points.append((c["t"], "运行通过", c["cmd"][:60]))
+            wrote_since = False
     points.sort()
 
     n_write = sum(1 for c in calls if c["name"] in ("edit_file", "write_file") and not c["error"])
-    n_test = sum(1 for c in calls if c["name"] == "bash" and is_test(c["cmd"]))
-    kinds = {k: sum(1 for p in points if p[1] == k) for k in ("自测通过", "编辑停顿", "自测失败")}
+    n_test = sum(1 for c in calls if c["name"] == "bash" and is_test(c["cmd"]) and not read_only(c["cmd"]))
+    kinds = {k: sum(1 for p in points if p[1] == k) for k in ("测试通过", "运行通过", "测试失败")}
     dur = max(1.0, (end - start) / 60)
     out = [f"# 稳定点：{bdir}", "",
            f"- 计时 {mmss(end - start)}；成功改文件 {n_write} 次，跑测试命令 {n_test} 次"
            + ("（含 --test-re）" if extra else ""),
-           f"- 稳定点：自测通过 {kinds['自测通过']} 个、编辑停顿 {kinds['编辑停顿']} 个"
-           f"（合计每 10 分钟约 {(kinds['自测通过'] + kinds['编辑停顿']) / dur * 10:.1f} 个）；另有自测失败 {kinds['自测失败']} 次", ""]
+           f"- 稳定点：测试通过 {kinds['测试通过']} 个、运行通过 {kinds['运行通过']} 个"
+           f"（合计每 10 分钟约 {(kinds['测试通过'] + kinds['运行通过']) / dur * 10:.1f} 个）；"
+           f"另有测试失败 {kinds['测试失败']} 次", ""]
 
     rows = []
     for t, kind, note in points:
@@ -160,7 +192,7 @@ def analyse(bdir: Path, a) -> list[str]:
     out += table(["时间", "类型", "命令 / 说明", "未合并文件", "未合并行", "这棵树后来"], rows) if rows else ["（没有）"]
 
     # ---- 按候选规则回放
-    stable = [(t, k) for t, k, _ in points if k in ("自测通过", "编辑停顿")]
+    stable = [(t, k) for t, k, _ in points if k in ("测试通过", "运行通过")]
     fired, last_req, last_merge = [], start, start
     real_merges = [t for t, _ in merges if t > start]
     minute = start
@@ -197,7 +229,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python stable_points.py")
     ap.add_argument("targets", nargs="+", help="run_id、trial 目录或 Belay 的 run_dir")
     ap.add_argument("--test-re", default="", help="额外算作自测的命令（正则），例如 'simulate (run|score)'")
-    ap.add_argument("--quiet-min", type=float, default=2, help="编辑停顿：多少分钟没改文件")
+    ap.add_argument("--no-generic", action="store_true", help="只认测试命令，不把“改完后第一条成功的非只读命令”算作稳定点")
     ap.add_argument("--lines", type=int, default=50, help="回放：未合并行数阈值")
     ap.add_argument("--files", type=int, default=5, help="回放：未合并文件数阈值")
     ap.add_argument("--min-gap", type=float, default=5, help="回放：两次后台请求之间至少几分钟")
