@@ -122,3 +122,35 @@ def test_reply_json_reads_the_text_then_the_thinking_block():
     assert _reply_json(r, "requirements")["requirements"][0]["implemented"] == "yes"
     r = Response([{"type": "text", "text": '{"requirements": [{"id": "R1", "impl'}], "max_tokens")
     assert _reply_json(r, "requirements") is None
+
+
+# ---------------------------------------------------------------- 跑通过的快照（driver 的判定）
+
+def _bash(cmd: str, **kw) -> dict:
+    return {"name": "bash", "input": {"command": cmd, **kw}}
+
+
+def _edit() -> dict:
+    return {"name": "edit_file", "input": {"file_path": "a.py"}}
+
+
+def test_driver_marks_only_passing_test_or_run_commands_after_the_last_edit():
+    from types import SimpleNamespace
+    from belay.runtime.driver import _Hooks
+
+    def passed(batch, cfg=None) -> bool:
+        hooks = _Hooks(SimpleNamespace(cfg=cfg or BelayConfig()), None)
+        return hooks._passed_run([tu for tu, _r in batch], [r for _tu, r in batch])
+
+    ok = ("1 passed", False)
+    assert passed([(_edit(), ("ok", False)), (_bash("python -m pytest -q"), ok)])
+    assert passed([(_bash("cd /app && simulate score"), ("score 0.98", False))])
+    assert not passed([(_bash("cat pytest.ini"), ok)])                          # 只读
+    assert not passed([(_bash("pip install pytest"), ok)])                      # 安装
+    assert not passed([(_bash("pytest -x"), ("1 failed\n\n[exit code 1]", False))])
+    assert not passed([(_bash("pytest -x"), ("[Command timed out after 120s and was killed.]", False))])
+    assert not passed([(_bash("pytest -x", run_in_background=True), ("Started in background", False))])
+    assert not passed([(_bash("pytest -x"), ok), (_edit(), ("ok", False))])    # 跑完又改了
+    assert not passed([(_bash("simulate score"), ok)], BelayConfig(merge_stable_generic=False))
+    assert passed([(_bash("pytest"), ok)], BelayConfig(merge_stable_generic=False))
+    assert not passed([(_bash("pytest"), ok)], BelayConfig(background="handoff"))

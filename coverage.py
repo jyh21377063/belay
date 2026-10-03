@@ -182,7 +182,7 @@ def analyse(bdir, every_min: float, lag_files: int, lag_min: float, auto_min: fl
                   if eligible else "") + "。会不会合并，取决于复核者能不能引用到任务原文。")
     # b. 按未合并改动量提前触发
     reviews_t = sorted(e.t for e in events if e.type == "review_started" and e.get("trigger") in
-                       ("auto", "todo", "handoff", "session_end"))
+                       ("auto", "todo", "stable", "handoff", "session_end"))
     extra, k, minute = [], 0, start
     while minute <= end:
         while k < len(events) and events[k].t <= minute:

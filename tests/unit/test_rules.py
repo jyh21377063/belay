@@ -218,6 +218,107 @@ def test_background_gate_rejections_escalate_only_when_the_same_regression_persi
     s.check_log()
 
 
+# ======================================================================== 后台：持续出现的回归送复核者判断豁免
+
+MUL_WAIVER = {"tests": [MUL], "quote": MUL_QUOTE, "reason": "the task changes mul's sign handling"}
+
+
+def waiver_sim(**kw) -> Sim:
+    kw.setdefault("confirm_regressions", False)
+    return sim(cfg=bgc(**kw), reviewer=MANUAL)
+
+
+def answer(s: Sim, merge: bool, **extra) -> str:
+    vid = s.running_review()
+    assert vid is not None
+    s.review(vid, judge(merge, **extra)(s, s.g.reviews[vid]))
+    return vid
+
+
+def n_events(s: Sim, kind: str) -> int:
+    return len([e for e in s.log if e.type == kind])
+
+
+def test_background_regression_is_rejected_first_and_reviewed_when_it_persists():
+    s = waiver_sim()
+    edit(s, "m1", {MUL: "FAILED"})
+    a1 = next(iter(s.g.attempts.values()))
+    assert s.g.attempts[a1.id].status == "rejected" and not s.g.reviews       # 第一次出现：多半是改到一半
+    edit(s, "m2", {MUL: "FAILED"})
+    v = s.g.reviews[s.running_review()]
+    assert v.gate["regressions"] and not v.submit                                # 第二次（另一棵树）：送复核
+    answer(s, True, waivers=[MUL_WAIVER])
+    g = s.g
+    assert MUL in g.waived and g.head == 1 and g.checkpoints[1].tree == "m2"
+    assert n_events(s, "persistent_regression") == 0                             # 豁免了就不提醒 worker
+    edit(s, "m3", {MUL: "FAILED"})
+    assert s.g.reviews[s.running_review()].gate["regressions"] == []             # 之后一直豁免：回归门直接通过
+    answer(s, True)
+    assert s.g.head == 2
+    s.check_log()
+
+
+def test_refused_background_waiver_warns_once_and_is_not_reviewed_again():
+    s = waiver_sim()
+    edit(s, "m1", {MUL: "FAILED"})
+    edit(s, "m2", {MUL: "FAILED"})
+    answer(s, False)                                                             # 复核者不豁免
+    g = s.g
+    a2 = max(g.attempts.values(), key=lambda a: a.created_seq)
+    assert a2.status == "rejected" and a2.reason == "review" and not g.waived
+    assert set(g.persistent) == {MUL} and n_events(s, "persistent_regression") == 1   # 拒绝之后才提示 worker
+    reviews = len(g.reviews)
+    edit(s, "m3", {MUL: "FAILED"})
+    assert len(s.g.reviews) == reviews and s.running_review() is None             # 同一组不再送审
+    assert n_events(s, "persistent_regression") == 1
+    edit(s, "m4", {MUL: "FAILED", Z: "FAILED"})
+    assert s.running_review() is None                                            # Z 第一次出现
+    edit(s, "m5", {MUL: "FAILED", Z: "FAILED"})
+    assert s.running_review() is not None                                        # Z 也持续了：再送审
+    answer(s, False)
+    assert set(s.g.persistent) == {MUL, Z}
+    s.check_log()
+
+
+def test_partial_background_waiver_keeps_only_unwaived_tests_in_the_warning():
+    s = waiver_sim()
+    edit(s, "m1", {MUL: "FAILED", Z: "FAILED"})
+    edit(s, "m2", {MUL: "FAILED", Z: "FAILED"})
+    answer(s, False, waivers=[MUL_WAIVER])                                       # 豁免 MUL，Z 不豁免
+    g = s.g
+    assert set(g.waived) == {MUL} and g.head == 0
+    assert set(g.persistent) == {Z}
+    ev = [e for e in s.log if e.type == "persistent_regression"]
+    assert len(ev) == 1 and ev[0].get("tests") == [Z]
+    edit(s, "m3", {MUL: "FAILED"})                                               # Z 修好了，只剩已豁免的 MUL
+    assert s.g.reviews[s.running_review()].gate["regressions"] == []
+    answer(s, True)
+    assert s.g.head == 1
+    s.check_log()
+
+
+@pytest.mark.parametrize("kw", [{"bg_waivers": False}, {"waivers": False}])
+def test_background_waivers_can_be_switched_off(kw):
+    s = waiver_sim(**kw)
+    edit(s, "m1", {MUL: "FAILED"})
+    edit(s, "m2", {MUL: "FAILED"})
+    assert not s.g.reviews and set(s.g.persistent) == {MUL}                      # 现状：直接拒、记持续性回归
+    s.check_log()
+
+
+def test_background_and_submit_waivers_share_the_budget():
+    s = waiver_sim(waive_max_tests=1)
+    edit(s, "m1", {MUL: "FAILED"})
+    edit(s, "m2", {MUL: "FAILED"})
+    answer(s, True, waivers=[MUL_WAIVER])
+    assert set(s.g.waived) == {MUL}
+    edit(s, "z1", {Z: "FAILED"})
+    edit(s, "z2", {Z: "FAILED"})
+    vid = answer(s, True, waivers=[{"tests": [Z], "quote": MUL_QUOTE, "reason": "x"}])
+    assert set(s.g.waived) == {MUL} and any("at most 1" in n for n in s.g.reviews[vid].decision["notes"])
+    s.check_log()
+
+
 # ======================================================================== 后台：边界快照（勾掉 todo、交接）优先
 
 def boundary_sim(**kw) -> Sim:
@@ -313,6 +414,87 @@ def test_todos_ticked_during_a_merge_coalesce_into_one_request_for_the_newest():
     assert {t.title: t.status for t in g.todos.values()} == {"header": "anchored", "body": "anchored",
                                                               "footer": "anchored"}
     assert all(g.todos[t].checkpoint == g.head for t in g.todos)
+    s.check_log()
+
+
+def stable_run(s: Sim, tree: str, overrides: dict | None = None) -> int:
+    """worker 改完之后自己的命令跑通过：driver 拍一张 stable（树通常和跑命令前那张相同）。"""
+    s.world.define(tree, overrides or {})
+    return s.snap(tree, reason="stable")
+
+
+def test_passing_run_snapshot_is_requested_without_waiting_for_the_fallback():
+    s = boundary_sim(merge_min_interval_sec=1200, merge_stable_interval_sec=300)
+    edit(s, "a1")
+    finish(s)
+    assert s.g.head == 1
+    before = edit(s, "w1")
+    n = stable_run(s, "w1")
+    assert n != before and s.g.snapshots[n].reason == "stable"                 # 同一棵树也记下跑通过
+    edit(s, "w2")                                                              # worker 接着改：中间态
+    s.advance(299)
+    s.tick()
+    assert bg_open(s) is None                                                  # 成本上限：距上次复核不足 300 s
+    s.advance(2)
+    s.tick()
+    assert bg_requests(s)[-1] == ("w1", "stable")                              # 选跑通过的那张，不是最新的 w2
+    finish(s)
+    assert s.g.checkpoints[s.g.head].tree == "w1"
+    s.advance(301)
+    s.tick()
+    assert bg_open(s) is None                                                  # w2 没跑通过过：只能等兜底
+    s.advance(1200)
+    s.tick()
+    assert bg_requests(s)[-1] == ("w2", "auto")
+    s.check_log()
+
+
+def test_a_passing_run_without_new_edits_is_just_a_snapshot():
+    s = boundary_sim()
+    edit(s, "a1")
+    finish(s)
+    n1 = stable_run(s, "x")
+    assert stable_run(s, "x") == n1                                            # 没改过代码：不是新的跑通过
+    edit(s, "y")
+    n3 = stable_run(s, "x")                                                    # 改回到上一张跑通过的树
+    assert s.g.snapshots[n3].reason == "writes"
+    n4 = stable_run(s, "a1")                                                   # 就是链头
+    assert s.g.snapshots[n4].reason == "writes"
+    s.check_log()
+
+
+def test_todo_anchor_comes_before_a_newer_passing_run():
+    s = boundary_sim(merge_stable_interval_sec=0)
+    edit(s, "a1")
+    tick_todo(s, "t1", ["header"], "body")
+    stable_run(s, "p1")
+    finish(s)
+    s.advance(61)
+    s.tick()
+    assert bg_requests(s)[-1] == ("t1", "todo")
+    finish(s)
+    s.tick()
+    assert bg_requests(s)[-1] == ("p1", "stable")
+    s.check_log()
+
+
+def test_fallback_counts_from_the_last_merge_including_submits():
+    s = sim(cfg=BelayConfig(merge_min_interval_sec=1200))
+    s.world.define("a1", {})
+    s.snap("a1")
+    assert s.g.head == 1
+    s.advance(1100)
+    s.world.define("sub", {})
+    s.submit("sub")
+    assert s.g.checkpoints[s.g.head].tree == "sub"
+    s.world.define("w", {})
+    s.snap("w")
+    s.advance(200)
+    s.tick()
+    assert [a.tree for a in s.g.attempts.values() if a.lane == "bg"] == ["a1"]   # 刚合并完：不兜底
+    s.advance(1001)
+    s.tick()
+    assert bg_requests(s)[-1] == ("w", "auto")
     s.check_log()
 
 

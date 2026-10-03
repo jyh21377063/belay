@@ -9,7 +9,8 @@ from typing import Optional
 
 from belay.core.config import BelayConfig
 from belay.env import LocalEnv
-from belay.runtime.session import (TEST_CMD, TODO_DONE, TODO_FIRST, TODO_STALE, TODO_STALE_ACTIVE,
+from belay.runtime.shellcmd import is_test_command
+from belay.runtime.session import (TODO_DONE, TODO_FIRST, TODO_STALE, TODO_STALE_ACTIVE,
                                    TODO_STALE_NONE, BelaySession, in_progress_phrase)
 from belay.tools import get_belay_tools
 
@@ -68,8 +69,10 @@ def done_notes(notes: list[str]) -> list[str]:
 def test_test_commands_are_recognised():
     for cmd in ("pytest -x", "python -m pytest tests", "cargo test", "go test ./...", "npm run test", "make check",
                 "python -m unittest discover"):
-        assert TEST_CMD.search(cmd), cmd
-    assert not TEST_CMD.search("cat tests/test_mod.py") and not TEST_CMD.search("ls")
+        assert is_test_command(cmd), cmd
+    for cmd in ("cat tests/test_mod.py", "ls", "cat pytest.ini", 'grep -rn "pytest\\|unittest" .', "pip install pytest",
+                "ps aux | grep pytest"):
+        assert not is_test_command(cmd), cmd
 
 
 def test_nudges_after_tests_when_an_item_is_in_progress_and_files_changed(tmp_path):

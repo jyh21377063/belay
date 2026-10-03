@@ -40,8 +40,10 @@ if TYPE_CHECKING:
 WRAPUP = ("Your time for this review is up. Call verdict now with what you have found (merge, the requirements you "
           "judged with their evidence levels, feedback). Do not call any other tool.")
 TRIGGER_TEXT = {
-    "auto": "a background check of the agent's latest snapshot, taken because no todo item was ticked off for a "
-            "while (it may be in the middle of a change; the agent keeps working meanwhile)",
+    "auto": "a background check of the agent's latest snapshot, taken because nothing was merged for a while (it "
+            "may be in the middle of a change; the agent keeps working meanwhile)",
+    "stable": "a background check of the snapshot taken right after the agent's own test or run command passed "
+              "(the agent may have kept working since; this snapshot is what is checked)",
     "todo": "a background check of the snapshot taken when the agent ticked off a todo item (the agent may have "
             "kept working since; this snapshot is what is checked)",
     "handoff": "a check at a session handoff",
@@ -312,9 +314,17 @@ class Reviewer:
                                                                        if g.waived else "") + "."]
         if regs:
             reasons = reasons_for_tree(g, v.tree)
-            lines.append(f"{len(regs)} of them do NOT pass on this snapshot. The agent proposed waivers for some "
-                         "(below); grant a waiver only for tests that contradict explicit task text, and do not merge "
-                         "otherwise:")
+            sub = g.submits.get(v.submit) if v.submit else None
+            if sub is not None and sub.waivers:
+                lines.append(f"{len(regs)} of them do NOT pass on this snapshot. The agent proposed waivers for some "
+                             "(below); grant a waiver only for tests that contradict explicit task text, and do not "
+                             "merge otherwise:")
+            else:
+                lines.append(f"{len(regs)} of them do NOT pass on this snapshot. Some also failed on the agent's "
+                             "previous background snapshot (a different tree), so this is not just a half-finished "
+                             "edit. The agent has not proposed waivers. If a test checks behaviour that the task text "
+                             "explicitly asks to change, you may waive it with a verbatim quote of that task text; "
+                             "never waive a test the agent simply broke, and do not merge otherwise:")
             for r in regs[:30]:
                 why = reasons.get(regression_ids([r])[0])
                 lines.append(f"  - {r}" + (f": {why[:300]}" if why else ""))

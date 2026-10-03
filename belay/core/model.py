@@ -62,8 +62,9 @@ WHERE_SLOT, WHERE_WORKSPACE, WHERE_LIVE = "slot", "workspace", "live"
 ATT_PENDING, ATT_ADVANCING, ATT_CREATED, ATT_REJECTED, ATT_SUPERSEDED = (
     "pending", "advancing", "created", "rejected", "superseded")
 LANE_FG, LANE_BG = "fg", "bg"
-# 触发：auto（后台验证最新快照）、todo（勾掉一条 todo）、handoff / session_end（交接）、submit、final / deadline（收尾）
-BG_TRIGGERS = ("auto", "todo", "handoff", "session_end")
+# 触发：auto（后台验证最新快照）、todo（勾掉一条 todo）、stable（worker 自己的测试 / 运行命令跑通过）、
+# handoff / session_end（交接）、submit、final / deadline（收尾）
+BG_TRIGGERS = ("auto", "todo", "stable", "handoff", "session_end")
 # ---- 复核
 REV_RUNNING, REV_RECORDED, REV_DECIDED, REV_FAILED, REV_CANCELLED = (
     "running", "recorded", "decided", "failed", "cancelled")

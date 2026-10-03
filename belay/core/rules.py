@@ -46,6 +46,7 @@ from belay.core.verify import (B_PASS, PASSED, PT_FAIL, PT_PASS, PT_RUNNING, PT_
 
 BLOCK_KINDS = ("insufficient_info", "environment", "check_conflict")
 HANDOFF_REASONS = ("handoff", "session_end")
+STABLE_REASON = "stable"                            # worker 改过代码之后自己的测试 / 运行命令跑通过（driver 拍）
 # 为前台意图拍的快照：由发起者自己发起合并请求，后台不取
 FOREGROUND_REASONS = ("submit", "final", "deadline")
 # 有人在等结论的合并请求（被拒时定位、诊断并告诉 worker）
@@ -259,14 +260,28 @@ def refresh_anchors(tx: Tx) -> None:
 
 # ======================================================================== 快照与后台合并请求（模块 B）
 
+def _latest_stable(g: Graph, worker: str) -> Optional[Snapshot]:
+    for n in sorted(g.snapshots, reverse=True):
+        s = g.snapshots[n]
+        if s.worker == worker and s.epoch == g.epoch and not s.lost and s.reason == STABLE_REASON:
+            return s
+    return None
+
+
 def record_snapshot(tx: Tx, worker: str, obs: SnapObs, reason: str) -> int:
     """记录一张快照；与这个 worker 上一张快照完全相同时不记，返回那一张的序号。
-    例外：交接 / 会话结束是要发起合并请求的节点，上一张不是这类快照时照样记一张（树相同）。"""
+    例外：交接 / 会话结束是要发起合并请求的节点，上一张不是这类快照时照样记一张（树相同）。
+    跑通过（stable）也是：跑命令之前已经拍过同一棵树（model_test / writes），照样记一张；但树和上一张跑通过的
+    相同（之后没改过代码）或就是链头时，只当普通快照。"""
     g = tx.g
+    if reason == STABLE_REASON:
+        prev = _latest_stable(g, worker)
+        if (prev is not None and prev.tree == obs.tree) or (g.head_cp is not None and g.head_cp.tree == obs.tree):
+            reason = "writes"
     last = latest_snapshot(g, worker)
     same = last is not None and last.tree == obs.tree and last.raw_tree == obs.raw_tree and last.epoch == g.epoch \
         and last.testable == obs.testable
-    if same and not (reason in HANDOFF_REASONS and last.reason not in HANDOFF_REASONS):
+    if same and not (reason in HANDOFF_REASONS and last.reason not in HANDOFF_REASONS) and reason != STABLE_REASON:
         return last.n
     n = g.last_snapshot + 1
     act = active_todos(g)
@@ -293,7 +308,8 @@ def _todos_covered(g: Graph, snap: Snapshot) -> list:
 def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Snapshot, str, str]]:
     """后台要合并的快照（这个 worker、同一段、可测、比链头新、比它最近一次合并请求的快照新、树没请求过）：
     优先最新的边界快照——交接 / 会话结束的快照，或勾掉 todo 的锚点快照：worker 自己停下来的完整节点，哪怕它之后又改了
-    别的东西；没有边界快照时才取最新的快照（auto，间隔更长的兜底）。同一个 worker 的快照是累积的，较新的边界包含较早
+    别的东西；其次是最新的跑通过的快照（stable：worker 改完之后自己的测试 / 运行命令退出码为 0）；都没有时才取最新的
+    快照（auto，间隔更长的兜底）。同一个 worker 的快照是累积的，较新的边界包含较早
     的边界，所以合并期间攒下的几个 todo 合成一次请求。不回退到最近一次请求之前的快照（被拒的由 worker 按反馈接着改），
     也不越过 worker 撤回定位到的坏改动的快照（revert）。auto 只取最新的可测快照，它不能合并时不退回更早的中间状态。
     mode=handoff 或降级模式只取交接 / 会话结束的快照。返回（快照, 触发, 标签）。"""
@@ -302,6 +318,7 @@ def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Sn
     tried = {a.tree for a in g.attempts.values() if a.epoch == g.epoch}
     floor = max((a.snapshot for a in g.attempts.values() if a.worker == worker and a.epoch == g.epoch), default=0)
     newest: Optional[Snapshot] = None
+    stable: Optional[Snapshot] = None
     auto_ok = not only_handoff
     for n in sorted(g.snapshots, reverse=True):
         snap = g.snapshots[n]
@@ -318,25 +335,33 @@ def _background_candidate(g: Graph, worker: str, mode: str) -> Optional[tuple[Sn
                 if any(t.status == TODO_COMPLETED and t.anchor_snapshot == snap.n and t.anchor_epoch == snap.epoch
                        for t in g.todos.values()):
                     return snap, "todo", "; ".join(t.title for t in _todos_covered(g, snap))
+                if snap.reason == STABLE_REASON and stable is None:
+                    stable = snap
                 if auto_ok:
                     newest = snap
         if snap.testable:
             auto_ok = False                         # auto 只取最新的可测快照，不退回更早的中间状态
         if snap.reason == "revert":
             break                                   # worker 撤回了定位到的坏改动：更早的快照里还带着它
+    if stable is not None:
+        return stable, "stable", ""
     return (newest, "auto", "") if newest is not None else None
 
 
 def _bg_due(g: Graph, cfg: BelayConfig, now: float, trigger: str) -> bool:
     """后台复核的节流：距上一次后台复核开始，勾掉 todo 至少 merge_todo_interval_sec（只防连续勾掉琐碎条目时反复请
-    复核者），兜底的 auto 至少 merge_min_interval_sec；交接不受限制。只按回归门被拒的请求没有复核，不计入间隔。
+    复核者），跑通过至少 merge_stable_interval_sec（复核成本的上限），兜底的 auto 距上一次后台复核或合并（含 submit）
+    至少 merge_min_interval_sec；交接不受限制。只按回归门被拒的请求没有复核，不计入间隔。
     没有复核者时不节流（回归门只花 CPU）。"""
     if not cfg.reviewer or trigger == "handoff":
         return True
     last = last_bg_review_t(g)
+    if trigger == "auto" and g.head_cp is not None and g.head_cp.id != 0:
+        last = max(last or 0.0, g.head_cp.created_t)
     if last is None:
         return True
-    gap = cfg.merge_todo_interval_sec if trigger == "todo" else cfg.merge_min_interval_sec
+    gap = {"todo": cfg.merge_todo_interval_sec, STABLE_REASON: cfg.merge_stable_interval_sec}.get(
+        trigger, cfg.merge_min_interval_sec)
     return now - last >= gap
 
 
@@ -477,6 +502,8 @@ def advance_attempt(tx: Tx, aid: str) -> None:
         sub = tx.g.submits.get(a.submit) if a.submit else None
         if reviewable and cfg.waivers and sub is not None and sub.waivers:
             return _request_review(tx, a, regs, flaky)     # worker 认为这些测试与任务原文冲突：由复核者裁决
+        if reviewable and cfg.waivers and cfg.bg_waivers and a.lane == LANE_BG and _bg_waivable(tx.g, a, regs):
+            return _request_review(tx, a, regs, flaky)     # 后台：持续出现的回归由复核者判断要不要豁免
         return _reject(tx, aid, "regression", regs, flaky)
     if reviewable:
         return _request_review(tx, a, regs, flaky)
@@ -514,6 +541,8 @@ def _reject(tx: Tx, aid: str, reason: str, regs: tuple, flaky: tuple, detail: st
             _repeated_diagnosis(tx, aid)
         else:                                       # 后台的：同一回归连续两个后台请求都在才定位与诊断
             _background_persists(tx, aid)
+    elif reason == "review" and regs and a.lane == LANE_BG:
+        _background_persists(tx, aid)               # 复核者没有豁免持续出现的回归：这时才提示 worker（只含没豁免的）
 
 
 def supersede_attempt(tx: Tx, aid: str, reason: str) -> None:
@@ -1102,6 +1131,34 @@ def _after_merge(tx: Tx, cid: int) -> None:
 
 # ======================================================================== 持续性回归
 
+def _prev_bg_rejection(g: Graph, a: Attempt) -> Optional[Attempt]:
+    """上一个带回归被拒的后台请求（另一棵树、同一段）。"""
+    snap = g.snapshots.get(a.snapshot)
+    if snap is None:
+        return None
+    prev = [x for x in g.attempts.values() if x.lane == LANE_BG and x.status == ATT_REJECTED and x.id != a.id
+            and x.regressions and x.created_seq < a.created_seq and x.tree != a.tree
+            and x.snapshot in g.snapshots and g.snapshots[x.snapshot].epoch == snap.epoch]
+    return max(prev, key=lambda x: x.created_seq) if prev else None
+
+
+def _bg_common_regressions(g: Graph, a: Attempt, regs: Iterable[str]) -> list[str]:
+    """这次的回归里，上一个被拒的后台请求也有的（不是改到一半的临时状态）：去掉命令检查、已豁免的、
+    已经记为持续性回归且还没解决的（复核者已经拒绝豁免、worker 已经收到提示）。"""
+    p = _prev_bg_rejection(g, a)
+    if p is None:
+        return []
+    common = sorted(set(regression_ids(regs)) & set(regression_ids(p.regressions)))
+    common = [t.split(" [", 1)[0] for t in common]
+    return [t for t in common if not is_cmd(t) and t not in g.waived and not open_persistent(g, t)]
+
+
+def _bg_waivable(g: Graph, a: Attempt, regs: tuple) -> bool:
+    """后台请求的回归要不要送复核者判断豁免：至少有一个测试连续两个后台请求（不同的树）都挂、没被豁免、
+    也还没被复核者拒绝豁免过（拒绝后记为持续性回归，测试重新通过之前不再送审）。第一次出现的直接拒（多半是改到一半）。"""
+    return bool(_bg_common_regressions(g, a, regs))
+
+
 def _background_persists(tx: Tx, aid: str) -> None:
     """后台合并请求被拒，且上一个被拒的后台请求（另一棵树、同一段）也有同样的回归：不是改到一半的临时状态，
     记为持续性回归，定位并诊断（结果在 worker 的下一轮作为提示送达，不打断它）。同一组测试只做一次。"""
@@ -1110,17 +1167,10 @@ def _background_persists(tx: Tx, aid: str) -> None:
     snap = g.snapshots.get(a.snapshot)
     if snap is None or not _running_run(g) or g.run.finalizing:
         return
-    prev = [x for x in g.attempts.values() if x.lane == LANE_BG and x.status == ATT_REJECTED and x.id != aid
-            and x.regressions and x.created_seq < a.created_seq and x.tree != a.tree and x.snapshot in g.snapshots
-            and g.snapshots[x.snapshot].epoch == snap.epoch]
-    if not prev:
-        return
-    p = max(prev, key=lambda x: x.created_seq)
-    common = sorted(set(regression_ids(a.regressions)) & set(regression_ids(p.regressions)))
-    common = [t.split(" [", 1)[0] for t in common]
-    common = [t for t in common if not is_cmd(t) and not open_persistent(g, t)]
+    common = _bg_common_regressions(g, a, a.regressions)
     if not common:
         return
+    p = _prev_bg_rejection(g, a)
     tx.emit("persistent_regression", RUNTIME, RULE, tests=common[:50], trigger="background", checkpoint=None,
             since=p.snapshot, epoch=snap.epoch, latest=a.snapshot)
     loc = start_locate(tx, common, {"tree": a.tree, "snapshot": a.snapshot}, "background", ref=aid)

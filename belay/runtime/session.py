@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 
@@ -30,13 +29,11 @@ from belay.core.config import BelayConfig
 from belay.env import Env
 from belay.llm import Response, Usage
 from belay.runtime.prompts import FULL_SUMMARY_PROMPT, L3_PROMPT
+from belay.runtime.shellcmd import is_test_command
 from belay.tools import Policy, Tool, ToolContext, ToolError
 from belay.worker.transcript import Transcript
 
 WRITE_TOOLS = ("edit_file", "write_file", "bash")
-# 模型自己跑测试 / 构建的命令：跑之前拍快照（driver），跑完之后可能提醒勾掉 todo（_todo_notes）
-TEST_CMD = re.compile(r"\b(pytest|py\.test|nosetests|tox|cargo\s+test|go\s+test|mvn\s+(\S+\s+)*test|gradle\w*\s+test|"
-                      r"npm\s+(run\s+)?test|yarn\s+test|jest|mocha|make(\s+\S+)*\s+(test|check)|ctest|unittest)\b")
 NUDGE = "If every requirement is done, call submit; otherwise continue working."
 TODO_FIRST = ("Keeping a todo list (todo_write) is how your progress survives a context reset; for a simple change "
               "you can skip it.")
@@ -285,7 +282,8 @@ class BelaySession:
             self._writes_since_todo += 1
             if self._stale_from is None:
                 self._stale_from = self.turns
-        tested = any(tu["name"] == "bash" and not err and TEST_CMD.search(str((tu.get("input") or {}).get("command") or ""))
+        # 模型自己跑了测试（只看命令词：cat pytest.ini、grep pytest 不算）：可能该勾掉 todo 了
+        tested = any(tu["name"] == "bash" and not err and is_test_command(str((tu.get("input") or {}).get("command") or ""))
                      for tu, (_out, err) in zip(tool_uses, results))
         if cfg.todo_done_nudge and tested and self._writes_since_todo > 0 and \
                 self.turns - self._last_todo_turn > cfg.todo_done_nudge_quiet_turns and \

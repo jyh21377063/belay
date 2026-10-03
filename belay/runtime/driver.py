@@ -42,7 +42,8 @@ from belay.runtime.port import WorkerPort
 from belay.runtime.prompts import DIAGNOSE_SYSTEM, system_prompt
 from belay.runtime.reviewer import Reviewer
 from belay.runtime.runtime import Runtime
-from belay.runtime.session import TEST_CMD, BelaySession, ModelCallFailed, load_transcript_messages
+from belay.runtime.session import BelaySession, ModelCallFailed, load_transcript_messages
+from belay.runtime.shellcmd import bash_passed, is_run_command, is_test_command
 from belay.runtime.store import EventStore
 from belay.runtime.verifier import RunnerVerifier, VerifierSpec
 from belay.tools import EXPLORE_TOOLS, Policy, get_belay_tools, get_tools
@@ -115,12 +116,14 @@ class _Hooks:
 
     async def before_tool(self, tu: dict) -> None:
         """模型自己跑测试或构建前拍一张：这时代码通常是连贯的（后台空闲时会验证它；它也是交接的自然停顿点）。"""
-        if tu.get("name") == "bash" and TEST_CMD.search(str((tu.get("input") or {}).get("command") or "")):
+        if tu.get("name") == "bash" and is_test_command(str((tu.get("input") or {}).get("command") or "")):
             await self.run.take_snapshot("model_test")
             self.run.boundaries += 1
 
     async def after_tools(self, tool_uses: list[dict], results: list, todos) -> None:
-        """存：编辑类工具之后一定拍；bash 不一定写文件，累计 snapshot_bash_every 次再拍。树没变时不记新快照。"""
+        """存：编辑类工具之后一定拍；bash 不一定写文件，累计 snapshot_bash_every 次再拍。树没变时不记新快照。
+        这一批里最后一个动作是跑通过的测试 / 运行命令（退出码 0、前台、之后没再编辑）时拍成跑通过（stable）：
+        后台优先请求这种 worker 自己验证过的状态（自上一张跑通过之后没改过代码的，规则层只当普通快照）。"""
         run = self.run
         ok = [tu.get("name") for tu, (_out, err) in zip(tool_uses, results) if not err]
         edits = sum(1 for n in ok if n in ("edit_file", "write_file"))
@@ -130,8 +133,25 @@ class _Hooks:
             await run.update_todos(todos)
         if any(tu.get("name") == "submit" for tu in tool_uses):
             run.boundaries += 1                          # 拿到了提交结果
-        if edits or run.bash_since >= run.cfg.snapshot_bash_every:
+        if self._passed_run(tool_uses, results):
+            await run.take_snapshot("stable")
+        elif edits or run.bash_since >= run.cfg.snapshot_bash_every:
             await run.take_snapshot("writes")
+
+    def _passed_run(self, tool_uses: list[dict], results: list) -> bool:
+        passed = False
+        for tu, (out, err) in zip(tool_uses, results):
+            name = tu.get("name")
+            if err:
+                continue
+            if name in ("edit_file", "write_file"):
+                passed = False                           # 跑通过之后又改了：这一批的快照不是验证过的状态
+            elif name == "bash":
+                inp = tu.get("input") or {}
+                if bash_passed(inp, out) and is_run_command(str(inp.get("command") or ""),
+                                                            self.run.cfg.merge_stable_generic):
+                    passed = True
+        return passed and self.run.cfg.background == "latest"
 
     def write_guard(self):
         return self.run.write_guard()
@@ -505,7 +525,11 @@ class BelayRun:
         raw = await self.repo.snapshot(self.w)
         last = latest_snapshot(g, self.w) or latest_snapshot(g)
         if last is not None and last.raw_tree == raw and last.epoch == g.epoch:      # 没有改动：直接沿用上一张
-            return SnapObs(tree=last.tree, raw_tree=raw, files=last.files, dropped=last.dropped,
+            files = last.files
+            if last.base != g.head:                  # 之后合并过：改动量要相对现在的链头（跑通过的快照常常同树重记）
+                files = tuple(await self.repo.numstat(g.head_cp.tree, last.tree)) if last.tree != g.head_cp.tree \
+                    else ()
+            return SnapObs(tree=last.tree, raw_tree=raw, files=files, dropped=last.dropped,
                            testable=last.testable, commit=last.commit, precheck=last.precheck, tool_seq=self.tool_seq)
         base, head = g.checkpoints[0].tree, g.head_cp.tree
         if self.cfg.protect_tests and guard_set(g.baseline):

@@ -29,11 +29,16 @@ class BelayConfig:
     # ---- 合并
     confirm_regressions: bool = True
     protect_tests: bool = True
-    # 后台合并请求：latest = 空闲时优先合并最新的边界快照（勾掉 todo / 交接），很久没有时兜底合并最新快照；
-    # handoff = 只在交接时；off = 只有 submit 与收尾
+    # 后台合并请求：latest = 空闲时优先合并最新的边界快照（交接 / 勾掉 todo / worker 自己的命令刚跑通过），
+    # 很久都没有时兜底合并最新快照；handoff = 只在交接时；off = 只有 submit 与收尾
     background: str = "latest"
-    merge_min_interval_sec: float = 900     # 兜底（auto）：距上一次后台复核这么久还没有边界快照，才合并最新快照
+    merge_min_interval_sec: float = 1200    # 兜底（auto）：距上一次合并或后台复核这么久还没有边界快照，才合并最新快照
     merge_todo_interval_sec: float = 60     # 勾掉 todo：距上一次后台复核至少这么久（只防连续勾掉琐碎条目）
+    # 跑通过（stable）：worker 改过代码之后自己跑测试 / 运行命令且退出码为 0，拍下的快照。后台线空闲就请求最新的一张，
+    # 距上一次后台复核至少这么久（只是复核成本的上限，不是触发时机）
+    merge_stable_interval_sec: float = 300
+    merge_stable_generic: bool = True       # 普通运行命令（非测试、非只读、非安装 / 搬文件）跑通过也算；False 只认测试命令
+    bg_waivers: bool = True                 # 后台请求的回归连续出现时送复核者判断能否豁免（waivers=False 时无效）
     # ---- 快照（模块 B）
     snapshot_bash_every: int = 5
     precheck_python: bool = True
@@ -163,6 +168,8 @@ class BelayConfig:
             raise ValueError("background 只能是 latest / handoff / off")
         if cfg.l3_mode not in ("overflow", "always", "off"):
             raise ValueError("l3_mode 只能是 overflow / always / off")
+        if min(cfg.merge_min_interval_sec, cfg.merge_todo_interval_sec, cfg.merge_stable_interval_sec) < 0:
+            raise ValueError("merge_*_interval_sec 不能为负")
         if cfg.snapshot_bash_every < 1:
             raise ValueError("snapshot_bash_every 至少为 1")
         if cfg.verify_slots < 1:

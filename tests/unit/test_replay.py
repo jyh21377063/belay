@@ -113,7 +113,7 @@ def drive(seed: int, steps: int = 200, boundaries: bool = False, improve: bool |
     reasons = ["writes", "writes", "model_test", "session_end", "handoff"]
     if boundaries:
         ops += ["todos", "todos", "todos", "tick", "review", "job", "job"]
-        reasons += ["writes", "revert"]
+        reasons += ["writes", "revert", "stable", "stable"]
     for _ in range(steps):
         op = rnd.choice(ops)
         try:
@@ -265,8 +265,10 @@ def _bg_choice_problems(log, cfg: BelayConfig) -> tuple[list[str], dict]:
       - 只有一个：发起时这个 worker 没有别的进行中的请求（不抢占、不排队）；
       - 边界优先：auto 发起时，链头 / 上次请求之后、撤回（revert）之后没有可合并的边界快照（勾掉 todo 的锚点、交接）；
         todo / 交接发起时，它之后也没有更新的可合并边界；
+      - 跑通过（stable）排在边界之后、auto 之前：stable 发起时没有可合并的边界，它之后也没有更新的可合并 stable；
+        auto 发起时没有可合并的 stable；
       - auto 只取最新的可测快照；交接模式与降级时只有交接。"""
-    problems, seen = [], {"auto": 0, "todo": 0, "handoff": 0, "coalesced": 0}
+    problems, seen = [], {"auto": 0, "todo": 0, "stable": 0, "handoff": 0, "coalesced": 0}
     g = Graph()
     for e in log:
         if e.type == "merge_requested" and e.get("lane") == "bg":
@@ -295,6 +297,11 @@ def _bg_choice_problems(log, cfg: BelayConfig) -> tuple[list[str], dict]:
                     t.status == TODO_COMPLETED and t.anchor_snapshot == k and t.anchor_epoch == s.epoch
                     for t in g.todos.values())
 
+            def stable(k: int) -> bool:
+                s = g.snapshots[k]
+                return s.reason == R.STABLE_REASON and s.testable and s.tree != head.tree and s.tree not in tried \
+                    and cfg.background != "handoff" and not g.degraded
+
             later = sorted((k for k, s in g.snapshots.items() if s.worker == w and s.epoch == g.epoch and not s.lost
                             and k > lo), reverse=True)
             for k in later:                                          # 从最新往回，直到撤回或前台快照
@@ -304,14 +311,23 @@ def _bg_choice_problems(log, cfg: BelayConfig) -> tuple[list[str], dict]:
                 if k == n:
                     if trig == "todo" and not boundary(k):
                         problems.append(f"{where}: not a todo anchor")
+                    if trig == "stable" and not stable(k):
+                        problems.append(f"{where}: not a passing-run snapshot")
                     if trig == "todo" and len([t for t in g.todos.values() if t.status == TODO_COMPLETED
                                                and t.anchor_epoch == s.epoch and lo < (t.anchor_snapshot or 0) <= k]) > 1:
                         seen["coalesced"] += 1
-                    if trig == "auto" and s.reason != "revert":
-                        continue                                     # auto：更早的也不能是边界（撤回之前的除外）
+                    if trig in ("auto", "stable") and s.reason != "revert":
+                        continue                                     # 更早的也不能是边界（撤回之前的除外）
                     break
                 if boundary(k):
-                    problems.append(f"{where}: skipped the newer boundary snapshot {k} ({s.reason})")
+                    problems.append(f"{where}: skipped the {'newer' if k > n else 'older'} boundary snapshot {k} "
+                                    f"({s.reason})")
+                    break
+                if trig == "auto" and stable(k):
+                    problems.append(f"{where}: skipped the passing-run snapshot {k}")
+                    break
+                if trig == "stable" and stable(k) and k > n:
+                    problems.append(f"{where}: skipped the newer passing-run snapshot {k}")
                     break
                 if trig == "auto" and s.testable and k > n:
                     problems.append(f"{where}: snapshot {k} is newer and testable")
@@ -331,7 +347,7 @@ def test_background_picks_the_newest_boundary_under_random_interleavings(seed):
 
 
 def test_boundary_fuzz_actually_coalesces_todos_and_falls_back_to_auto():
-    total = {"auto": 0, "todo": 0, "handoff": 0, "coalesced": 0}
+    total = {"auto": 0, "todo": 0, "stable": 0, "handoff": 0, "coalesced": 0}
     for seed in range(60):
         s, _ = drive(1000 + seed, steps=250, boundaries=True)
         for k, v in _bg_choice_problems(s.log, s.cfg)[1].items():

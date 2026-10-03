@@ -117,7 +117,8 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 | --- | --- | --- |
 | 勾掉 todo：最新的锚点快照（哪怕 worker 之后又改了别的） | bg | 距上一次后台复核开始至少 `merge_todo_interval_sec`（默认 60 s，只防连续勾掉琐碎条目） |
 | 交接 / 会话结束的快照 | bg | 不节流 |
-| 兜底（auto）：没有边界快照时的最新可测快照 | bg | 距上一次后台复核开始至少 `merge_min_interval_sec`（默认 900 s） |
+| 跑通过（stable）：没有 todo / 交接边界时，最新的跑通过快照——worker 改过代码之后自己跑测试或普通运行命令（`merge_stable_generic`）且退出码为 0、之后这一批没再编辑时 driver 拍的（哪怕 worker 之后又改了别的；自上一张跑通过之后树没变的只当普通快照） | bg | 距上一次后台复核开始至少 `merge_stable_interval_sec`（默认 300 s，只是复核成本的上限） |
+| 兜底（auto）：上面都没有时的最新可测快照 | bg | 距上一次后台复核开始或上一次合并（含 submit）至少 `merge_min_interval_sec`（默认 1200 s） |
 | submit | fg | 不节流；取代正在进行的后台请求（作业按树复用，复核取消） |
 | 收尾（最新快照还没合并） | fg | 在截止预留里做 |
 
@@ -159,8 +160,11 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 2. 回归门：有测试配置时跑全量（`selection=None`；v7 的 related 档位与“相关测试先过、全量后验”的两级取消），
    回归先确认重跑，重跑通过的记为 flaky。没有测试配置时 `selection=()`，直接通过。
 3. 单调检查：已完成（E3）的需求依据的测试在这棵树上不再通过 → `merge_rejected(requirement_regression)`。
-4. 有回归：worker 在这次 submit 里提议了豁免 → 请复核者裁决；否则 `merge_rejected(regression)`（前台的立即定位与诊断，
-   后台的同一回归连续两次才定位与诊断）。
+4. 有回归：worker 在这次 submit 里提议了豁免 → 请复核者裁决；后台请求里有回归在上一个被拒的后台请求（另一棵树）
+   上也挂、没被豁免、也还没记为持续性回归（`bg_waivers`）→ 请复核者判断要不要豁免（第一次出现的直接拒：多半是改到
+   一半）；否则 `merge_rejected(regression)`（前台的立即定位与诊断，后台的同一回归连续两次才定位与诊断）。豁免一旦
+   批准就写进 `g.waived`，之后所有回归门（后台与 submit）都不再检查它，豁免了也不提醒 worker；复核者拒绝豁免时才记为
+   持续性回归、定位并提示 worker（只含没豁免的测试），测试重新通过之前同一组不再送审。
 5. 没有回归 → 请复核者（复核者在忙就等；前台取代后台）。
 6. 复核者的结论经规则校验后写 `review_decided`：批准 → `merge_advancing` → CAS → `merged`，随后写这次复核的需求判定
    与测试判定（`requirement_judged`）、锚定 todo、给提交下结论；不批准 → `merge_rejected(review)`，原因与反馈进账本
@@ -279,7 +283,7 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 
 ## 10. 配置（`core/config.py`，新增与变化）
 
-`merge_min_interval_sec`、`merge_todo_interval_sec`、`review_max_turns`、`review_max_sec`、`review_run_timeout_sec`、
+`merge_min_interval_sec`、`merge_todo_interval_sec`、`merge_stable_interval_sec`、`merge_stable_generic`、`bg_waivers`、`review_max_turns`、`review_max_sec`、`review_run_timeout_sec`、
 `review_retries`、`review_input_chars`、`review_locate_wait_sec`、`score_tolerance`、`notify_misses`、`reserve_review_sec`、
 `todo_done_nudge`、`todo_done_nudge_max`、`todo_done_nudge_gap_turns`、`todo_done_nudge_quiet_turns`、
 `todo_reminder_backoff`、`todo_reminder_turns_max`（`todo_reminder_max` 默认改为 0 = 不限）、`after_accept`、

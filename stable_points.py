@@ -25,7 +25,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from belay.runtime.session import TEST_CMD
+from belay.runtime.shellcmd import is_read_only, is_run_command, is_test_command
 from eval.belay_report import find_targets, load_graph
 
 
@@ -42,29 +42,11 @@ def table(head: list[str], rows: list[list]) -> list[str]:
 
 
 EXIT = re.compile(r"\[exit code (-?\d+)")
-READ_ONLY = {"ls", "cat", "head", "tail", "grep", "egrep", "rg", "find", "wc", "echo", "pwd", "tree", "file", "stat",
-             "less", "more", "diff", "sort", "uniq", "awk", "cut", "which", "type", "true", "printf", "du", "df",
-             "realpath", "dirname", "basename", "env", "date", "nl", "od", "xxd", "md5sum", "sha256sum", "sleep"}
-SEG = re.compile(r"&&|\|\||;|\||\n")
 
 
 def read_only(cmd: str) -> bool:
-    """命令里每一段都只是读取 / 查看（cd 不算一段）：ls、cat、grep、git diff / log / status / show、sed -n ……"""
-    for seg in SEG.split(cmd):
-        words = seg.strip().split()
-        while words and ("=" in words[0] and not words[0].startswith("=")):       # VAR=x 前缀
-            words = words[1:]
-        if not words or words[0] in ("cd", "(", ")", "{", "}"):
-            continue
-        w0 = words[0].lstrip("(").split("/")[-1]
-        if w0 in READ_ONLY:
-            continue
-        if w0 == "git" and len(words) > 1 and words[1] in ("diff", "log", "status", "show", "blame", "ls-files"):
-            continue
-        if w0 == "sed" and "-n" in words[1:3]:
-            continue
-        return False
-    return True
+    """命令里每一段都只是读取 / 查看（与运行时同一套解析：引号里的 | 不切分，heredoc 正文不当命令）。"""
+    return is_read_only(cmd)
 
 
 def tool_calls(bdir: Path) -> list[dict]:
@@ -104,7 +86,7 @@ def analyse(bdir: Path, a) -> list[str]:
     rel = lambda t: mmss(t - start)                                     # noqa: E731
     w = g.run.workers[0] if g.run.workers else "w1"
     extra = re.compile(a.test_re) if a.test_re else None
-    is_test = lambda cmd: bool(TEST_CMD.search(cmd) or (extra and extra.search(cmd)))   # noqa: E731
+    is_test = lambda cmd: bool(is_test_command(cmd) or (extra and extra.search(cmd)))   # noqa: E731
     generic = not a.no_generic
     calls = [c for c in tool_calls(bdir) if c["t"] and start <= c["t"] <= end]
 
@@ -169,7 +151,7 @@ def analyse(bdir: Path, a) -> list[str]:
         if test:
             points.append((c["t"], "测试通过", c["cmd"][:60]))
             wrote_since = False
-        elif generic and not read_only(c["cmd"]):
+        elif generic and is_run_command(c["cmd"]):         # 安装、搬文件、只读都不算
             points.append((c["t"], "运行通过", c["cmd"][:60]))
             wrote_since = False
     points.sort()
