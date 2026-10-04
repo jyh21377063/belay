@@ -1,6 +1,8 @@
-"""after_accept=improve：需求都做完之后，复核者提出改进项、判定改进项，worker 继续加强已交付的版本。
+"""改进项机制（after_accept=polish 的 IMPROVE 模式）：需求都做完之后，复核者提出改进项、判定改进项，worker 继续加强
+已交付的版本。
 
-经由模拟器驱动（纯函数规则，每个事务之后检查不变量）。默认 finalize 的行为不变也在这里确认。
+经由模拟器驱动（纯函数规则，每个事务之后检查不变量）。默认 finalize 的行为不变也在这里确认。会话在 POLISH 开始时的
+结束（phase）按规则层的约定模拟，与 test_polish.py 相同。
 """
 from __future__ import annotations
 
@@ -50,7 +52,8 @@ class Lead:
 
 def cfg(**kw) -> BelayConfig:
     kw.setdefault("background", "off")
-    kw.setdefault("after_accept", "improve")
+    kw.setdefault("after_accept", "polish")
+    kw.setdefault("polish_mode", "improve")
     return BelayConfig(**kw)
 
 
@@ -88,8 +91,8 @@ def test_finalize_mode_is_unchanged():
 
 
 def test_improve_needs_a_reviewer():
-    assert not BelayConfig(after_accept="improve", reviewer=False).improve
-    s = Sim(BASE, cfg=BelayConfig(background="off", after_accept="improve", reviewer=False))
+    assert not BelayConfig(after_accept="polish", polish_mode="improve", reviewer=False).improve
+    s = Sim(BASE, cfg=BelayConfig(background="off", after_accept="polish", polish_mode="improve", reviewer=False))
     s.setup(TASK, PLAN)
     s.do(R.start_session, "w1", "first", {})
     sid = finish_all(s)                                        # 没有复核者：按自述记下，接受后收尾
@@ -119,9 +122,9 @@ def test_accept_starts_the_phase_and_the_reviewer_is_asked_for_directions():
     assert "accepted" in text and "does not stop here" in text and "I1 [open] Cover negative zero" in text
     assert "you can stop" not in text
     assert improving(g, s.cfg)
-    s.do(R.end_session, "w1", "submitted")
+    s.do(R.end_session, "w1", "phase")                          # POLISH 开始：这个会话结束，换新会话
     g = s.g
-    assert R.next_step(g, "w1", s.now, s.cfg) == ("start_session", "restart")   # 不收尾
+    assert R.next_step(g, "w1", s.now, s.cfg) == ("start_session", "phase")     # 不收尾
     ctx = build_context(g, "w1", 24000, s.now, s.cfg, mode="resume")
     assert "Improvement phase: in progress" in ctx.text and "I2 [open] Document add's overflow" in ctx.text
     assert "continues to improve the delivered version" in ctx.text
@@ -129,21 +132,12 @@ def test_accept_starts_the_phase_and_the_reviewer_is_asked_for_directions():
     assert not check_log(s.log) and not llm_effects(s.log) and replay(s.log) == g
 
 
-def test_directions_given_with_the_accepting_review_need_no_extra_review():
-    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE, new=[{"title": "Handle huge ints", "why": "w",
-                                                               "quote": MUL_QUOTE}]))
-    s = sim(lead)
-    sid = finish_all(s)
-    assert lead.calls == ["submit"] and s.g.submits[sid].status == "accepted"
-    assert list(s.g.improvements) == ["I1"] and s.g.improvements["I1"].proposed_checkpoint == 1
-
-
 def test_proposals_are_ignored_while_requirements_are_open():
     lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE[:2], new=[{"title": "t", "why": "w", "quote": MUL_QUOTE}]))
     s = sim(lead)
     sid = finish_all(s)
     assert s.g.submits[sid].status == "returned" and not s.g.improvements and not s.g.run.improving
-    assert any("only once every requirement" in n for n in s.g.reviews["V1"].decision["notes"])
+    assert s.g.reviews["V1"].decision["improvements"] is None      # POLISH 开始之前：改进项机制不在用
 
 
 def test_proposals_must_be_tied_to_the_task_text_or_a_measured_score_and_are_capped():
@@ -153,18 +147,18 @@ def test_proposals_must_be_tied_to_the_task_text_or_a_measured_score_and_are_cap
            {"title": "  mul NEGATIVES tests ", "why": "dup", "quote": MUL_QUOTE},            # 重复
            {"title": "Docs A", "why": "w", "quote": DOC_QUOTE},
            {"title": "Docs B", "why": "w", "quote": DOC_QUOTE}]
-    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE, new=new))
+    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE), improve=lambda s, v: verdict(v, new=new))
     s = sim(lead, improve_max_open=2)
     finish_all(s)
     assert [i.title for i in s.g.improvements.values()] == ["Mul negatives tests", "Docs A"]
-    notes = s.g.reviews["V1"].decision["notes"]
+    notes = s.g.reviews["V2"].decision["notes"]
     assert sum("tied neither" in n for n in notes) == 2
     assert any("already on the list" in n for n in notes) and any("at most 2" in n for n in notes)
 
 
 def test_objective_items_need_a_measured_score():
-    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE, score=0.6,
-                                            new=[{"title": "Speed it up", "why": "w", "objective": True}]))
+    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE, score=0.6),
+                improve=lambda s, v: verdict(v, new=[{"title": "Speed it up", "why": "w", "objective": True}]))
     s = sim(lead)
     finish_all(s)
     i = s.g.improvements["I1"]
@@ -174,9 +168,9 @@ def test_objective_items_need_a_measured_score():
 # ======================================================================== 判定改进项、进展
 
 def _phase(s_kw=None, **lead_kw):
-    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE, score=lead_kw.get("score0"),
-                                            new=[{"title": "Mul edge cases", "why": "w", "quote": MUL_QUOTE},
-                                                 {"title": "Doc examples", "why": "w", "quote": DOC_QUOTE}]))
+    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE, score=lead_kw.get("score0")),
+                improve=lambda s, v: verdict(v, new=[{"title": "Mul edge cases", "why": "w", "quote": MUL_QUOTE},
+                                                     {"title": "Doc examples", "why": "w", "quote": DOC_QUOTE}]))
     s = sim(lead, **(s_kw or {}))
     sid = finish_all(s)
     assert s.g.submits[sid].status == "accepted" and len(s.g.improvements) == 2
@@ -185,8 +179,8 @@ def _phase(s_kw=None, **lead_kw):
 
 def test_done_needs_evidence_and_counts_as_progress():
     s, lead = _phase()
-    s.do(R.end_session, "w1", "submitted")
-    s.do(R.start_session, "w1", "restart", {})                 # 改进阶段开始之后的第一个会话
+    s.do(R.end_session, "w1", "phase")
+    s.do(R.start_session, "w1", "phase", {})                   # 改进阶段开始之后的第一个会话
     lead.by["submit"] = lambda s, v: verdict(v, improvements=[
         {"id": "I1", "status": "done", "level": "E0"},                                   # 只有自述：partial
         {"id": "I2", "status": "done", "level": "E2", "runs": ["X1"], "evidence": ["ran the example"]}])
@@ -207,30 +201,30 @@ def test_with_a_measured_score_done_needs_a_command():
     s.world.define("t2", {ADD: "PASSED"})
     s.submit("t2")
     assert imp(s)["I1"] == (IMP_OPEN, None)
-    assert any("needs E2 or better" in n for n in s.g.reviews["V2"].decision["notes"])
+    assert any("needs E2 or better" in n for n in s.g.reviews["V3"].decision["notes"])
 
 
 def test_a_higher_score_counts_as_progress_only_in_improve_mode():
     s, lead = _phase(score0=0.5)
-    s.do(R.end_session, "w1", "submitted")
-    s.do(R.start_session, "w1", "restart", {})
+    s.do(R.end_session, "w1", "phase")
+    s.do(R.start_session, "w1", "phase", {})
     lead.by["submit"] = lambda s, v: verdict(v, score=0.505)  # 在容差（2%）以内：不算
     s.world.define("t2", {ADD: "PASSED"})
     s.submit("t2")
-    assert s.g.reviews["V2"].decision["improved"] is False and not s.g.sessions["S2"].progress
+    assert s.g.reviews["V3"].decision["improved"] is False and not s.g.sessions["S2"].progress
     lead.by["submit"] = lambda s, v: verdict(v, score=0.6)
     s.world.define("t3", {ADD: "PASSED"})
     s.submit("t3")
-    assert s.g.reviews["V3"].decision["improved"] is True and s.g.sessions["S2"].progress
+    assert s.g.reviews["V4"].decision["improved"] is True and s.g.sessions["S2"].progress
     s.do(R.end_session, "w1", "done")
     assert improve_idle_sessions(s.g, "w1") == 0
 
 
 def test_idle_sessions_after_the_start_end_the_phase():
     s, lead = _phase()
-    s.do(R.end_session, "w1", "submitted")                     # 开始改进时的那个会话不算
+    s.do(R.end_session, "w1", "phase")                         # 开始改进时的那个会话不算
     assert improve_idle_sessions(s.g, "w1") == 0
-    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("start_session", "restart")
+    assert R.next_step(s.g, "w1", s.now, s.cfg) == ("start_session", "phase")
     for k in range(2):
         s.do(R.start_session, "w1", "restart", {})
         s.do(R.end_session, "w1", "done")
@@ -244,7 +238,7 @@ def test_drop_then_no_more_improvements_closes_the_phase():
     s.world.define("t2", {ADD: "PASSED"})
     sid = s.submit("t2")
     assert not s.g.run.improve_closed and s.g.submits[sid].status == "accepted"
-    assert any("I1, I2 are still open" in n for n in s.g.reviews["V2"].decision["notes"])
+    assert any("I1, I2 are still open" in n for n in s.g.reviews["V3"].decision["notes"])
     lead.by["submit"] = lambda s, v: verdict(v, improvements=[
         {"id": "I1", "status": "dropped", "reason": "mul already covers it"},
         {"id": "I2", "status": "done", "level": "E1"}], no_more="the docs and mul are complete")
@@ -274,7 +268,7 @@ def test_a_closing_claim_needs_the_score_measured_when_the_task_has_one():
                                                                   "objective": True}])
     s.world.define("t2", {ADD: "PASSED"})
     sid = s.submit("t2")
-    assert any("measure it in this review" in n for n in s.g.reviews["V2"].decision["notes"])
+    assert any("measure it in this review" in n for n in s.g.reviews["V3"].decision["notes"])
     # 两项都放弃了、宣布无效：没有 open 的改进项，于是请复核者再提方向
     assert lead.calls[-1] == "improve" and not s.g.run.improve_closed
     assert imp(s)["I3"] == (IMP_OPEN, None) and s.g.submits[sid].status == "accepted"

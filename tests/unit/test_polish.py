@@ -63,8 +63,8 @@ def test_polish_config():
     c = BelayConfig(after_accept="polish")
     assert c.improve and c.polish
     assert not BelayConfig(after_accept="polish", reviewer=False).improve
-    assert BelayConfig(after_accept="improve").improve and not BelayConfig(after_accept="improve").polish
-    for bad in ({"after_accept": "x"}, {"polish_mode": "x"}, {"verify_rounds": 0}):
+    assert not BelayConfig().improve and not BelayConfig().polish          # 默认 finalize
+    for bad in ({"after_accept": "x"}, {"after_accept": "improve"}, {"polish_mode": "x"}, {"verify_rounds": 0}):
         try:
             BelayConfig.from_dict(bad)
         except ValueError:
@@ -199,15 +199,6 @@ def test_forced_verify_mode_ignores_the_score():
     s = sim(lead, runs=GAP_RUNS, polish_mode="verify")
     submit(s, "t1")
     assert s.g.run.polish_mode == "verify" and lead.calls == ["submit", "verify"]
-
-
-def test_legacy_improve_mode_is_unchanged_by_polish():
-    lead = Lead(submit=lambda s, v: verdict(v, ALL_DONE, new=[{"title": "x", "why": "y", "quote": MUL_QUOTE}]))
-    s = Sim(BASE, cfg=BelayConfig(background="off", after_accept="improve"), reviewer=lead)
-    s.setup(TASK, PLAN)
-    s.do(R.start_session, "w1", "first", {})
-    submit(s, "t1")
-    assert lead.calls == ["submit"] and list(s.g.improvements) == ["I1"] and s.g.run.polish_mode == "improve"
 
 
 # ======================================================================== 打转换人

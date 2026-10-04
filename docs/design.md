@@ -70,7 +70,7 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 | 需求 | `plan_proposed` / `requirement_frozen` | llm / rule | 清单冻结：引文、摘要、kind、checks、acceptance |
 | | `requirement_judged` | rule / self_report | 状态 open / done / blocked，证据等级、证据、缺失项、所在合并点、来源（review / checks / self_report / rollback） |
 | todo | `todos_updated` / `todo_completed` / `todo_anchored` / `todo_invalidated` | self_report / rule | 锚点被链上合并点包含即 anchored |
-| 改进 | `improve_started` / `improvement_proposed` / `improvement_judged` / `improve_closed` | rule | 改进阶段与改进项（after_accept=improve，见 4.5） |
+| 改进 | `improve_started` / `improvement_proposed` / `improvement_judged` / `improve_closed` | rule | 改进阶段与改进项（after_accept=polish，见 4.5、4.6） |
 | 提交 | `submit_requested` / `submit_updated` | rule | pending → accepted / returned；被拒由 `merge_rejected` 推出 |
 | 执行 | `session_*` / `compacted` / `snapshot_taken` / `stall_detected` | | |
 | 验证 | `job_started` / `job_preempted` / `job_finished` / `baseline_recorded` | rule / observed | |
@@ -192,17 +192,17 @@ v8 的一句话：**worker 只管干活，runtime 只管存档，复核者是唯
 `delivered`。最新快照的复核没做完时交付的仍是链头。截止预留 = max(下限, 全量回归门耗时 × 系数 + 余量 + 一次复核)，
 最多占预算的 `reserve_max_frac`。
 
-### 4.5 需求都做完之后：收尾还是继续改进（`after_accept`）
+### 4.5 需求都做完之后：收尾还是继续（`after_accept`）；改进项机制
 
-`after_accept=finalize`（默认）：submit 被接受即收尾，与之前完全相同。`after_accept=improve`（需要复核者）：需求都做完
-不等于不能更好——LHTB 这类按比例计分、隐藏评分器看不到的任务，剩下的预算用来加强已交付的版本。合并链单调，交付的
-永远是链头，所以继续做的风险只在复核者看不到的地方（SWE 的隐藏 P2P 测试、复核者自测的分数与隐藏评分器不一致），
-SWE-EVO 不开。
+`after_accept=finalize`（默认）：submit 被接受即收尾。`after_accept=polish`（需要复核者）：需求都做完不等于不能更好——
+换一个新会话进入 POLISH（4.6）。POLISH 的 IMPROVE 模式用下面的改进项机制：LHTB 这类按比例计分、隐藏评分器看不到的
+任务，剩下的预算用来加强已交付的版本。合并链单调，交付的永远是链头，所以继续做的风险只在复核者看不到的地方（SWE 的
+隐藏 P2P 测试、复核者自测的分数与隐藏评分器不一致）。
 
 - **复核者当 leader**：改进项（`Improvement`，I1…）只由复核者提出、只由复核者判定，worker 只做。每条必须挂到任务原文
   的逐字引文（至少 3 个词，规则校验）或可测的目标（链上测过分数，或这次测了）上；与已有的不重复；同时 open 的最多
-  `improve_max_open`（5）条。只在需求都做完之后提（复核时估计：判完成 / 受阻，或证据检查全部通过；落地时按账本再确认），
-  和需求的判定一样只在合并（或只判定）时落地，没被合并的复核里的改进项不记。
+  `improve_max_open`（5）条。只在 IMPROVE 开始之后提（`queries.improvement_items`），和需求的判定一样只在合并（或只
+  判定）时落地，没被合并的复核里的改进项不记。
 - **判定**：完成要有证据——链上测过分数时要 E2 / E3（复核者实际运行了），否则 E1 起；E0 只算 partial；放弃（dropped）
   要写原因。改进项不影响 DONE 的判定。
 - **开始**：需求都做完、submit 走到 `finish_submit` 时写 `improve_started`。还没有 open 的改进项、复核者也没宣布结束时，
@@ -212,14 +212,14 @@ SWE-EVO 不开。
   todo、交接、兜底），复核者每次都看到改进项并判定、可以补新的；后台复核更新了改进项时提醒 worker。开场与 board 有
   “Improvements”一节。合并标准不变（不比链头差，分数不降）。
 - **进展**：改进项判完成，或合并点的分数比链上上一次测到的高出 `score_tolerance` 以上（复核决定里的 `improved`；只在
-  improve 模式下算），记到会话上。
+  after_accept=polish 时算），记到会话上。
 - **结束**（任一）：截止预留；复核者宣布没有值得做的改进了（`no_more_improvements` 写原因；open 的都要先判完成或放弃；
   不能同时提新的；链上测过分数时这次也要测）；改进阶段开始之后开的会话里连续 `improve_idle_sessions`（2）个没有进展
   （开始时正在进行的那个会话不算）。之后照常收尾、交付链头。收尾时正在进行的 `improve` 复核直接取消。
 
 ### 4.6 换新会话进入 POLISH（`after_accept=polish`）
 
-`after_accept=improve` 在宣布完成的那个会话里继续：上下文里全是为现有实现辩护的推理。`polish` 把会话当作一个阶段的
+在宣布完成的那个会话里继续，上下文里全是为现有实现辩护的推理。`polish` 把会话当作一个阶段的
 工作单元：需求都做完、submit 走到 `finish_submit` 时写 `improve_started`（payload 带 `mode`），这次 submit 的回复之后
 结束当前会话（结束原因 `phase`，`port.submit` 判断：这个会话开始于 `improve_seq` 之前），会话还开着时让模型按
 `L3_PHASE` 写交接摘要（怎么验证的、哪里最没把握、怎么构建运行、放弃过的方案），新会话的开场理由是 `phase`。
@@ -227,8 +227,8 @@ SWE-EVO 不开。
 - **时间门槛**：剩余时间扣掉截止预留后不足 `new_session_min_sec`（600 秒）时不写 `improve_started`，直接接受、收尾
   （判断在规则里，写 `improve_started` 之前）。
 - **模式**（`polish_mode`）：`auto` 按链上有没有测过分数选——有分数选 `improve`，没有选 `verify`；也可以固定。
-- **IMPROVE**：与 4.5 的改进项机制相同，只有一处不同：改进项的说明、verdict 的改进项字段、改进项的提议与判定都只在
-  POLISH 开始之后才有（`queries.improvement_items`）。需求阶段的复核者输入与 `finalize` 完全相同，对比才干净。
+- **IMPROVE**：4.5 的改进项机制。改进项的说明、verdict 的改进项字段、改进项的提议与判定都只在 POLISH 开始之后才有
+  （`queries.improvement_items`）。需求阶段的复核者输入与 `finalize` 完全相同，对比才干净。
 - **VERIFY**：不新增数据结构，复用“已完成的需求在 E2 / E3 的反证下退回 open”（`reassessed`）这条规则。接受之前先在
   链头上开一次只判定的复审（触发 `verify`，焦点是判了完成、证据不到 E3 的需求，E1 在前）：复核者设法拿到 E2 / E3——
   跑通了就升级证据等级，跑出缺口就以 E2 / E3 判 not_done、在 missing 里写出复现命令，规则把它退回 open，这次 submit
@@ -350,7 +350,7 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 | 合并请求（节流、交接与 todo、回归门、复核）、证据等级校验、单调（已完成不退回、E3 测试、分数）、豁免由复核者裁决、复核失败的重试与降级、只判定的复核、受阻的裁决、没有回归门的路径、收尾、DONE 的条件 | `tests/unit/test_rules.py` |
 | 后台挑快照：todo 锚点优先于之后的改动、合并期间攒下的 todo 合成一次、不抢占进行中的复核、submit 仍然取代、被拒不回退、revert 是屏障、auto 只是兜底 | `tests/unit/test_rules.py`（“边界快照”一节） |
 | todo 提醒的触发与节流（跑完测试、有进行中的条目、改过文件；同一组上限与间隔、组变了重新计数；探索期不计时；不限次数与退避；多项并行按组说；交接后从图上取条目） | `tests/unit/test_todo_reminders.py` |
-| 改进阶段：finalize 不变；接受后开始、请复核者提方向；提议的校验（引文、目标、去重、上限、需求没做完时不提）；证据等级；分数提高与改进项完成算进展；放弃与宣布结束；重试后结束；空闲会话结束；收尾取消；后台复核更新改进项；被拒的复核不记；回退重新打开 | `tests/unit/test_improve.py`、`tests/integration/test_belay_run.py`（改进阶段一节）、`test_replay.py`（improve 模式） |
+| 改进阶段（POLISH 的 IMPROVE）：finalize 不变；接受后开始、请复核者提方向；提议的校验（引文、目标、去重、上限、需求没做完时不提）；证据等级；分数提高与改进项完成算进展；放弃与宣布结束；重试后结束；空闲会话结束；收尾取消；后台复核更新改进项；被拒的复核不记；回退重新打开 | `tests/unit/test_improve.py`、`tests/integration/test_polish_run.py`、`test_replay.py`（improve 模式） |
 | 重放一致性（随机复核结论：失败、格式坏、豁免、分数、各种等级）；随机交错下后台总是挑最新的边界快照（性质检查） | `tests/unit/test_replay.py` |
 | 开场、等级与缺失项、board | `tests/unit/test_context.py` |
 | 端到端：复核会话（真实的复核目录与工具）、E2、复核失败、回归被拒、后台不批准的提醒、跑完测试后提醒勾掉 todo、交接、恢复、截止 | `tests/integration/test_belay_run.py`、`test_long_run.py` |

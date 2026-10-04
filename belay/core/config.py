@@ -10,8 +10,7 @@
   reviewer=False         没有复核者：合并只看回归门；需求只由测试（E3）或 worker 的自述（E0）记下
   background=handoff     后台只在交接时发起合并请求；off 只在 submit 与收尾时合并
   todo_done_nudge=False  跑完测试后不提醒“做完了就勾掉”（只留第一次与长时间没更新的 todo 提醒）
-  after_accept=improve   需求都做完后不收尾，由复核者提出改进项，在同一个会话里继续加强已交付的版本（旧实现，留作对照）
-  after_accept=polish    需求都做完后换一个新会话进入 POLISH：IMPROVE（链上测过分数：复核者提改进项）或 VERIFY
+  after_accept=polish   需求都做完后换一个新会话进入 POLISH：IMPROVE（链上测过分数：复核者提改进项）或 VERIFY
                          （没有分数：复核者复审判了完成的需求，跑出缺口就退回）。默认 finalize：收尾
   stuck_handoff=False    同一个问题在 submit 上反复失败时只提醒，不换新会话
 
@@ -83,12 +82,12 @@ class BelayConfig:
     reserve_review_sec: float = 300
     reserve_min_sec: float = 120
     reserve_max_frac: float = 0.25
-    # ---- 需求都做完之后：finalize = 收尾交付（默认）；improve = 继续改进已交付的版本，直到截止预留、复核者认为
-    # 没有值得做的改进，或连续 improve_idle_sessions 个（改进阶段开始之后开的）会话没有进展。改进项由复核者提出，
-    # 每条挂到任务原文的引文或可测的目标上；同时 open 的最多 improve_max_open 条。需要复核者（reviewer=True）。
-    # polish = 需求都做完、submit 被接受后，结束当前会话，由新会话进入 POLISH；polish_mode：auto（链上测过分数选
-    # improve，否则 verify）/ improve（复核者提改进项，同 after_accept=improve 的机制）/ verify（复核者复审判了完成的
-    # 需求：跑出缺口就以 E2 / E3 退回 open，最多 verify_rounds 轮；没有退回任何需求时收尾）。
+    # ---- 需求都做完之后：finalize = 收尾交付（默认）；polish = 需求都做完、submit 被接受后，结束当前会话，由新会话
+    # 进入 POLISH（需要复核者 reviewer=True）。polish_mode：auto（链上测过分数选 improve，否则 verify）/ improve
+    # （复核者提改进项，继续加强已交付的版本，直到截止预留、复核者认为没有值得做的改进，或连续 improve_idle_sessions
+    # 个（改进阶段开始之后开的）会话没有进展；改进项每条挂到任务原文的引文或可测的目标上，同时 open 的最多
+    # improve_max_open 条）/ verify（复核者复审判了完成的需求：跑出缺口就以 E2 / E3 退回 open，最多 verify_rounds
+    # 轮；没有退回任何需求时收尾）。
     # 剩余时间扣掉截止预留后不足 new_session_min_sec 时不进 POLISH（直接收尾），也不因打转换新会话。
     after_accept: str = "finalize"
     polish_mode: str = "auto"
@@ -162,8 +161,8 @@ class BelayConfig:
 
     @property
     def improve(self) -> bool:
-        """需求都做完之后是否继续（改进阶段 / POLISH）：after_accept=improve 或 polish，且有复核者。"""
-        return self.after_accept in ("improve", "polish") and self.reviewer
+        """需求都做完之后是否继续（POLISH）：after_accept=polish，且有复核者。"""
+        return self.after_accept == "polish" and self.reviewer
 
     @property
     def polish(self) -> bool:
@@ -199,8 +198,8 @@ class BelayConfig:
             raise ValueError("verify_slots 至少为 1")
         if cfg.review_retries < 0 or cfg.review_max_turns < 2:
             raise ValueError("review_retries 不能为负，review_max_turns 至少为 2")
-        if cfg.after_accept not in ("finalize", "improve", "polish"):
-            raise ValueError("after_accept 只能是 finalize / improve / polish")
+        if cfg.after_accept not in ("finalize", "polish"):
+            raise ValueError("after_accept 只能是 finalize / polish")
         if cfg.polish_mode not in ("auto", "improve", "verify"):
             raise ValueError("polish_mode 只能是 auto / improve / verify")
         if cfg.verify_rounds < 1 or cfg.stuck_submit_misses < 1 or cfg.phase_preread_files < 0:

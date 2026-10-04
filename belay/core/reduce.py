@@ -240,7 +240,7 @@ def _requirement_judged(g: Graph, e: Event) -> Graph:
     return g
 
 
-# ======================================================================== 改进阶段（after_accept=improve）
+# ======================================================================== 改进阶段（after_accept=polish）
 
 def _improve_started(g: Graph, e: Event) -> Graph:
     _running(g)
@@ -625,7 +625,7 @@ def _merged(g: Graph, e: Event) -> Graph:
     if wip is not None and wip.tree == a.tree:
         g = replace(g, wips=_put(g.wips, a.worker, replace(wip, base=cid, files=(), last_rejection=None)))
     # 合并本身不算进展：进展只来自需求完成、证据检查第一次通过（见 _requirement_judged、_check_passes）；
-    # after_accept=improve 时还有：分数比链上上一次测到的高出容差以上（复核决定里的 improved）、改进项完成
+    # after_accept=polish 时还有：分数比链上上一次测到的高出容差以上（复核决定里的 improved）、改进项完成
     if d.get("improved"):
         g = _progress(g, e, None)
     return _check_passes(g, e, a.tree)

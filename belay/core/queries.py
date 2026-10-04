@@ -75,7 +75,7 @@ def mentioned_requirements(g: Graph, text: str) -> list[str]:
     return out
 
 
-# ---------------------------------------------------------------- 改进阶段（after_accept=improve）
+# ---------------------------------------------------------------- 改进阶段（after_accept=polish）
 
 def improvements_in_order(g: Graph) -> list[Improvement]:
     return sorted(g.improvements.values(), key=lambda i: i.n)
@@ -93,12 +93,10 @@ def improving(g: Graph, cfg: Optional[BelayConfig] = None) -> bool:
 
 
 def improvement_items(g: Graph, cfg: Optional[BelayConfig]) -> bool:
-    """改进项机制是否在用：after_accept=improve（旧实现：从第一次复核起就用），或 after_accept=polish 的 IMPROVE 模式
-    （POLISH 开始之后才用；之前复核者的输入与 finalize 完全相同）。"""
+    """改进项机制是否在用：after_accept=polish 的 IMPROVE 模式（POLISH 开始之后才用；之前复核者的输入与 finalize
+    完全相同）。"""
     if cfg is None or not cfg.improve:
         return False
-    if not cfg.polish:
-        return True
     return g.run is not None and g.run.improving and g.run.polish_mode == "improve"
 
 

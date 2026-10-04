@@ -300,7 +300,7 @@ def _progress(g: Graph, cap_chars: int) -> str:
 
 
 def _improvements(g: Graph, cfg: BelayConfig) -> str:
-    """改进阶段（after_accept=improve，或 polish 的 IMPROVE 模式）：复核者提出的改进项。还没开始、也没有改进项时为空；
+    """改进阶段（after_accept=polish 的 IMPROVE 模式）：复核者提出的改进项。还没开始、也没有改进项时为空；
     VERIFY 模式没有改进项（复审退回的需求列在需求状态里）。"""
     if g.run is not None and g.run.polish_mode == "verify":
         return ""

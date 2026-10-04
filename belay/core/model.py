@@ -39,7 +39,7 @@ JUDGEMENTS = (J_DONE, J_PARTIAL, J_NOT_DONE, J_BLOCKED)
 # 判定的来源（requirement_judged.by）
 BY_REVIEW, BY_CHECKS, BY_SELF, BY_ROLLBACK = "review", "checks", "self_report", "rollback"
 
-# ---- 改进项（after_accept=improve：需求都做完之后，复核者提出、复核者判定）
+# ---- 改进项（after_accept=polish 的 IMPROVE 模式：需求都做完之后，复核者提出、复核者判定）
 IMP_OPEN, IMP_DONE, IMP_DROPPED = "open", "done", "dropped"
 IMP_STATUSES = (IMP_OPEN, IMP_DONE, IMP_DROPPED)
 
@@ -105,7 +105,7 @@ class Requirement:
 
 @dataclass(frozen=True)
 class Improvement:
-    """改进项（after_accept=improve）：需求清单都判完成之后，复核者提出的“还能怎样加强已交付的版本”。
+    """改进项（after_accept=polish 的 IMPROVE 模式）：需求清单都判完成之后，复核者提出的“还能怎样加强已交付的版本”。
     每条挂到任务原文的引文（规则逐字校验）或可测的目标（链上测过分数）上。不影响 DONE 的判定；做完它（或分数提高）
     算进展。只由复核者判定，规则校验证据等级。"""
     id: str                                  # I1
@@ -439,11 +439,11 @@ class Run:
     suspended: int = 0
     delivered: Optional[int] = None
     status_reasons: tuple[str, ...] = ()
-    # 改进阶段（after_accept=improve）：需求都做完、submit 被接受之后开始；复核者认为没有值得做的改进了就结束
+    # 改进阶段（after_accept=polish）：需求都做完、submit 被接受之后开始；复核者认为没有值得做的改进了就结束
     improving: bool = False
     improve_seq: Optional[int] = None
     improve_closed: str = ""                 # 结束的原因（空 = 没结束）
-    # after_accept=polish：POLISH 的模式（改进阶段开始时选定）improve | verify；after_accept=improve 时为 improve
+    # after_accept=polish：POLISH 的模式（改进阶段开始时选定）improve | verify
     polish_mode: str = ""
     recoveries: int = 0
     rebuilds: int = 0

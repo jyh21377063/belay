@@ -148,7 +148,7 @@ VERDICT_SCHEMA = {"type": "object", "properties": {
 
 
 def verdict_schema(improve: bool) -> dict:
-    """after_accept=improve 时 verdict 多三个字段（改进项）；默认模式下与原来完全相同。"""
+    """POLISH 的 IMPROVE 模式里 verdict 多三个字段（改进项）；其余时候与原来完全相同。"""
     if not improve:
         return VERDICT_SCHEMA
     return {**VERDICT_SCHEMA, "properties": {**VERDICT_SCHEMA["properties"], **IMPROVE_SCHEMA}}
@@ -416,7 +416,7 @@ class Reviewer:
         return out[-n:]
 
     def _improve_text(self, vid: str) -> str:
-        """after_accept=improve：改进项的说明、现有的改进项、上一次请复核者提改进方向时被忽略的部分。"""
+        """POLISH 的 IMPROVE 模式：改进项的说明、现有的改进项、上一次请复核者提改进方向时被忽略的部分。"""
         g = self.run.rt.graph
         cfg = self.run.cfg
         scored = last_score(g)[0] is not None
@@ -424,11 +424,7 @@ class Reviewer:
             max_open=cfg.improve_max_open,
             need="; with a measured score, done needs E2 or E3: measure it" if scored else "",
             score_rule=" The task has a measured score: measure it in this review too." if scored else "")
-        run = g.run
-        state = ("The improvement phase has started." if run.improving else
-                 "The improvement phase has not started: some requirements are still open, so propose nothing unless "
-                 "your judgements leave none open.")
-        lines = [guide, state]
+        lines = [guide, "The improvement phase has started."]       # 只在 POLISH 的 IMPROVE 开始之后才有这一段
         items = improvement_lines(g)
         lines.append("Improvement items so far:\n" + "\n".join(items) if items else "Improvement items so far: none.")
         v = g.reviews[vid]

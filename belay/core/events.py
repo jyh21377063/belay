@@ -54,7 +54,7 @@ EVENT_SPECS: dict[str, Spec] = {
     "plan_proposed": Spec(("round", "valid", "problems"), (LLM, RULE)),
     "requirement_frozen": Spec(("requirements",), (RULE,)),
     "requirement_judged": Spec(("requirement", "status", "by"), (RULE, SELF_REPORT)),
-    # ---- 改进阶段（after_accept=improve）：改进项只由规则校验过的复核结论产生
+    # ---- 改进阶段（after_accept=polish）：改进项只由规则校验过的复核结论产生
     "improve_started": Spec(("submit", "checkpoint"), (RULE,)),
     "improvement_proposed": Spec(("improvement", "title", "review"), (RULE,)),
     "improvement_judged": Spec(("improvement", "status"), (RULE,)),

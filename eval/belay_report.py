@@ -247,7 +247,7 @@ def report(trial: Optional[Path], bdir: Path) -> str:
             f"{rel(dl[-1].t) if dl else '-'}；状态 {L['status']}"
             + (f"；未 DONE 的原因：{'; '.join(L['status_reasons'])}" if L["status_reasons"] else ""),
             f"- 会话 {len(g.sessions)} 个；恢复 {run.recoveries} 次，停机 {int(run.downtime_sec)}s", ""]
-    if run.improving or g.improvements:                       # after_accept=improve
+    if run.improving or g.improvements:                       # after_accept=polish
         st = by_type.get("improve_started", [])
         after = [c for c in merges if run.improve_seq and c.created_seq > run.improve_seq]
         before = [c for c in merges if not run.improve_seq or c.created_seq <= run.improve_seq]

@@ -77,10 +77,10 @@ def drive(seed: int, steps: int = 200, boundaries: bool = False, improve: bool |
                       waive_max_tests=rnd.choice([1, 20]), stall_same_failure=rnd.choice([2, 3]))
     if boundaries:
         cfg = replace(cfg, merge_min_interval_sec=rnd.choice([0, 900]), merge_todo_interval_sec=rnd.choice([0, 60]))
-    # 改进阶段（after_accept=improve）：用单独的随机数，不打乱上面的主序列
+    # 改进阶段（after_accept=polish 的 IMPROVE 模式）：用单独的随机数，不打乱上面的主序列
     rimp = random.Random(seed * 7919 + 13)
     if improve if improve is not None else rimp.random() < 0.4:
-        cfg = replace(cfg, after_accept="improve", improve_max_open=rimp.choice([1, 3, 5]),
+        cfg = replace(cfg, after_accept="polish", polish_mode="improve", improve_max_open=rimp.choice([1, 3, 5]),
                       improve_idle_sessions=rimp.choice([1, 2]))
     s = Sim(BASE, cfg=cfg, auto_jobs=False, auto_located=rnd.random() < 0.8, reviewer=MANUAL)
     s.setup(TASK, PLAN, budget=rnd.choice([1500, 20000]))
@@ -355,7 +355,7 @@ def test_boundary_fuzz_actually_coalesces_todos_and_falls_back_to_auto():
     assert all(v >= 5 for v in total.values()), total
 
 
-# ======================================================================== 改进阶段（after_accept=improve）
+# ======================================================================== 改进阶段（after_accept=polish 的 IMPROVE 模式）
 
 @pytest.mark.parametrize("seed", range(30))
 def test_replay_consistency_in_improve_mode(seed):

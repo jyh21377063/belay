@@ -51,7 +51,7 @@ STABLE_REASON = "stable"                            # worker 改过代码之后�
 FOREGROUND_REASONS = ("submit", "final", "deadline")
 # 有人在等结论的合并请求（被拒时定位、诊断并告诉 worker）
 DECLARED_TRIGGERS = ("submit",)
-# 只判定、不合并的复核：需求都做完、改进阶段里还没有 open 的改进项时，请复核者提出改进方向（after_accept=improve）
+# 只判定、不合并的复核：需求都做完、改进阶段里还没有 open 的改进项时，请复核者提出改进方向（POLISH 的 IMPROVE 模式）
 IMPROVE_TRIGGER = "improve"
 # 只判定、不合并的复核：POLISH 的 VERIFY 模式里复审判了完成的需求（跑出缺口就以 E2 / E3 退回 open）
 VERIFY_TRIGGER = "verify"
@@ -712,7 +712,7 @@ def _clean_blockers(raw) -> list[str]:
 
 
 def _clean_improvements(v: dict) -> dict:
-    """改进项（after_accept=improve）的格式规整：对已有改进项的判定、新提议、“没有值得做的改进了”。"""
+    """改进项（POLISH 的 IMPROVE 模式）的格式规整：对已有改进项的判定、新提议、“没有值得做的改进了”。"""
     judged = []
     for item in v.get("improvements") or []:
         if not isinstance(item, dict) or not str(item.get("id") or "").strip():
@@ -875,7 +875,7 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
         reasons.append(f"the score dropped from {prev:g} (merge point {prev_cp}) to {score:g}")
     improved = bool(cfg.improve and v.attempt is not None and score is not None and prev is not None
                     and score > prev + cfg.score_tolerance * abs(prev))
-    # ---- 改进项（after_accept=improve）
+    # ---- 改进项（POLISH 的 IMPROVE 模式）
     improvements = _decide_improvements(g, cfg, v, verdict, res, run_ids, judgements, score, notes)
     # ---- 合并
     merge = None
@@ -904,26 +904,13 @@ def _norm_imp(title: str) -> str:
     return " ".join(str(title).lower().split())
 
 
-def _improve_phase_after(g: Graph, cfg: BelayConfig, judgements: list[dict], res: dict) -> bool:
-    """这次复核的判定落地之后，是否可以提出改进项（或宣布没有值得做的改进了）：改进阶段已经开始，或者需求都做完了
-    （复核者判完成 / 受阻，或证据检查在这棵树上全部通过——合并时规则会记 E3）。收尾、截止预留、改进阶段已结束时不行。
-    这是复核时的估计；落地时（_apply_improvements）再按账本确认一次。"""
+def _improve_phase_after(g: Graph) -> bool:
+    """是否可以提出改进项（或宣布没有值得做的改进了）：改进阶段已经开始（改进项只由 POLISH 开始时那次专门的复核
+    和之后的复核提出）。收尾、截止预留、改进阶段已结束时不行。落地时（_apply_improvements）再确认一次。"""
     run = g.run
     if run is None or run.finalizing or run.reserve or run.improve_closed:
         return False
-    if run.improving:
-        return True
-    if cfg.polish:                                  # polish：改进项只由 POLISH 开始时那次专门的复核提出
-        return False
-    st = {r.id: r.status for r in actionable(g)}
-    for j in judgements:
-        st[j["requirement"]] = j["status"]
-    for r in actionable(g):
-        ev = evidence_checks(g, r)
-        if st.get(r.id) == REQ_OPEN and ev and all(res.get(c) == PASSED for c in ev) and \
-                not any(j["requirement"] == r.id for j in judgements):
-            st[r.id] = REQ_DONE
-    return bool(st) and not any(s == REQ_OPEN for s in st.values())
+    return run.improving
 
 
 def _decide_improvements(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, res: dict, run_ids: set[str],
@@ -975,7 +962,7 @@ def _decide_improvements(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, r
                                   else J_NOT_DONE})
     proposals = verdict.get("new_improvements") or []
     claim = bool(verdict.get("no_more_improvements"))
-    if not _improve_phase_after(g, cfg, judgements, res):
+    if not _improve_phase_after(g):
         if proposals or claim:
             notes.append("improvements are proposed only once every requirement on the checklist is done; ignored")
         return out
@@ -1095,7 +1082,7 @@ def _apply_judgements(tx: Tx, vid: str, cid: int) -> None:
 def _apply_improvements(tx: Tx, vid: str, cid: int) -> None:
     """复核者对改进项的结论（已在 decide_review 校验）落在合并点上：判定、新提议、宣布没有值得做的改进了。
     和需求的判定一样，只在合并（或只判定）时落地；没被合并的复核里的改进项不记。在需求的判定与证据检查（E3）都
-    落地之后调用：新提议与“没有值得做的改进了”要求那时需求都做完了（或改进阶段已经开始）。"""
+    落地之后调用：新提议与“没有值得做的改进了”要求改进阶段已经开始（POLISH 的 IMPROVE 模式）。"""
     g, cfg = tx.g, tx.cfg
     if not _running_run(g) or cid not in g.checkpoints or not is_ancestor(g, cid, g.head):
         return
@@ -1115,9 +1102,7 @@ def _apply_improvements(tx: Tx, vid: str, cid: int) -> None:
                 evidence=j.get("evidence") or [], tests=j.get("tests") or [], runs=j.get("runs") or [],
                 missing=j.get("missing") or [], checkpoint=cid, review=vid, reason=j.get("reason") or "")
     run = tx.g.run
-    if run.finalizing or run.reserve or run.improve_closed or not (run.improving or not open_requirements(tx.g)):
-        return
-    if cfg.polish and not run.improving:
+    if run.finalizing or run.reserve or run.improve_closed or not run.improving:
         return
     titles = {_norm_imp(i.title) for i in tx.g.improvements.values()}
     for p in d.get("proposed") or []:
@@ -1567,9 +1552,9 @@ def _judge_on_head(tx: Tx, sid: str) -> None:
 
 def finish_submit(tx: Tx, sid: str) -> None:
     """提交的结论：合并（或只判定）之后还有没完成的 actionable 需求 → 交还清单；没有 → 接受（运行可以收尾）。
-    after_accept=improve / polish：需求都做完时改进阶段开始（第一次）；还没有 open 的改进项、复核者也没说“没有值得做的
-    改进了”时，先请复核者在链头上提出改进方向（只判定、不合并），有了结论再接受——这样接受的回复里就带着改进项。
-    polish：剩余时间扣掉截止预留后不足 new_session_min_sec 时不进 POLISH，直接接受（收尾）；VERIFY 模式下先请复核者
+    after_accept=polish：需求都做完时 POLISH 开始（第一次）；剩余时间扣掉截止预留后不足 new_session_min_sec 时不进
+    POLISH，直接接受（收尾）。IMPROVE 模式下还没有 open 的改进项、复核者也没说“没有值得做的改进了”时，先请复核者在
+    链头上提出改进方向（只判定、不合并），有了结论再接受——这样接受的回复里就带着改进项；VERIFY 模式下先请复核者
     复审判了完成的需求，跑出缺口的退回 open（这次提交随之交还），什么都没退回时 POLISH 结束、接受。"""
     g, cfg = tx.g, tx.cfg
     s = g.submits.get(sid)
@@ -1581,7 +1566,7 @@ def finish_submit(tx: Tx, sid: str) -> None:
         return
     left = [r.id for r in open_requirements(g)]
     if not left and cfg.improve and _running_run(g) and not g.run.finalizing and not g.run.reserve:
-        if not g.run.improving and (not cfg.polish or _time_for_new_session(g, cfg, tx.now)):
+        if not g.run.improving and _time_for_new_session(g, cfg, tx.now):
             tx.emit("improve_started", RUNTIME, RULE, submit=sid, checkpoint=g.head, mode=_polish_mode(g, cfg))
         if tx.g.run.improving:
             ready = _audit_ready(tx, sid) if tx.g.run.polish_mode == "verify" else _improvements_ready(tx, sid)
@@ -1601,8 +1586,6 @@ def _time_for_new_session(g: Graph, cfg: BelayConfig, now: float) -> bool:
 
 
 def _polish_mode(g: Graph, cfg: BelayConfig) -> str:
-    if not cfg.polish:
-        return "improve"
     if cfg.polish_mode != "auto":
         return cfg.polish_mode
     return "improve" if last_score(g)[0] is not None else "verify"
@@ -2010,7 +1993,7 @@ def next_step(g: Graph, worker: str, now: float, cfg: BelayConfig) -> tuple[str,
         return "wait", "merge in progress"
     if open_submit(g, worker) is not None:
         return "wait", "submit in progress"
-    imp = improving(g, cfg)                          # after_accept=improve：需求都做完了也不收尾，继续改进
+    imp = improving(g, cfg)                          # POLISH：需求都做完了也不收尾，继续改进 / 复审
     if submit_accepted(g, worker) and not imp:
         return "finalize", "complete"
     if consecutive_crashes(g, worker) >= cfg.max_crash_restarts:
