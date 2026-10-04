@@ -204,7 +204,8 @@ class Session:
     id: str
     worker: str
     n: int
-    reason: str                              # first | handoff | restart | recover | crash | rebuild | resume
+    reason: str                              # first | handoff | restart | recover | crash | rebuild | resume |
+    #                                          phase（进入 POLISH）| fresh（上一个会话在同一个问题上反复失败）
     started_seq: int
     started_t: float
     opening: dict = field(default_factory=dict)
@@ -288,10 +289,12 @@ class Job:
 class Stall:
     seq: int
     t: float
-    kind: str                                # no_progress | repeated_failure | review_rejections | sessions_no_progress
-    action: str                              # hint | stop
+    kind: str                                # no_progress | repeated_failure | review_rejections | requirement_misses |
+    #                                          sessions_no_progress
+    action: str                              # hint | stop | handoff（结束会话，交给新会话）
     worker: Optional[str] = None
     detail: str = ""
+    sig: str = ""                            # 同一个问题的签名：req:R5 | reg:<回归签名>
 
 
 @dataclass(frozen=True)
@@ -440,6 +443,8 @@ class Run:
     improving: bool = False
     improve_seq: Optional[int] = None
     improve_closed: str = ""                 # 结束的原因（空 = 没结束）
+    # after_accept=polish：POLISH 的模式（改进阶段开始时选定）improve | verify；after_accept=improve 时为 improve
+    polish_mode: str = ""
     recoveries: int = 0
     rebuilds: int = 0
     downtime_sec: float = 0.0

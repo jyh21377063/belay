@@ -39,7 +39,7 @@ from belay.llm import Usage
 from belay.runtime import planner as P
 from belay.runtime.gitops import CP_REF, DELIVERED_REF, SNAP_REF, ShadowRepo
 from belay.runtime.port import WorkerPort
-from belay.runtime.prompts import DIAGNOSE_SYSTEM, system_prompt
+from belay.runtime.prompts import DIAGNOSE_SYSTEM, L3_PHASE, L3_STUCK, system_prompt
 from belay.runtime.reviewer import Reviewer
 from belay.runtime.runtime import Runtime
 from belay.runtime.session import BelaySession, ModelCallFailed, load_transcript_messages
@@ -578,15 +578,32 @@ class BelayRun:
 
 
     # ================================================================ 会话
-    async def context(self, mode: str, away=(), recent_calls=(), extra: Optional[dict] = None):
+    async def context(self, mode: str, away=(), recent_calls=(), extra: Optional[dict] = None, reason: str = ""):
         blobs = {**await self._context_blobs(mode), **(extra or {})}
         return build_context(self.rt.graph, self.w, self.cfg.opening_budget_tokens, self.rt.now(), self.cfg,
-                             blobs, mode=mode, away=away, recent_calls=recent_calls)
+                             blobs, mode=mode, away=away, recent_calls=recent_calls, reason=reason)
+
+    async def _delivered_files(self) -> list[tuple[str, int, int]]:
+        """已交付的版本（链头）相对原始代码改了哪些文件，改动行数多的在前。"""
+        g = self.rt.graph
+        base, head = g.checkpoints[0].tree, g.head_cp.tree
+        if base == head:
+            return []
+        files = await self.repo.numstat(base, head)
+        return sorted(files, key=lambda f: -(f[1] + f[2]))
 
     async def _context_blobs(self, mode: str) -> dict[str, str]:
-        """链头以来的改动 diff（恢复点：链头 → 最新快照的原样树）。"""
+        """链头以来的改动 diff（恢复点：链头 → 最新快照的原样树）；POLISH 里另给已交付的版本改了哪些文件。"""
         g = self.rt.graph
         out: dict[str, str] = {}
+        if mode != "first" and g.run is not None and g.run.improving and g.head_cp is not None:
+            try:
+                files = await self._delivered_files()
+                if files:
+                    out["delivered_files"] = "\n".join(f"  {p} (+{a} -{d})" for p, a, d in files[:30]) + \
+                        (f"\n  ... and {len(files) - 30} more files" if len(files) > 30 else "")
+            except Exception as e:
+                self.log(f"delivered files failed: {e}")
         rp = resume_point(g, self.w)
         snap = latest_snapshot(g, self.w)
         if mode != "first" and snap is not None and rp.get("base") in g.checkpoints:
@@ -644,9 +661,14 @@ class BelayRun:
         calls = self._recent_calls(prev.id) if crashed and prev else []
         extra = await self._away_files(prev.id) if prev is not None and reason != "first" else {}
         ctx = await self.context(mode="first" if reason == "first" else "resume", away=away, recent_calls=calls,
-                                 extra=extra)
+                                 extra=extra, reason=reason)
         pre: list[str] = []
-        if reason != "first":                                          # 预读链头以来改过的文件、当前 todo 提到的文件
+        if reason == "phase":                                          # 进入 POLISH：预读整个任务改动最多的文件
+            try:
+                pre = [p for p, _a, _d in await self._delivered_files()][:self.cfg.phase_preread_files]
+            except Exception as e:
+                self.log(f"phase preread failed: {e}")
+        elif reason != "first":                                        # 预读链头以来改过的文件、当前 todo 提到的文件
             g = rt.graph
             snap = latest_snapshot(g, self.w)
             rp = resume_point(g, self.w)
@@ -659,6 +681,15 @@ class BelayRun:
                 if todo is None:
                     continue
                 for tok in re.findall(r"[\w./-]+\.\w+|[\w.-]+/[\w./-]+", todo.title):
+                    if len(pre) >= self.cfg.l2_reread_files:
+                        break
+                    if tok not in pre and \
+                            (await self.env.run(f"test -f {shlex.quote(tok)}", timeout=10)).return_code == 0:
+                        pre.append(tok)
+            if reason == "fresh":                                      # 反复失败的需求：缺失项里提到的文件
+                st = next((x for x in reversed(rt.graph.stalls) if x.worker == self.w and x.action == "handoff"), None)
+                r = rt.graph.requirements.get(st.sig[4:]) if st is not None and st.sig.startswith("req:") else None
+                for tok in re.findall(r"[\w./-]+\.\w+|[\w.-]+/[\w./-]+", " ".join(r.missing) if r else ""):
                     if len(pre) >= self.cfg.l2_reread_files:
                         break
                     if tok not in pre and \
@@ -712,10 +743,11 @@ class BelayRun:
             tpath = str(Path(self.s.run_dir) / "sessions" / f"{sid}.jsonl")
             session = self._make_session(opening, port, tpath)
             if pre and self.cfg.graph_context:                         # 读过的文件记下 digest，可以直接编辑
-                reread = await session.preread(pre)
+                reread = await session.preread(pre, self.cfg.phase_preread_files if reason == "phase" else None)
                 if reread:
-                    session.messages[0]["content"] += \
-                        f"\n## Files you were changing (re-read by the harness)\n{reread}\n"
+                    title = "Files the delivered version changes most" if reason == "phase" else \
+                        "Files you were changing"
+                    session.messages[0]["content"] += f"\n## {title} (re-read by the harness)\n{reread}\n"
             await rt.submit(R.start_session, self.w, reason, summary, tpath)
         self.session = session
         self.stop_event.clear()
@@ -756,6 +788,9 @@ class BelayRun:
                     end, error = "crash", f"{type(e).__name__}: {e}"
                     self.log(f"session {sid} crashed: {error}")
                     break
+            if end == "submitted" and port.end_reason:              # submit 之后换新会话：进入 POLISH / 反复失败
+                end = port.end_reason
+                await self._handoff_summary(session, end, port.stuck_detail)
         finally:
             self.session_task = None
             self.session = None
@@ -771,6 +806,15 @@ class BelayRun:
             self.spawn(self.mirror("session_end"))
         if end == "crash":
             await asyncio.sleep(self.s.crash_backoff_sec)
+
+    async def _handoff_summary(self, session: BelaySession, end: str, detail: str) -> None:
+        """换新会话之前（会话还开着）让模型写交接摘要：进入 POLISH 写“哪里最没把握”，反复失败只写事实。"""
+        if not (self.cfg.handoff_summary and self.cfg.l3_mode != "off" and self.cfg.graph_context):
+            return
+        prompt = L3_PHASE if end == "phase" else L3_STUCK.format(problem=(detail or "the same failure")[:600])
+        summary = await session.summarize(prompt)
+        if summary:
+            await self.rt.submit(R.record_compaction, self.w, 4, session.last_context, 0, summary)
 
     async def _explore(self, description: str, question: str) -> str:
         from belay.worker.loop import Worker, WorkerConfig

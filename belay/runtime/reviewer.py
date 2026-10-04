@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING, Optional
 
 from belay.core import rules as R
 from belay.core.model import ACTIONABLE, JOB_RUNNING, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_RUNNING
-from belay.core.queries import actionable, last_score, latest_handoff_summary, todos_in_order
+from belay.core.queries import (actionable, improvement_items, last_score, latest_handoff_summary, todos_in_order,
+                                verifying)
 from belay.core.render import checkpoint_line, improvement_lines, render_job, render_located, requirement_state
 from belay.core.verify import (B_PASS, PASSED, PT_FAIL, active_guard, guard_set, point_status, reasons_for_tree,
                                regression_ids, results_for_tree, units)
@@ -54,7 +55,22 @@ TRIGGER_TEXT = {
     "judge": "the agent called submit without new changes: judge the requirements on the latest merge point",
     "improve": "every requirement on the checklist is judged done and the run continues: propose how the delivered "
                "version (the latest merge point) can be made better",
+    "verify": "an audit: every requirement on the checklist was accepted, most of them on reading the code; check the "
+              "ones in focus by running them",
 }
+VERIFY_GUIDE = """## Audit
+Every requirement on the checklist was accepted. This review looks for requirements that were judged done but are \
+incomplete or wrong. There is nothing to merge: give merge=false and judge the requirements in focus (judged on \
+reading only come first).
+- For each one, get E2 or E3 evidence: run the relevant tests, or write and run a small command or script that \
+exercises the behaviour the task text describes, including the inputs, cases and options it names.
+- If it works: judge it done with that stronger evidence.
+- If you find a gap: judge it partial or not_done with the E2 / E3 evidence that shows it (cite the run ids or tests), \
+and in missing say exactly what fails and the command that shows it. The requirement goes back to the agent.
+- Reopen a requirement only on a gap you have shown by running something; a doubt from reading alone does not reopen \
+it. Do not ask for refactoring, style or behaviour the task text does not ask for."""
+VERIFY_NOTE = ("The checklist was accepted and an audit reopened the requirements that are open now. A reopened "
+               "requirement is judged done again only on E2 or E3 evidence: run the check that showed the gap.")
 IMPROVE_SCHEMA = {
     "improvements": {"type": "array", "description": "Your judgement of open improvement items this change works on",
                      "items": {"type": "object", "properties": {
@@ -120,7 +136,14 @@ VERDICT_SCHEMA = {"type": "object", "properties": {
         "required": ["tests", "quote", "reason"]}},
     "score": {"type": ["number", "null"], "description": "Measured objective, higher is better; null if none"},
     "score_note": {"type": "string", "description": "How the score was measured"},
-    "feedback": {"type": "string", "description": "For the agent: concrete missing items, failing tests, commands"}},
+    "blockers": {"type": "array", "items": {"type": "string", "enum": ["regression", "breaks_done", "destructive",
+                                                                        "fake_result", "debug_code", "score_drop",
+                                                                        "other"]},
+                 "description": "Required when merge=false: the merge criteria the snapshot fails. An unfinished "
+                                "requirement is never a blocker"},
+    "blocking": {"type": "string", "description": "When merge=false: what exactly blocks the merge and how to fix it"},
+    "feedback": {"type": "string", "description": "For the agent: what is still missing, failing tests, commands that "
+                                                  "show the problem"}},
     "required": ["merge", "reason", "requirements", "feedback"]}
 
 
@@ -132,7 +155,7 @@ def verdict_schema(improve: bool) -> dict:
 
 
 IMPROVE_GUIDE = """## Improvements (this run does not stop when the checklist is done)
-Once every requirement on the checklist is done, the remaining time goes to making the delivered version better, \
+Once every requirement on the checklist is done, the run continues by making the delivered version better, \
 and you lead that work: you judge the improvement items and propose new ones. Each item must serve the task: give \
 quote (verbatim task text it serves, at least a few words) or set objective=true when it raises the measured score \
 (then measure the score in this review). Propose only what would make the delivered result clearly better for what \
@@ -245,6 +268,8 @@ class Reviewer:
         if v.attempt is not None:
             parts.append(f"## Merge request\nThis review is {TRIGGER_TEXT.get(v.trigger, v.trigger)}. Snapshot "
                          f"s{v.snapshot} against the previous merge point {checkpoint_line(g, base.id)}.")
+        elif v.trigger == R.VERIFY_TRIGGER:
+            parts.append(f"## Audit\nThis review is {TRIGGER_TEXT['verify']} ({checkpoint_line(g, base.id)}).")
         elif v.trigger == R.IMPROVE_TRIGGER:
             parts.append(f"## Improvement directions\nThis review is {TRIGGER_TEXT['improve']} "
                          f"({checkpoint_line(g, base.id)}). There is nothing to merge: give merge=false and "
@@ -261,7 +286,11 @@ class Reviewer:
         parts.append("## Regression gate (run by the harness on this snapshot)\n" + self._gate_text(vid))
         parts.append("## Requirements\nStatus is the ledger before this review. Focus: "
                      + (", ".join(v.focus) or "(none open)") + "\n" + self._requirements_text(vid))
-        if cfg.improve:
+        if v.trigger == R.VERIFY_TRIGGER:
+            parts.append(VERIFY_GUIDE)
+        elif verifying(g, cfg):
+            parts.append(VERIFY_NOTE)
+        if improvement_items(g, cfg):
             parts.append(self._improve_text(vid))
         parts.append(self._claims_text(vid))
         prev = [x for x in sorted(g.reviews.values(), key=lambda x: x.seq)
@@ -354,12 +383,37 @@ class Reviewer:
                 extra.append("linked tests: " + ", ".join(f"{c} ({res.get(c, 'not run')})" for c in checks[:8]))
             if r.status == REQ_DONE and r.evidence:
                 extra.append("evidence: " + "; ".join(r.evidence[:2])[:300])
-            if r.status == REQ_OPEN and r.missing:
+            history = self._history(r.id, vid) if r.status == REQ_OPEN and r.misses else []
+            if len(history) > 1:
+                extra.append("earlier judgements (oldest first):")
+                extra.extend(f"  {h}" for h in history)
+            elif r.status == REQ_OPEN and r.missing:
                 extra.append("missing last time: " + "; ".join(r.missing[:3])[:300])
             if r.status == "blocked":
                 extra.append(f"blocked ({r.blocked_kind}): {(r.blocked_reason or '')[:200]}")
             out.append(line + "".join(f"\n    {x}" for x in extra))
         return "\n".join(out)
+
+    def _history(self, rid: str, vid: str) -> list[str]:
+        """同一需求最近几次被判为没做完时的判定（复核、快照、缺失项、理由）：让前后的判断标准一致。"""
+        g = self.run.rt.graph
+        n = self.run.cfg.review_history
+        if n <= 0:
+            return []
+        out = []
+        for x in sorted(g.reviews.values(), key=lambda x: x.seq):
+            if x.id == vid or x.status != REV_DECIDED:
+                continue
+            for j in x.decision.get("judgements") or []:
+                if j.get("requirement") != rid:
+                    continue
+                if j.get("status") != REQ_OPEN:
+                    out = []                                 # 之后又判过完成：从那以后算起
+                    continue
+                miss = "; ".join(j.get("missing") or [])[:300]
+                out.append(f"{x.id} (s{x.snapshot}): {(j.get('judgement') or 'open').replace('_', ' ')}"
+                           + (f"; missing: {miss}" if miss else ""))
+        return out[-n:]
 
     def _improve_text(self, vid: str) -> str:
         """after_accept=improve：改进项的说明、现有的改进项、上一次请复核者提改进方向时被忽略的部分。"""
@@ -422,8 +476,10 @@ class Reviewer:
             timeout = int(min(max(1, int(inp.get("timeout") or 300)), cfg.review_run_timeout_sec))
             rid = f"X{len(state.runs) + 1}"
             res = await ctx.env.run(cmd, timeout=timeout)
-            state.runs.append({"id": rid, "cmd": cmd[:500], "rc": res.return_code})
-            out = truncate_output(res.output.rstrip("\n"))
+            raw = res.output.rstrip("\n")
+            state.runs.append({"id": rid, "cmd": cmd[:500], "rc": res.return_code,
+                               "tail": raw[-R.RUN_TAIL_CHARS:]})      # 规则只留给 worker 复现用得上的几条
+            out = truncate_output(raw)
             note = " (timed out and killed)" if res.timed_out else ""
             return f"[run {rid}] exit code {res.return_code}{note}\n{out or '(no output)'}"
 
@@ -489,5 +545,5 @@ class Reviewer:
                 Tool("locate", "Find the change after which a test started failing, by bisecting the agent's "
                                "snapshots (the test must fail on this snapshot).",
                      {"type": "object", "properties": {"test": {"type": "string"}}, "required": ["test"]}, locate),
-                Tool("verdict", "Give your verdict. Call it exactly once, at the end.", verdict_schema(cfg.improve),
-                     verdict)]
+                Tool("verdict", "Give your verdict. Call it exactly once, at the end.",
+                     verdict_schema(improvement_items(rt.graph, cfg)), verdict)]

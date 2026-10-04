@@ -19,10 +19,10 @@ from belay.core.config import BelayConfig
 from belay.core.events import Event
 from belay.core.model import (E0, REQ_BLOCKED, REQ_DONE, REQ_OPEN, TODO_ACTIVE, TODO_ANCHORED, TODO_COMPLETED,
                               Graph)
-from belay.core.queries import (actionable, chain, id_ranges, improving, last_score, latest_handoff_summary, num,
-                                open_persistent, todos_in_order)
-from belay.core.render import (checkpoint_line, improvement_lines, render_diagnosis, render_located,
-                               requirement_line, requirement_state)
+from belay.core.queries import (actionable, chain, id_ranges, improving, last_score, latest_handoff_summary,
+                                latest_submit, num, open_persistent, todos_in_order, verifying)
+from belay.core.render import (submit_reviews, checkpoint_line, improvement_lines, render_diagnosis, render_located,
+                               requirement_line, requirement_state, review_command_lines)
 from belay.core.verify import (B_FAIL, B_FLAKY, active_guard, check_unit, reasons_for_tree, regression_ids,
                                related_units, test_files_of)
 
@@ -41,14 +41,26 @@ INTRO = {
     "compaction": "Your earlier conversation in this session was replaced with the context below, rebuilt by the "
                   "harness from its record, followed by your most recent messages. Files you read earlier are no "
                   "longer in context unless re-read below: read a file again before editing it.",
+    # 开场理由 phase / fresh（after_accept=polish、打转换人）：只换开头这一段，其余内容按图的状态生成
+    "phase": "You are starting a new session: every requirement on the checklist has been accepted, and the run "
+             "continues on the delivered version (see Finishing below). Nothing from earlier sessions is in your "
+             "context except what is below, which the harness rebuilt from its record. Read a file before editing it.",
+    "fresh": "You are taking over from a previous session that kept failing on the same problem (see Why a new "
+             "session below). Nothing from earlier sessions is in your context except what is below, which the "
+             "harness rebuilt from its record. Form your own view of the problem; read a file before editing it.",
 }
-PROTECTED = ("task", "requirements", "pending", "todos", "summary", "workspace")
+PROTECTED = ("task", "requirements", "why", "pending", "todos", "summary", "workspace")
 SUBMIT_LINE = ("When you believe every requirement on the checklist is done, call submit: the harness tests your "
                "work, a reviewer checks each requirement and you get back what is still missing.")
 IMPROVE_LINE = ("Every requirement on the checklist is done; the run continues to improve the delivered version until "
-                "the time is up or the reviewer finds nothing more worth doing. Work on the open improvement items; "
+                "the reviewer finds nothing more worth doing. Work on the open improvement items; "
                 "tick a todo item or call submit to get your work reviewed and merged. Only merged work is delivered, "
                 "so nothing that already works may break.")
+VERIFY_LINE = ("Every requirement on the checklist was accepted, most of them on reading the code. The reviewer then "
+               "audited them by running checks: the requirements it reopened are listed above, each with what fails "
+               "and the command that shows it. For each one, reproduce the gap first, then fix only that gap; do not "
+               "refactor or change behaviour that already works. Only merged work is delivered. When none is open, "
+               "call submit: the reviewer may audit again.")
 
 
 @dataclass(frozen=True)
@@ -149,11 +161,14 @@ def _pending(g: Graph, worker: str) -> str:
         if rej.get("reason") == "review":
             v = g.reviews.get(rej.get("review") or "")
             d = v.decision if v is not None else {}
-            line = (f"- The reviewer did not merge your snapshot s{rej.get('snapshot')} ({rej.get('trigger')}): "
-                    + "; ".join((d.get("reasons") or [str(rej.get("detail"))])[:4])[:800])
-            if d.get("feedback"):
-                line += f"\n  Reviewer's feedback: {d['feedback'][:1500]}"
-            out.append(line)
+            if d.get("blocks") is not False:        # 复核者没给出阻断原因的不批准：不当作待处理的问题
+                line = (f"- The reviewer did not merge your snapshot s{rej.get('snapshot')} ({rej.get('trigger')}): "
+                        + "; ".join((d.get("reasons") or [str(rej.get("detail"))])[:4])[:800])
+                if d.get("blocking"):
+                    line += f"\n  What blocks the merge: {d['blocking'][:1500]}"
+                elif d.get("feedback"):
+                    line += f"\n  Reviewer's feedback: {d['feedback'][:1500]}"
+                out.append(line)
         else:
             reasons = reasons_for_tree(g, a.tree) if a else {}
             lines = []
@@ -183,6 +198,9 @@ def _away_line(g: Graph, e: Event) -> Optional[str]:
         if a is None:
             return None
         if e.get("reason") == "review":
+            v = g.reviews.get(a.review) if a.review else None
+            if v is not None and v.decision.get("blocks") is False:
+                return None
             return f"merge request {a.id} (s{a.snapshot}) was not approved by the reviewer: {str(e.get('detail'))[:200]}"
         if (a.lane != "fg" and a.trigger != "handoff") or not e.get("regressions"):
             return None
@@ -282,7 +300,10 @@ def _progress(g: Graph, cap_chars: int) -> str:
 
 
 def _improvements(g: Graph, cfg: BelayConfig) -> str:
-    """改进阶段（after_accept=improve）：复核者提出的改进项。还没开始、也没有改进项时为空。"""
+    """改进阶段（after_accept=improve，或 polish 的 IMPROVE 模式）：复核者提出的改进项。还没开始、也没有改进项时为空；
+    VERIFY 模式没有改进项（复审退回的需求列在需求状态里）。"""
+    if g.run is not None and g.run.polish_mode == "verify":
+        return ""
     if not g.improvements and not improving(g, cfg):
         return ""
     run = g.run
@@ -328,7 +349,8 @@ def _summary(g: Graph, worker: str, recent_calls: Iterable[str]) -> str:
     return "\n".join(out)
 
 
-def _workspace(g: Graph, worker: str, blobs: Mapping[str, str], cfg: BelayConfig, mode: str) -> str:
+def _workspace(g: Graph, worker: str, blobs: Mapping[str, str], cfg: BelayConfig, mode: str,
+               reason: str = "") -> str:
     cp = g.head_cp
     if cp is None:
         return "(no merge point yet)"
@@ -340,8 +362,16 @@ def _workspace(g: Graph, worker: str, blobs: Mapping[str, str], cfg: BelayConfig
     if w is not None and w.dropped:
         lines.append("Changes under test paths (never delivered; checks run against the original test files): "
                      + ", ".join(w.dropped[:15]) + (" ..." if len(w.dropped) > 15 else ""))
+    delivered = blobs.get("delivered_files")
+    if delivered and g.run is not None and g.run.improving:
+        lines.append("Files the delivered version changes relative to the original code:\n" + _clip(delivered, 2500))
     partial = blobs.get("partial_diff")
-    if partial and mode != "first":
+    if partial and mode != "first" and reason == "fresh":
+        lines.append(f"Changes since merge point {cp.id} left in your working tree by the previous session; they "
+                     "were not approved. Keep what is useful, or undo what is not:")
+        lines.append("```diff\n" + _clip(partial, cfg.context_diff_chars, "the rest is in your working tree")
+                     + "\n```")
+    elif partial and mode != "first":
         lines.append(f"Your changes since merge point {cp.id}, kept in your working tree (nothing was rolled back; "
                      "the harness reviews them in the background):")
         lines.append("```diff\n" + _clip(partial, cfg.context_diff_chars, "the rest is in your working tree")
@@ -383,12 +413,36 @@ def _gate(g: Graph, worker: str) -> str:
     return "\n".join(lines)
 
 
+def _why_fresh(g: Graph, worker: str, cfg: BelayConfig) -> str:
+    """开场理由 fresh：上一个会话为什么被换下（停滞信号）、复核者能复现问题的命令、受阻的出路。"""
+    st = next((x for x in reversed(g.stalls) if x.worker == worker and x.action == "handoff"), None)
+    if st is None:
+        return ""
+    out = [f"The previous session kept failing on this: {st.detail[:800]}"]
+    s = latest_submit(g, worker)
+    if s is not None:
+        out += review_command_lines(g, submit_reviews(g, s.id), cfg.review_commands)
+    if st.sig.startswith("req:"):
+        rid = st.sig[4:]
+        out.append(f"If {rid} really cannot be done here, declare it in submit(blocked=[{{requirement: \"{rid}\", kind, "
+                   "reason}]) and the reviewer decides; other open requirements can be worked on first.")
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- 组装
+
+def finishing_line(g: Graph, cfg: BelayConfig) -> str:
+    """“收尾”一段按图的状态给（不看开场理由：POLISH 里交接、崩溃之后开的会话也拿到同样的说明）。"""
+    if verifying(g, cfg):
+        return VERIFY_LINE
+    return IMPROVE_LINE if improving(g, cfg) else SUBMIT_LINE
+
 
 def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: BelayConfig,
                   blobs: Optional[Mapping[str, str]] = None, mode: str = "first", away: Iterable[Event] = (),
-                  recent_calls: Iterable[str] = ()) -> Context:
-    """mode：first | resume（交接、崩溃、恢复、容器重建）| compaction（会话内 L2）。now 不进入给模型的文字。"""
+                  recent_calls: Iterable[str] = (), reason: str = "") -> Context:
+    """mode：first | resume（交接、崩溃、恢复、容器重建）| compaction（会话内 L2）。reason 是开场理由：phase / fresh 时
+    换开头一段（fresh 另有“为什么换新会话”一段），其余内容按图的状态生成。now 不进入给模型的文字。"""
     blobs = blobs or {}
     cpt = cfg.chars_per_token
     fresh = mode == "first"
@@ -396,18 +450,19 @@ def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: Be
         Section("task", "Task", "original", f"<task>\n{g.run.task.strip()}\n</task>" if g.run else "", True),
         Section("requirements", "Requirements checklist (frozen index; status is below)", "rule",
                 _requirement_index(g), True),
+        Section("why", "Why a new session", "rule", _why_fresh(g, worker, cfg) if reason == "fresh" else "", True),
         Section("pending", "Open problems", "observed", "" if fresh else _pending(g, worker), True),
         Section("progress", "Requirement status", "rule", _progress(g, int(cfg.cap("progress") * cpt * 0.8))),
         Section("improvements", "Improvements", "rule", _improvements(g, cfg)),
         Section("todos", "Your todo list", "self_report", _todos(g), True),
         Section("summary", "Your notes from earlier", "llm",
                 "" if fresh else _summary(g, worker, recent_calls if mode == "resume" else ()), True),
-        Section("workspace", "Working tree", "observed", _workspace(g, worker, blobs, cfg, mode), True),
+        Section("workspace", "Working tree", "observed", _workspace(g, worker, blobs, cfg, mode, reason), True),
         Section("away", "While you were away", "observed", _away(g, away, blobs, cfg) if mode == "resume" else ""),
         Section("gate", "Regression gate", "observed", _gate(g, worker)),
-        Section("next", "Finishing", "rule", IMPROVE_LINE if improving(g, cfg) else SUBMIT_LINE),
+        Section("next", "Finishing", "rule", finishing_line(g, cfg)),
     ]
-    entries = {"pending": "board() and failure_log(test=...)", "progress": "board(status=...)", "todos": "",
+    entries = {"why": "", "pending": "board() and failure_log(test=...)", "progress": "board(status=...)", "todos": "",
                "improvements": "board()",
                "summary": "", "workspace": "board()", "away": "board()", "gate": "board(view=\"failures\")"}
     secs = [s for s in secs if s.text.strip()]
@@ -419,7 +474,7 @@ def build_context(g: Graph, worker: str, budget_tokens: int, now: float, cfg: Be
             s = Section(s.key, s.title, s.source, _clip(s.text, int(cap * cpt), entries.get(s.key, "")), s.protected)
             trimmed.append(s.key)
         capped.append(s)
-    intro = INTRO.get(mode, INTRO["first"])
+    intro = INTRO.get(reason if mode == "resume" and reason in ("phase", "fresh") else mode, INTRO["first"])
     rendered = [_render(s) for s in capped]
     total = estimate_tokens(intro, cpt) + sum(estimate_tokens(r, cpt) for r in rendered)
     dropped = []

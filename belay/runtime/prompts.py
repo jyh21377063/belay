@@ -81,6 +81,30 @@ Be concrete (function names, hypotheses, exact commands). Keep it as short as th
 anything a fresh session could not reconstruct. Do not repeat the task, file lists, todo lists or test results. \
 Output only the summary. Do not call any tools."""
 
+# 进入 POLISH 时（after_accept=polish）：接手的新会话要检查并加强已交付的版本，最需要的是“哪里最没把握”
+L3_PHASE = """The checklist has been accepted, and a fresh session will now continue on the delivered version: it \
+will check it and make it better. The harness already keeps, outside your context, the task text, the requirements \
+with their evidence, the diff and the reviewer's verdicts. Write ONLY what it cannot know:
+
+1. How you verified the work: the exact commands you ran and what they showed.
+2. Where you are least sure: requirements or edge cases you implemented on a guess, inputs or options you never \
+tried, behaviour you could not check. Be specific (function, case, why you are unsure).
+3. How to build, run and check things here (commands, environment quirks, slow steps).
+4. Approaches you tried and abandoned, and why.
+
+Do not describe what you plan to do next. Output only the summary. Do not call any tools."""
+
+# 打转换人时：只留事实，不把卡住的思路（当前假设、下一步）传给新会话
+L3_STUCK = """This session is ending because the same problem kept coming back: {problem}. A fresh session will take \
+over this work. The harness already keeps the task text, the requirements, the reviewer's verdicts and the diff. \
+Write ONLY facts it cannot get from the harness:
+
+1. Each approach you tried for this problem, and exactly how it failed (error text, test id, command).
+2. What the reviewer or the tests said each time, in your own words.
+3. Anything you established for certain about the code (a fact you checked, not a guess).
+
+Do NOT give your current hypothesis, your plan or a next step. Output only the summary. Do not call any tools."""
+
 FULL_SUMMARY_PROMPT = """The conversation so far will now be replaced by a summary, and the work continues from it. \
 After that you will see only the task statement and this summary. Write these sections, concise but complete:
 1. Primary request; 2. Key technical concepts; 3. Files and code (paths, functions, what changed); 4. Errors and \
@@ -145,6 +169,10 @@ results, tests or checks weakened to pass, leftover debug code that changes beha
 - if a score is measured (below), it is not lower than the previous one.
 A merge does NOT require any requirement to be finished: partial progress that keeps everything else working should \
 be merged. When in doubt about a real problem, do not merge and say exactly why.
+When you do not merge, give blockers: which of the criteria above the snapshot fails (regression, breaks_done, \
+destructive, fake_result, debug_code, score_drop, or other), and in blocking what exactly blocks the merge and how to \
+fix it. A requirement that is not finished yet is never a blocker: that goes in the requirement judgements and in \
+feedback.
 
 # Judging requirements
 For each requirement in focus that this change works on (on a submit or a final review: every requirement in focus), \
@@ -158,6 +186,8 @@ Get the highest level that is cheap: run the relevant tests first, run the progr
 The agent's summary, todo list and notes are claims, not facts.
 A requirement that is already done stays done unless you have E2 or E3 evidence that it no longer works; set \
 regressed=true when this change broke it (then do not merge).
+When a requirement lists earlier judgements, keep to the same standard; if you now judge it differently, say why in \
+its reason.
 blocked: only for a requirement the agent declared blocked, and only when the task text really does not give \
 enough information, or the environment makes it impossible without installing or downloading anything. If there is a \
 reasonable reading, or a way to do it in this repository, say so in missing and judge it not_done.
@@ -171,6 +201,6 @@ the previous merge point when one is given. Otherwise leave score null.
 Your working directory holds the snapshot (changes to test files are not part of it). The agent's working tree is \
 not accessible and you must not try to reach it. Commands run with a timeout; do not start servers that keep \
 running. You have a limited number of turns: be efficient, then call verdict exactly once. The feedback goes to the \
-agent: name concrete missing items, failing tests and commands it can run."""
+agent: name what is still missing, the failing tests and the commands it can run to see the problem."""
 
 

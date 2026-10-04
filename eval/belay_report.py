@@ -253,7 +253,9 @@ def report(trial: Optional[Path], bdir: Path) -> str:
         before = [c for c in merges if not run.improve_seq or c.created_seq <= run.improve_seq]
         s0 = next((c.score for c in reversed(before) if c.score is not None), None)
         s1 = delivered.score if delivered is not None else None
-        out.insert(-1, f"- 改进阶段：开始 {rel(st[0].t) if st else '-'}；"
+        mode = {"verify": "VERIFY", "improve": "IMPROVE"}.get(run.polish_mode, run.polish_mode or "-")
+        start_cp = L["improve"].get("start_checkpoint")
+        out.insert(-1, f"- 改进阶段（{mode}，开始时链头 #{start_cp}）：开始 {rel(st[0].t) if st else '-'}；"
                        + (f"结束：{short(run.improve_closed, 100)}；" if run.improve_closed else "")
                        + f"改进项 {len(g.improvements)} 条（"
                        + "，".join(f"{k} {v}" for k, v in Counter(i.status for i in g.improvements.values()).items())

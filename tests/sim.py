@@ -45,7 +45,8 @@ def judge(merge: bool = True, reqs: Optional[dict] = None, **extra) -> Callable[
         return {"merge": merge if v.attempt is not None else False, "reason": extra.get("reason", "ok"),
                 "summary": extra.get("summary", "a change"), "requirements": items,
                 "waivers": extra.get("waivers", []), "score": extra.get("score"),
-                "score_note": extra.get("score_note", ""), "feedback": extra.get("feedback", "")}
+                "score_note": extra.get("score_note", ""), "feedback": extra.get("feedback", ""),
+                **{k: extra[k] for k in ("blockers", "blocking") if k in extra}}
     return fn
 
 

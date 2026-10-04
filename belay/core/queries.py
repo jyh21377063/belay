@@ -92,16 +92,34 @@ def improving(g: Graph, cfg: Optional[BelayConfig] = None) -> bool:
                 and not g.run.finalizing and not g.run.reserve)
 
 
+def improvement_items(g: Graph, cfg: Optional[BelayConfig]) -> bool:
+    """改进项机制是否在用：after_accept=improve（旧实现：从第一次复核起就用），或 after_accept=polish 的 IMPROVE 模式
+    （POLISH 开始之后才用；之前复核者的输入与 finalize 完全相同）。"""
+    if cfg is None or not cfg.improve:
+        return False
+    if not cfg.polish:
+        return True
+    return g.run is not None and g.run.improving and g.run.polish_mode == "improve"
+
+
+def verifying(g: Graph, cfg: Optional[BelayConfig] = None) -> bool:
+    """POLISH 的 VERIFY 模式进行中：复核者复审判了完成的需求，跑出缺口的退回 open。"""
+    return improving(g, cfg) and g.run.polish_mode == "verify"
+
+
+STUCK_END = "stuck_handoff"                          # 因打转结束、交给新会话的会话：不计入“连续无进展”
+
+
 def improve_idle_sessions(g: Graph, worker: str) -> int:
     """改进阶段开始之后开的会话里，最近连续几个结束了却没有进展（进展：改进项完成、分数提高、需求完成）。
-    开始改进时正在进行的那个会话不算：至少给一个新会话按改进项开场的机会。"""
+    开始改进时正在进行的那个会话不算：至少给一个新会话按改进项开场的机会。因打转换出去的会话跳过。"""
     if g.run is None or g.run.improve_seq is None:
         return 0
     n = 0
     for s in reversed(sessions_of(g, worker)):
         if s.started_seq < g.run.improve_seq:
             break
-        if s.ended_t is None:
+        if s.ended_t is None or s.end_reason == STUCK_END:
             continue
         if s.progress:
             break
@@ -289,9 +307,10 @@ def last_ended_session(g: Graph, worker: str) -> Optional[Session]:
 
 
 def sessions_without_progress(g: Graph, worker: str) -> int:
+    """最近连续几个结束了却没有进展的会话。因打转换出去的会话跳过：合并链单调，多给新会话一次机会不会让交付变差。"""
     n = 0
     for s in reversed(sessions_of(g, worker)):
-        if s.ended_t is None:
+        if s.ended_t is None or s.end_reason == STUCK_END:
             continue
         if s.progress:
             break

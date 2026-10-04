@@ -110,7 +110,7 @@ def test_big_graph_keeps_protected_sections_within_budget_and_folds_the_rest():
         assert key not in ("task", "requirements")
     assert "board(status=" in ctx.text or "folded" in ctx.text           # 被折叠的段带查询入口
     for k in PROTECTED:
-        assert k in [x for x, _ in ctx.sections] or k == "pending"
+        assert k in [x for x, _ in ctx.sections] or k in ("pending", "why")    # why 只在 fresh 开场
 
 
 def test_board_filters_and_pagination():

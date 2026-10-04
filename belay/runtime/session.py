@@ -13,8 +13,9 @@
     提醒（纯探索期不计时；不限次数，被忽略就拉长间隔）；多项同时进行中时按“这一组”说，不点名其中一项；
   - 每条追加进对话的消息都写进轨迹（message 记录），整体替换时写 messages_checkpoint：runtime 崩溃后可以读盘重放；
   - 模型接口多次重试仍失败时抛 ModelCallFailed：驱动可以在内存里原样重试同一个会话。
-会话返回时给出结束原因：submitted（提交被接受）| done（模型不再调用工具，隐式提交用完）| handoff（L4 / 自然停顿点）|
-deadline（runtime 要求停止）| max_turns。
+会话返回时给出结束原因：submitted（提交被接受，或 submit 之后换新会话：进入 POLISH、同一个问题反复失败——由驱动按
+WorkerPort.end_reason 记为 phase / stuck_handoff，并在结束前用 summarize 写交接摘要）| done（模型不再调用工具，隐式提交
+用完）| handoff（L4 / 自然停顿点）| deadline（runtime 要求停止）| max_turns。
 """
 from __future__ import annotations
 
@@ -487,6 +488,12 @@ class BelaySession:
         self.last_context = self._estimate()
         self._checkpoint_messages("compaction")
 
+    async def summarize(self, prompt: str) -> str:
+        """会话结束前写一份交接摘要（不调用工具）；失败时返回空串。"""
+        summary = await self._summary(prompt)
+        self.transcript.write("handoff_summary", chars=len(summary))
+        return summary
+
     async def _summary(self, prompt: str) -> str:
         msgs = [dict(m) for m in self.messages]
         last = msgs[-1]
@@ -533,10 +540,10 @@ class BelaySession:
             self.ctx.file_digests[path] = digest
         return f"### {path}\n```\n{body}\n```", digest
 
-    async def preread(self, paths: list[str]) -> str:
-        """恢复时预读当前步骤涉及的文件（沿用 L2 重读的预算）。"""
+    async def preread(self, paths: list[str], limit: Optional[int] = None) -> str:
+        """恢复时预读当前步骤涉及的文件（默认沿用 L2 重读的文件数；进入 POLISH 时用 phase_preread_files）。"""
         out = []
-        for path in paths[:self.cfg.l2_reread_files]:
+        for path in paths[:self.cfg.l2_reread_files if limit is None else limit]:
             text, _ = await self._read_for_context(self.ctx.resolve(path))
             if text:
                 out.append(text)

@@ -526,7 +526,8 @@ def test_reviewer_rejection_in_the_background_is_reported_to_the_worker(tmp_path
         mod = (review_dir / "pkg" / "mod.py").read_text()
         if "print(" in mod:
             return {"merge": False, "reason": "debug print left in add()", "requirements": [],
-                    "feedback": "remove the print from add()"}
+                    "blockers": ["debug_code"], "blocking": "remove the print from add()",
+                    "feedback": "R3: sub() is not defined yet"}
         from tests.integration.fakes import oracle
         return oracle(opening, review_dir)
     h = H(tmp_path, BelayConfig(merge_min_interval_sec=0))
@@ -541,6 +542,7 @@ def test_reviewer_rejection_in_the_background_is_reported_to_the_worker(tmp_path
     assert res.status == "DONE"
     notices = json.dumps([r["messages"][-1]["content"] for r in llm.requests])
     assert "The reviewer did not merge your snapshot" in notices and "remove the print from add()" in notices
+    assert "What blocks the merge" in notices and "sub() is not defined yet" not in notices   # 还缺什么留到 submit
     g = run.rt.graph
     assert any(a.reason == "review" and a.lane == "bg" for a in g.attempts.values())
     patch = (Path(h.settings.run_dir) / "deliverable.diff").read_text()

@@ -10,7 +10,10 @@
   reviewer=False         没有复核者：合并只看回归门；需求只由测试（E3）或 worker 的自述（E0）记下
   background=handoff     后台只在交接时发起合并请求；off 只在 submit 与收尾时合并
   todo_done_nudge=False  跑完测试后不提醒“做完了就勾掉”（只留第一次与长时间没更新的 todo 提醒）
-  after_accept=improve   需求都做完后不收尾，由复核者提出改进项，继续加强已交付的版本（默认 finalize：收尾）
+  after_accept=improve   需求都做完后不收尾，由复核者提出改进项，在同一个会话里继续加强已交付的版本（旧实现，留作对照）
+  after_accept=polish    需求都做完后换一个新会话进入 POLISH：IMPROVE（链上测过分数：复核者提改进项）或 VERIFY
+                         （没有分数：复核者复审判了完成的需求，跑出缺口就退回）。默认 finalize：收尾
+  stuck_handoff=False    同一个问题在 submit 上反复失败时只提醒，不换新会话
 
 v8 的节奏：快照照常拍（不打扰 worker）→ 后台空闲时，对最新的边界快照（勾掉 todo 的锚点、交接）发起合并请求，
 很久没有边界快照时才兜底合并最新的可测快照：回归门（全量）→ 复核者 → 合并点。submit、交接与收尾不受间隔限制。
@@ -65,6 +68,8 @@ class BelayConfig:
     review_locate_wait_sec: float = 120     # 复核者的 locate 工具最多等这么久
     score_tolerance: float = 0.02           # 分数比上一个合并点低超过这个比例就不合并（测量噪声）
     notify_misses: int = 2                  # 同一需求连续这么多次被判为没做完时提醒 worker
+    review_history: int = 3                 # 复核者开场里，没做完的需求附上最近几次判定的缺失项（0 = 只给上一次的）
+    review_commands: int = 5                # submit 回复、后台提醒、新会话开场里最多附几条复核者跑过的命令（输出尾部）
     # ---- 提交（请求立即复核）
     submit_wait_sec: float = 2400
     nudge_on_stop: bool = True
@@ -81,7 +86,15 @@ class BelayConfig:
     # ---- 需求都做完之后：finalize = 收尾交付（默认）；improve = 继续改进已交付的版本，直到截止预留、复核者认为
     # 没有值得做的改进，或连续 improve_idle_sessions 个（改进阶段开始之后开的）会话没有进展。改进项由复核者提出，
     # 每条挂到任务原文的引文或可测的目标上；同时 open 的最多 improve_max_open 条。需要复核者（reviewer=True）。
+    # polish = 需求都做完、submit 被接受后，结束当前会话，由新会话进入 POLISH；polish_mode：auto（链上测过分数选
+    # improve，否则 verify）/ improve（复核者提改进项，同 after_accept=improve 的机制）/ verify（复核者复审判了完成的
+    # 需求：跑出缺口就以 E2 / E3 退回 open，最多 verify_rounds 轮；没有退回任何需求时收尾）。
+    # 剩余时间扣掉截止预留后不足 new_session_min_sec 时不进 POLISH（直接收尾），也不因打转换新会话。
     after_accept: str = "finalize"
+    polish_mode: str = "auto"
+    verify_rounds: int = 2
+    new_session_min_sec: float = 600
+    phase_preread_files: int = 4
     improve_idle_sessions: int = 2
     improve_max_open: int = 5
     # ---- 运行结束与停滞
@@ -90,6 +103,11 @@ class BelayConfig:
     stall: bool = True
     stall_no_progress_sec: float = 1800
     stall_same_failure: int = 3
+    # 打转换人（只在 submit 的结果返回时判断）：同一需求连续 stuck_submit_misses 次被 submit 的复核判为没做完，或同一
+    # 回归连续 stall_same_failure 次拒掉 submit 时先提醒；这个会话里提醒过之后再失败一次、且提醒之后没有任何进展，
+    # 就结束会话交给新会话（每个问题只换一次）。换出来的会话不计入 max_idle_sessions / improve_idle_sessions。
+    stuck_handoff: bool = True
+    stuck_submit_misses: int = 2
     idle_timeout_sec: float = 1500
     # ---- 交接与恢复（模块 G）
     resume_max_downtime_sec: float = 1800
@@ -144,8 +162,13 @@ class BelayConfig:
 
     @property
     def improve(self) -> bool:
-        """改进阶段是否可用：after_accept=improve，且有复核者（改进项由复核者提出和判定）。"""
-        return self.after_accept == "improve" and self.reviewer
+        """需求都做完之后是否继续（改进阶段 / POLISH）：after_accept=improve 或 polish，且有复核者。"""
+        return self.after_accept in ("improve", "polish") and self.reviewer
+
+    @property
+    def polish(self) -> bool:
+        """after_accept=polish：需求都做完时换新会话进入 POLISH（IMPROVE 或 VERIFY）。"""
+        return self.after_accept == "polish" and self.reviewer
 
     @property
     def soft_handoff_tokens(self) -> int:
@@ -176,8 +199,12 @@ class BelayConfig:
             raise ValueError("verify_slots 至少为 1")
         if cfg.review_retries < 0 or cfg.review_max_turns < 2:
             raise ValueError("review_retries 不能为负，review_max_turns 至少为 2")
-        if cfg.after_accept not in ("finalize", "improve"):
-            raise ValueError("after_accept 只能是 finalize / improve")
+        if cfg.after_accept not in ("finalize", "improve", "polish"):
+            raise ValueError("after_accept 只能是 finalize / improve / polish")
+        if cfg.polish_mode not in ("auto", "improve", "verify"):
+            raise ValueError("polish_mode 只能是 auto / improve / verify")
+        if cfg.verify_rounds < 1 or cfg.stuck_submit_misses < 1 or cfg.phase_preread_files < 0:
+            raise ValueError("verify_rounds 与 stuck_submit_misses 至少为 1，phase_preread_files 不能为负")
         if cfg.improve_idle_sessions < 1 or cfg.improve_max_open < 1:
             raise ValueError("improve_idle_sessions 与 improve_max_open 至少为 1")
         if cfg.todo_reminder_turns < 1 or cfg.todo_reminder_backoff < 1 or cfg.todo_reminder_max < 0:

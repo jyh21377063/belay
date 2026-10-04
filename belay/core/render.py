@@ -16,9 +16,38 @@ from belay.core.verify import (B_FAIL, B_FLAKY, B_PASS, PASSED, active_guard, ch
 
 PAGE = 50
 STATUS_FILTERS = ("open", "done", "blocked", "unfinished")
-REASON_TEXT = {"reassessed": "the reviewer found it no longer works", "rolled_back": "its merge point was rolled back",
+REASON_TEXT = {"reassessed": "a check run by the reviewer shows it does not work", "rolled_back": "its merge point was rolled back",
                "blocked_not_accepted": "the reviewer did not accept that it is blocked",
                "checks fail": "its checks fail"}
+COMMAND_TAIL_CHARS = 1200                      # 每条复核命令给 worker 看的输出尾部
+
+
+def review_command_lines(g: Graph, vids, limit: int = 5) -> list[str]:
+    """复核者跑过、能复现问题的命令（只列存了输出尾部的）：没做完的判定引用过的在前，其次退出码非 0 的。"""
+    picks, seen = [], set()
+    for vid in vids:
+        v = g.reviews.get(vid) if vid else None
+        if v is None:
+            continue
+        runs = {str(x.get("id")): x for x in v.runs}
+        cited = [str(r) for j in (v.decision.get("judgements") or []) if j.get("status") == REQ_OPEN
+                 for r in j.get("runs") or []]
+        order = cited + [str(x.get("id")) for x in reversed(v.runs) if x.get("rc") not in (0, None)]
+        for rid in order:
+            x = runs.get(rid)
+            if x is None or not x.get("tail") or (v.id, rid) in seen:
+                continue
+            seen.add((v.id, rid))
+            picks.append((v.id, x))
+    if not picks or limit <= 0:
+        return []
+    out = ["Commands the reviewer ran that show the problem (in a copy of your snapshot; run them in your working "
+           "tree to reproduce it):"]
+    for vid, x in picks[:limit]:
+        out.append(f"  [{vid} {x.get('id')}] exit code {x.get('rc')}: {str(x.get('cmd') or '')[:300]}")
+        tail = str(x.get("tail") or "").rstrip()[-COMMAND_TAIL_CHARS:]
+        out.extend("    " + line for line in tail.split("\n"))
+    return out
 
 
 def requirement_state(r: Requirement) -> str:
@@ -225,6 +254,8 @@ def _rejection_lines(g: Graph, aid: str) -> list[str]:
         d = v.decision if v is not None else {}
         out.append("The reviewer did not merge it:")
         out.extend(f"  - {x}" for x in (d.get("reasons") or [a.detail])[:10])
+        if d.get("blocking"):
+            out.append(f"What blocks the merge: {d['blocking'][:2000]}")
         if d.get("feedback"):
             out.append(f"Reviewer's feedback: {d['feedback'][:2500]}")
     if a.regressions:
@@ -293,15 +324,15 @@ def _review_lines(g: Graph, vid: Optional[str], focus_only: bool = False) -> lis
 
 
 IMPROVE_PHASE_TEXT = (
-    "The run does not stop here: the remaining time goes to making the delivered version better. Work on the open "
+    "The run does not stop here: it continues by making the delivered version better. Work on the open "
     "improvement items below (keeping a todo item per improvement helps); ticking a todo item or calling submit gets "
     "your work reviewed, and only merged work is delivered, so nothing that already works may break. The reviewer "
     "judges each item and may add new ones; if you believe an item is not worth doing or cannot be done here, say why "
     "in your submit summary and the reviewer decides.")
 
 
-def render_submit(g: Graph, sid: str) -> str:
-    """submit 的回复：合并被拒 / 交还清单（还有没完成的需求）/ 接受。"""
+def render_submit(g: Graph, sid: str, commands: int = 5) -> str:
+    """submit 的回复：合并被拒 / 交还清单（还有没完成的需求）/ 接受。被拒、交还时附上复核者跑过的、能复现问题的命令。"""
     s = g.submits[sid]
     out = []
     if s.status == SUB_REJECTED:
@@ -313,6 +344,7 @@ def render_submit(g: Graph, sid: str) -> str:
         out.append(f"Submit {sid} was not merged: {why}. Nothing was recorded; your working tree is unchanged.")
         if a is not None:
             out.extend(_rejection_lines(g, a.id))
+            out.extend(review_command_lines(g, [a.review], commands))
         out.append("Fix this and call submit again.")
         return "\n".join(out)
     cp = g.checkpoints.get(s.checkpoint) if s.checkpoint is not None else None
@@ -364,23 +396,38 @@ def render_submit(g: Graph, sid: str) -> str:
             out.append("  - " + requirement_line(g, rid, 100))
         if len(s.open) > 40:
             out.append(f"  ... {len(s.open) - 40} more: board(status=\"open\")")
+        out.extend(review_command_lines(g, submit_reviews(g, sid), commands))
         out.append("If one of them cannot be done here, say so in submit(blocked=[{requirement, kind, reason}]).")
         return "\n".join(out)
     out.append(f"Submit {sid} is still being reviewed; keep working, the result will be reported.")
     return "\n".join(out)
 
 
-def render_review_notice(g: Graph, vid: str) -> str:
-    """后台合并请求没被复核者批准时给 worker 的提醒。"""
+def submit_reviews(g: Graph, sid: str) -> list[str]:
+    s = g.submits[sid]
+    a = g.attempts.get(s.attempt) if s.attempt else None
+    out = [a.review] if a is not None and a.review else []
+    return out + [v.id for v in sorted(g.reviews.values(), key=lambda v: v.seq)
+                  if v.submit == sid and v.attempt is None and v.id not in out]
+
+
+def render_review_notice(g: Graph, vid: str, commands: int = 5) -> str:
+    """后台合并请求没被复核者批准时给 worker 的提醒：只在有真正的阻断原因时发（回归、弄坏已完成的需求、分数下降，
+    或复核者给出的有效 blockers），内容只有为什么不能合并、怎么修和复现命令；“还缺什么”留到 submit 时再说。"""
     v = g.reviews.get(vid)
     if v is None or v.status != REV_DECIDED or v.decision.get("merge") is not False:
         return ""
     d = v.decision
+    if d.get("blocks") is False:
+        return ""
     lines = [f"The reviewer did not merge your snapshot s{v.snapshot} (background check; you were not interrupted). "
              "Your working tree is unchanged and the last merge point stays what would be delivered:"]
     lines += [f"- {x[:400]}" for x in (d.get("reasons") or [])[:6]]
-    if d.get("feedback"):
+    if d.get("blocking"):
+        lines.append(f"What blocks the merge: {d['blocking'][:2000]}")
+    elif d.get("blocks") is None and d.get("feedback"):           # 旧日志的结论没有 blocking：照旧给反馈
         lines.append(f"Reviewer's feedback: {d['feedback'][:2000]}")
+    lines += review_command_lines(g, [vid], commands)
     return "\n".join(lines)
 
 
@@ -487,6 +534,14 @@ def requirement_category(g: Graph, r: Requirement, delivered: Optional[int] = No
 CATEGORIES = ("done-E3", "done-E2", "done-E1", "self-reported", "blocked", "blocked-self-reported", "open")
 
 
+def _improve_start_checkpoint(g: Graph) -> Optional[int]:
+    """改进阶段 / POLISH 开始时的链头（improve_started 之前最后一个合并点）。"""
+    if g.run is None or g.run.improve_seq is None:
+        return None
+    before = [c for c in g.checkpoints.values() if c.created_seq < g.run.improve_seq and not c.abandoned]
+    return max(before, key=lambda c: c.created_seq).id if before else None
+
+
 def ledger(g: Graph) -> dict:
     """结构化账本：运行结束时写入报告，也用于实验指标。"""
     delivered = g.run.delivered if g.run and g.run.delivered is not None else delivery_checkpoint(g)
@@ -560,8 +615,15 @@ def ledger(g: Graph) -> dict:
         "sessions": [{"id": s.id, "reason": s.reason, "end": s.end_reason, "turns": s.turns, "progress": s.progress,
                       "compactions": len(s.compactions), "resumes": list(s.resumes)}
                      for s in sorted(g.sessions.values(), key=lambda s: num(s.id))],
-        "stalls": [{"kind": s.kind, "action": s.action} for s in g.stalls],
+        "stalls": [{"kind": s.kind, "action": s.action, "sig": s.sig} for s in g.stalls],
         "improve": {"started": bool(g.run and g.run.improving), "closed": g.run.improve_closed if g.run else "",
+                    "mode": g.run.polish_mode if g.run else "",
+                    # POLISH 开始时的链头：和最终交付分别评分，就是 POLISH 前后的对比
+                    "start_checkpoint": _improve_start_checkpoint(g),
+                    "audits": [{"id": v.id, "status": v.status,
+                                "reopened": [j["requirement"] for j in v.decision.get("judgements") or []
+                                             if j.get("reason") == "reassessed"]}
+                               for v in sorted(g.reviews.values(), key=lambda v: v.seq) if v.trigger == "verify"],
                     "items": [{"id": i.id, "title": i.title, "status": i.status, "level": i.level,
                                "quote": i.quote, "objective": i.objective, "review": i.review,
                                "judged_review": i.judged_review, "checkpoint": i.checkpoint, "reason": i.reason}

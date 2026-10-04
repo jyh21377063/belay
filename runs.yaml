@@ -157,6 +157,24 @@ agents:
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, after_accept: improve}}
 
+  # 变体：需求都做完后结束当前会话，由新会话进入 POLISH。auto：链上测过分数（LHTB）→ IMPROVE（复核者提改进项）；
+  # 没有分数（SWE）→ VERIFY（复核者复审判了完成的需求，跑出缺口就退回，新会话只补缺口）。剩余时间不够开新会话时直接收尾
+  belay-polish:
+    <<: *belay
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, after_accept: polish}}
+
+  belay-polish-verify:        # 不看有没有分数，固定 VERIFY
+    <<: *belay
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, after_accept: polish, polish_mode: verify}}
+
+  belay-polish-improve:       # 不看有没有分数，固定 IMPROVE
+    <<: *belay
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, after_accept: polish, polish_mode: improve}}
+
+  belay-no-stuck-handoff:     # 同一个问题在 submit 上反复失败时只提醒，不换新会话
+    <<: *belay
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, stuck_handoff: false}}
+
 # ---------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------

@@ -217,6 +217,58 @@ SWE-EVO 不开。
   不能同时提新的；链上测过分数时这次也要测）；改进阶段开始之后开的会话里连续 `improve_idle_sessions`（2）个没有进展
   （开始时正在进行的那个会话不算）。之后照常收尾、交付链头。收尾时正在进行的 `improve` 复核直接取消。
 
+### 4.6 换新会话进入 POLISH（`after_accept=polish`）
+
+`after_accept=improve` 在宣布完成的那个会话里继续：上下文里全是为现有实现辩护的推理。`polish` 把会话当作一个阶段的
+工作单元：需求都做完、submit 走到 `finish_submit` 时写 `improve_started`（payload 带 `mode`），这次 submit 的回复之后
+结束当前会话（结束原因 `phase`，`port.submit` 判断：这个会话开始于 `improve_seq` 之前），会话还开着时让模型按
+`L3_PHASE` 写交接摘要（怎么验证的、哪里最没把握、怎么构建运行、放弃过的方案），新会话的开场理由是 `phase`。
+
+- **时间门槛**：剩余时间扣掉截止预留后不足 `new_session_min_sec`（600 秒）时不写 `improve_started`，直接接受、收尾
+  （判断在规则里，写 `improve_started` 之前）。
+- **模式**（`polish_mode`）：`auto` 按链上有没有测过分数选——有分数选 `improve`，没有选 `verify`；也可以固定。
+- **IMPROVE**：与 4.5 的改进项机制相同，只有一处不同：改进项的说明、verdict 的改进项字段、改进项的提议与判定都只在
+  POLISH 开始之后才有（`queries.improvement_items`）。需求阶段的复核者输入与 `finalize` 完全相同，对比才干净。
+- **VERIFY**：不新增数据结构，复用“已完成的需求在 E2 / E3 的反证下退回 open”（`reassessed`）这条规则。接受之前先在
+  链头上开一次只判定的复审（触发 `verify`，焦点是判了完成、证据不到 E3 的需求，E1 在前）：复核者设法拿到 E2 / E3——
+  跑通了就升级证据等级，跑出缺口就以 E2 / E3 判 not_done、在 missing 里写出复现命令，规则把它退回 open，这次 submit
+  随之**交还**；只读代码的怀疑不退回（E1 的否定判断只记 note）。没有退回任何需求时 POLISH 结束（`improve_closed`），
+  submit 被接受、收尾。修好之后再 submit 会再复审一轮，最多 `verify_rounds`（2）轮；复核者给不出复审结论（重试
+  `review_retries` 次后）、没有可复审的需求时也结束。退回过的需求再判完成要 E2 / E3（只读代码判完成记为 partial）。
+- **开场按图的状态**：“Finishing”一段由图决定（VERIFY / IMPROVE / 普通），POLISH 里交接、崩溃之后开的会话也拿到同样
+  的说明；开场理由只换开头一段。POLISH 的开场另有“已交付的版本改了哪些文件”（基线 → 链头的 numstat），`phase` 开场
+  预读其中改动最多的 `phase_preread_files`（4）个文件。
+
+### 4.7 同一个问题反复失败：换新会话（`stuck_handoff`）
+
+只在 submit 的结果返回时判断（`rules.check_stuck`，在 `finish_submit` 交还、前台请求被拒时调用），不需要“等自然停顿点”：
+submit 的回复本身就是边界。
+
+- **信号**（每个带签名）：同一需求在连续 `stuck_submit_misses`（2）次 submit 的复核里被明确判为 partial / not_done
+  （没有新改动又 submit、它仍未完成也算一次；没被复核到的提交跳过）——`req:R5`；同一组回归连续 `stall_same_failure`（3）
+  次拒掉 submit——`reg:<签名>`。
+- **阶梯**：达到门槛时写一次 `stall_detected(action=hint)`（这个会话里每个签名一次），worker 收到提醒；这个会话里提醒过
+  之后又失败一次、提醒之后没有任何进展、剩余时间够开新会话、这个签名从没换过人 → 写 `action=handoff`。port 在这次
+  submit 的回复之后结束会话（`stuck_handoff`），模型按 `L3_STUCK` 只写事实（试过什么、怎么失败的、确认过的事实，不写
+  当前假设和下一步），新会话开场理由 `fresh`：“Why a new session”一段（停滞信号、复核者能复现问题的命令、受阻声明的
+  出路），链头以来的改动标明“上一个会话留下、没被批准，可以保留也可以撤掉”。
+- **每个签名只换一次**。换出去的会话不计入 `max_idle_sessions` / `improve_idle_sessions`：合并链单调，多给新会话一次
+  机会不会让交付变差。
+- `review_rejections`（连续被复核者拒绝）只数有真正阻断原因的拒绝，仍然只提醒。
+
+### 4.8 给 worker 的复核反馈
+
+- 复核者每条命令（X1…）的输出尾部随 `merge_reviewed` 记下，但只留给 worker 复现用得上的：结论里引用过的、退出码非 0
+  的，最多 8 条、每条 1500 字。submit 被拒 / 交还的回复、后台不批准的提醒、`fresh` 开场都附上这些命令与输出
+  （`review_commands` 条）。
+- verdict 新增 `blockers`（`merge=false` 时必填，枚举：regression / breaks_done / destructive / fake_result /
+  debug_code / score_drop / other，other 要附 `blocking` 文字）与 `blocking`（为什么不能合并、怎么修）；`feedback`
+  只写还缺什么。“需求还没做完”从来不是阻断原因。`merge=false` 却没有有效阻断原因时照常不批准，记 note
+  `merge=false without a blocking reason`，决定里 `blocks=false`：不推送后台提醒，开场不当作待处理的问题，不计入
+  `review_rejections`。后台提醒只发阻断原因、`blocking` 与复现命令；submit 的回复仍给全部信息。
+- 复核者开场里，没做完的需求附上最近 `review_history`（3）次被判为没做完时的判定（复核、快照、缺失项），提示词要求
+  沿用之前的判断标准，改变判断时写明理由。
+
 ## 5. 复核者（`runtime/reviewer.py`）
 
 - 每个复核开一个带工具的短会话，复用 worker 的循环（`belay/worker/loop.py`），轮数（`review_max_turns`）与时间

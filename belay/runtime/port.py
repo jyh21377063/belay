@@ -6,6 +6,8 @@
 通知（只推 worker 能据此行动的信息）：后台的合并请求没被复核者批准（带原因与反馈）、同一需求连续被判为没做完、
 持续性回归、定位结果、诊断结论、同一问题反复被拒。后台回归门上的中间态测不过不通知：那是常态。
 submit 触发的复核结论总是随 submit 的结果返回。通知不含剩余时间或已用时间。
+submit 的结果返回之后会话可能结束（end_reason）：after_accept=polish 时这个会话里 POLISH 开始了（phase）；同一个问题在
+submit 上反复失败、规则写了换人请求（stuck_handoff）。驱动随后让模型写交接摘要，再开新会话。
 """
 from __future__ import annotations
 
@@ -29,7 +31,9 @@ class WorkerPort:
         self.w = worker
         self._notices: list[str] = []
         self._returned_locates: set[str] = set()      # 已经随拒绝消息返回过的定位
-        self._accepted = False                         # 最近一次 submit 是否被接受（会话随之结束）
+        self._accepted = False                         # 最近一次 submit 之后会话是否结束（被接受，或换新会话）
+        self.end_reason: str | None = None             # 换新会话时的结束原因：phase（进入 POLISH）| stuck_handoff
+        self.stuck_detail = ""                         # stuck_handoff：反复失败的是什么（给交接摘要的提示词）
         run.rt.listeners.append(self._on_events)
 
     def close(self) -> None:
@@ -41,8 +45,13 @@ class WorkerPort:
         self._improvement_notice(events, g)
         for e in events:
             t = e.type
-            if t == "stall_detected" and e.get("worker") == self.w and e.get("action") != "stop":
-                if e.get("kind") == "repeated_failure":
+            if t == "stall_detected" and e.get("worker") == self.w and e.get("action") == "hint":
+                if e.get("kind") == "requirement_misses":
+                    self._notices.append(f"{e.get('detail')}. If your approach is not converging, look at it from a "
+                                         "different angle: re-run the reviewer's commands to see exactly what fails, "
+                                         "and check what the task text asks for. If it cannot be done here, declare it "
+                                         "in submit(blocked=[...]) and the reviewer decides.")
+                elif e.get("kind") == "repeated_failure":
                     self._notices.append(f"Your recent submits were all rejected for the same reason "
                                          f"({e.get('detail')}). If your current approach is not converging, it may "
                                          "help to look at those regressions from a different angle, or undo the "
@@ -60,7 +69,7 @@ class WorkerPort:
             elif t == "review_decided" and e.get("merge") is False:
                 v = g.reviews.get(e.get("review"))
                 if v is not None and v.trigger not in ("submit", "judge"):   # submit 的结论随 submit 返回
-                    txt = render_review_notice(g, v.id)
+                    txt = render_review_notice(g, v.id, self.run.cfg.review_commands)
                     if txt:
                         self._notices.append(txt)
             elif t == "requirement_judged" and e.get("status") == REQ_OPEN and \
@@ -140,11 +149,23 @@ class WorkerPort:
                                      timeout=self.run.cfg.submit_wait_sec)
         g = self.run.rt.graph
         s = g.submits[sid]
-        text = render_submit(g, sid)
+        text = render_submit(g, sid, self.run.cfg.review_commands)
         if s.status == "rejected" and s.attempt:
             text += await self._with_located(s.attempt)
         # 被接受时会话结束、运行收尾；改进阶段里接受只是“清单都做完了”，会话继续（回复里带着改进项）
-        self._accepted = s.status == SUB_ACCEPTED and not improving(self.run.rt.graph, self.run.cfg)
+        self._accepted = s.status == SUB_ACCEPTED and not improving(g, self.run.cfg)
+        self.end_reason = None
+        ws = g.workers.get(self.w)
+        sess = g.sessions.get(ws.session) if ws is not None and ws.session else None
+        run, cfg = g.run, self.run.cfg
+        if sess is not None and cfg.polish and run.improve_seq is not None and sess.started_seq < run.improve_seq \
+                and improving(g, cfg):
+            # after_accept=polish：这个会话里 POLISH 开始了（清单被接受）——换一个新会话来做 POLISH
+            self._accepted, self.end_reason = True, "phase"
+        elif not self._accepted and sess is not None:
+            st = R.handoff_requested(g, self.w, s.seq)
+            if st is not None:                         # 同一个问题反复失败：这次回复之后交给新会话
+                self._accepted, self.end_reason, self.stuck_detail = True, "stuck_handoff", st.detail
         return text, self._accepted
 
     async def request(self, name: str, /, **p: Any) -> dict:

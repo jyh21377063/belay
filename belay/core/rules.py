@@ -29,11 +29,11 @@ from belay.core.model import (ACTIONABLE, ATT_ADVANCING, ATT_CREATED, ATT_PENDIN
                               LEVEL_RANK, LEVELS, REQ_BLOCKED, REQ_DONE, REQ_OPEN, REV_DECIDED, REV_FAILED,
                               REV_RECORDED, REV_RUNNING, RUN_RUNNING, SUB_PENDING, TODO_ACTIVE, TODO_ANCHORED,
                               TODO_COMPLETED, TODO_PENDING, WHERE_LIVE, WHERE_SLOT, WHERE_WORKSPACE, Attempt, Graph,
-                              Review, Snapshot)
+                              Review, Snapshot, Stall)
 from belay.core.plan import normalize_ws, quote_in_text
 from belay.core.queries import (actionable, active_todos, broken_requirements, chain, chain_ids, consecutive_crashes,
-                                delivery_checkpoint, evidence_checks, improve_idle_sessions, improvements_in_order,
-                                improving, is_ancestor, judged_on_tree, open_improvements,
+                                delivery_checkpoint, evidence_checks, improve_idle_sessions, improvement_items,
+                                improvements_in_order, improving, is_ancestor, judged_on_tree, open_improvements,
                                 last_bg_review_t, last_score, last_session, latest_snapshot, mentioned_requirements,
                                 next_id, num, open_attempt, open_persistent, open_requirements, open_submit,
                                 remaining_sec, reserve_sec, running_review, sessions_without_progress,
@@ -53,6 +53,12 @@ FOREGROUND_REASONS = ("submit", "final", "deadline")
 DECLARED_TRIGGERS = ("submit",)
 # 只判定、不合并的复核：需求都做完、改进阶段里还没有 open 的改进项时，请复核者提出改进方向（after_accept=improve）
 IMPROVE_TRIGGER = "improve"
+# 只判定、不合并的复核：POLISH 的 VERIFY 模式里复审判了完成的需求（跑出缺口就以 E2 / E3 退回 open）
+VERIFY_TRIGGER = "verify"
+# 复核者不批准合并时的阻断原因（merge=false 必须给出至少一个；“需求还没做完”从来不是阻断原因）
+BLOCKERS = ("regression", "breaks_done", "destructive", "fake_result", "debug_code", "score_drop", "other")
+RUN_TAIL_CHARS = 1500                               # 复核者命令输出尾部的上限（给 worker 复现用）
+RUN_TAILS_KEPT = 8                                  # 一次复核最多保留几条命令的输出尾部
 
 
 class Rejected(Exception):
@@ -531,6 +537,8 @@ def _reject(tx: Tx, aid: str, reason: str, regs: tuple, flaky: tuple, detail: st
                                    and not j.live}))[:1000]
     tx.emit("merge_rejected", RUNTIME, RULE, attempt=aid, regressions=list(regs), flaky=list(flaky), reason=reason,
             detail=detail)
+    if a.submit is not None and a.lane == LANE_FG:
+        check_stuck(tx, a.submit)
     if reason in ("regression", "requirement_regression") and regs:
         tests = regression_ids(regs)
         tests = [t.split(" [", 1)[0] for t in tests]
@@ -687,9 +695,19 @@ def clean_verdict(raw) -> dict:
     out = {"merge": _bool_or_none(v.get("merge")), "reason": str(v.get("reason") or "")[:1500],
            "summary": str(v.get("summary") or "").strip().split("\n")[0][:300], "requirements": reqs[:300],
            "waivers": waivers[:20], "score": _num_or_none(v.get("score")),
-           "score_note": str(v.get("score_note") or "")[:500], "feedback": str(v.get("feedback") or "")[:4000]}
+           "score_note": str(v.get("score_note") or "")[:500], "feedback": str(v.get("feedback") or "")[:4000],
+           "blockers": _clean_blockers(v.get("blockers")), "blocking": str(v.get("blocking") or "").strip()[:2000]}
     if any(k in v for k in ("improvements", "new_improvements", "no_more_improvements")):
         out.update(_clean_improvements(v))
+    return out
+
+
+def _clean_blockers(raw) -> list[str]:
+    out = []
+    for x in _as_list(raw, 10, 40):
+        k = x.strip().lower().replace(" ", "_").replace("-", "_")
+        if k in BLOCKERS and k not in out:
+            out.append(k)
     return out
 
 
@@ -826,7 +844,13 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
                 judgements.append({**base, "status": REQ_DONE, "judgement": J_DONE, "level": level, "tests": tests,
                                    "runs": used_runs, "reason": "stronger evidence"})
             continue
-        if status == J_DONE:
+        if status == J_DONE and level not in (E2, E3) and any(h[2] == "reassessed" for h in r.history):
+            # 复审跑出过缺口、退回过的需求：再判完成要重新跑过（E2 / E3），只读代码不够
+            judgements.append({**base, "status": REQ_OPEN, "judgement": J_PARTIAL, "reason": "review",
+                               "missing": missing + ["it was reopened after a check showed a gap: run that check "
+                                                     "again (E2 or E3) before judging it done"]})
+            notes.append(f"{r.id}: judged done on {level} after it was reopened; it needs E2 or E3")
+        elif status == J_DONE:
             judgements.append({**base, "status": REQ_DONE, "judgement": J_DONE, "level": level, "tests": tests,
                                "runs": used_runs, "reason": "review"})
         elif status == J_BLOCKED:
@@ -840,7 +864,7 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
                 missing = [item["reason"]]
             judgements.append({**base, "missing": missing, "status": REQ_OPEN, "judgement": status,
                                "reason": "blocked_not_accepted" if r.id in declared or r.status == REQ_BLOCKED
-                               else "review"})
+                               else "review", "runs": used_runs})
     # ---- 分数
     score = verdict.get("score") if run_ids else None
     if verdict.get("score") is not None and not run_ids:
@@ -855,21 +879,32 @@ def decide_review(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, runs: li
     improvements = _decide_improvements(g, cfg, v, verdict, res, run_ids, judgements, score, notes)
     # ---- 合并
     merge = None
+    blockers = list(verdict.get("blockers") or [])
+    blocking = verdict.get("blocking") or ""
+    blocks = None                                  # 不合并时：有没有真正的阻断原因（规则的，或复核者给出的有效 blockers）
     if v.attempt is not None:
+        rule_reasons = bool(reasons)
         if not verdict.get("merge"):
             reasons.insert(0, "the reviewer did not approve the merge: " + (verdict.get("reason") or "no reason given"))
+            valid = bool(blockers) and (blockers != ["other"] or bool(blocking.strip()))
+            if not valid:
+                notes.append("merge=false without a blocking reason")
+            blocks = rule_reasons or valid
+        elif reasons:
+            blocks = True
         merge = not reasons
     return {"merge": merge, "reasons": reasons, "notes": notes, "judgements": judgements, "mentioned": mentioned,
             "waivers": granted, "score": score, "score_note": verdict.get("score_note") or "",
             "label": verdict.get("summary") or "", "feedback": verdict.get("feedback") or "",
-            "improvements": improvements, "improved": improved}
+            "improvements": improvements, "improved": improved, "blockers": blockers, "blocking": blocking,
+            "blocks": blocks}
 
 
 def _norm_imp(title: str) -> str:
     return " ".join(str(title).lower().split())
 
 
-def _improve_phase_after(g: Graph, judgements: list[dict], res: dict) -> bool:
+def _improve_phase_after(g: Graph, cfg: BelayConfig, judgements: list[dict], res: dict) -> bool:
     """这次复核的判定落地之后，是否可以提出改进项（或宣布没有值得做的改进了）：改进阶段已经开始，或者需求都做完了
     （复核者判完成 / 受阻，或证据检查在这棵树上全部通过——合并时规则会记 E3）。收尾、截止预留、改进阶段已结束时不行。
     这是复核时的估计；落地时（_apply_improvements）再按账本确认一次。"""
@@ -878,6 +913,8 @@ def _improve_phase_after(g: Graph, judgements: list[dict], res: dict) -> bool:
         return False
     if run.improving:
         return True
+    if cfg.polish:                                  # polish：改进项只由 POLISH 开始时那次专门的复核提出
+        return False
     st = {r.id: r.status for r in actionable(g)}
     for j in judgements:
         st[j["requirement"]] = j["status"]
@@ -897,8 +934,8 @@ def _decide_improvements(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, r
       - 新提议：只在需求都做完之后（或改进阶段里）；每条挂到任务原文的逐字引文（至少 3 个词）或可测的目标（链上测过
         分数，或这次测了）上；与已有的不重复；同时 open 的最多 improve_max_open 条；
       - “没有值得做的改进了”：要写原因；链上测过分数时这次也要测；open 的改进项都要先判完成或放弃；不能同时提新的。
-    返回 {judged, proposed, closed}；没有打开 after_accept=improve 时返回 None。"""
-    if not cfg.improve or g.run is None:
+    返回 {judged, proposed, closed}；改进项机制不在用（finalize、POLISH 开始之前、VERIFY 模式）时返回 None。"""
+    if g.run is None or not improvement_items(g, cfg):
         return None
     task = g.run.task
     scored = score is not None or last_score(g)[0] is not None
@@ -938,7 +975,7 @@ def _decide_improvements(g: Graph, cfg: BelayConfig, v: Review, verdict: dict, r
                                   else J_NOT_DONE})
     proposals = verdict.get("new_improvements") or []
     claim = bool(verdict.get("no_more_improvements"))
-    if not _improve_phase_after(g, judgements, res):
+    if not _improve_phase_after(g, cfg, judgements, res):
         if proposals or claim:
             notes.append("improvements are proposed only once every requirement on the checklist is done; ignored")
         return out
@@ -992,13 +1029,12 @@ def record_review(tx: Tx, vid: str, verdict: Optional[dict], runs: Iterable[dict
     if not failed:
         if v.attempt is not None and clean.get("merge") is None:
             failed, error = True, error or "the verdict does not say whether to merge"
-        elif v.attempt is None and v.trigger == IMPROVE_TRIGGER:
+        elif v.attempt is None and v.trigger == IMPROVE_TRIGGER and improvement_items(g, tx.cfg):
             if not (clean.get("new_improvements") or clean.get("improvements") or clean.get("no_more_improvements")):
                 failed, error = True, error or "the verdict neither proposes improvements nor says there are none"
         elif v.attempt is None and not clean.get("requirements"):
             failed, error = True, error or "the verdict judges no requirement"
-    runs = [{"id": str(x.get("id")), "cmd": str(x.get("cmd") or "")[:500],
-             "rc": int(x["rc"]) if isinstance(x.get("rc"), int) else None} for x in runs or ()][:200]
+    runs = _clean_runs(runs, clean)
     tx.emit("merge_reviewed", REVIEWER, LLM, review=vid, verdict=clean, runs=runs, failed=failed,
             error=(error or "")[:2000], transcript=transcript)
     if not failed:
@@ -1013,6 +1049,27 @@ def record_review(tx: Tx, vid: str, verdict: Optional[dict], runs: Iterable[dict
             if v.submit is not None:
                 finish_submit(tx, v.submit)
     _cascade(tx)
+
+
+def _clean_runs(runs: Iterable[dict], verdict: dict) -> list[dict]:
+    """复核者执行过的命令 {id, cmd, rc}；输出尾部（tail）只留给 worker 复现用得上的：结论里引用过的、退出码非 0 的，
+    最多 RUN_TAILS_KEPT 条（引用过的优先，其次最近的），每条最多 RUN_TAIL_CHARS 字。"""
+    out = []
+    for x in list(runs or ())[:200]:
+        out.append({"id": str(x.get("id")), "cmd": str(x.get("cmd") or "")[:500],
+                    "rc": int(x["rc"]) if isinstance(x.get("rc"), int) else None,
+                    "tail": str(x.get("tail") or "")[-RUN_TAIL_CHARS:]})
+    cited = {str(r) for item in (verdict or {}).get("requirements") or [] for r in item.get("runs") or []}
+    cited |= {str(r) for item in (verdict or {}).get("improvements") or [] for r in item.get("runs") or []}
+    want = [x["id"] for x in out if x["tail"] and x["id"] in cited]
+    want += [x["id"] for x in reversed(out) if x["tail"] and x["id"] not in cited and x["rc"] not in (0, None)]
+    keep = set(want[:RUN_TAILS_KEPT])
+    for x in out:
+        if x["id"] not in keep:
+            x.pop("tail")
+        elif not x["tail"]:
+            x.pop("tail")
+    return out
 
 
 def _apply_judgements(tx: Tx, vid: str, cid: int) -> None:
@@ -1043,7 +1100,7 @@ def _apply_improvements(tx: Tx, vid: str, cid: int) -> None:
     if not _running_run(g) or cid not in g.checkpoints or not is_ancestor(g, cid, g.head):
         return
     d = g.reviews[vid].decision.get("improvements") or {}
-    if not d or not cfg.improve:
+    if not d or not improvement_items(g, cfg):
         return
     for j in d.get("judged") or []:
         i = tx.g.improvements.get(j["improvement"])
@@ -1059,6 +1116,8 @@ def _apply_improvements(tx: Tx, vid: str, cid: int) -> None:
                 missing=j.get("missing") or [], checkpoint=cid, review=vid, reason=j.get("reason") or "")
     run = tx.g.run
     if run.finalizing or run.reserve or run.improve_closed or not (run.improving or not open_requirements(tx.g)):
+        return
+    if cfg.polish and not run.improving:
         return
     titles = {_norm_imp(i.title) for i in tx.g.improvements.values()}
     for p in d.get("proposed") or []:
@@ -1508,9 +1567,11 @@ def _judge_on_head(tx: Tx, sid: str) -> None:
 
 def finish_submit(tx: Tx, sid: str) -> None:
     """提交的结论：合并（或只判定）之后还有没完成的 actionable 需求 → 交还清单；没有 → 接受（运行可以收尾）。
-    after_accept=improve：需求都做完时改进阶段开始（第一次）；还没有 open 的改进项、复核者也没说“没有值得做的改进了”
-    时，先请复核者在链头上提出改进方向（只判定、不合并），有了结论再接受——这样接受的回复里就带着改进项。"""
-    g = tx.g
+    after_accept=improve / polish：需求都做完时改进阶段开始（第一次）；还没有 open 的改进项、复核者也没说“没有值得做的
+    改进了”时，先请复核者在链头上提出改进方向（只判定、不合并），有了结论再接受——这样接受的回复里就带着改进项。
+    polish：剩余时间扣掉截止预留后不足 new_session_min_sec 时不进 POLISH，直接接受（收尾）；VERIFY 模式下先请复核者
+    复审判了完成的需求，跑出缺口的退回 open（这次提交随之交还），什么都没退回时 POLISH 结束、接受。"""
+    g, cfg = tx.g, tx.cfg
     s = g.submits.get(sid)
     if s is None or s.status != SUB_PENDING:
         return
@@ -1519,14 +1580,78 @@ def finish_submit(tx: Tx, sid: str) -> None:
     if s.review is not None and g.reviews[s.review].status in (REV_RUNNING, REV_RECORDED):
         return
     left = [r.id for r in open_requirements(g)]
-    if not left and tx.cfg.improve and _running_run(g) and not g.run.finalizing and not g.run.reserve:
-        if not g.run.improving:
-            tx.emit("improve_started", RUNTIME, RULE, submit=sid, checkpoint=g.head)
-        if not _improvements_ready(tx, sid):
-            return
+    if not left and cfg.improve and _running_run(g) and not g.run.finalizing and not g.run.reserve:
+        if not g.run.improving and (not cfg.polish or _time_for_new_session(g, cfg, tx.now)):
+            tx.emit("improve_started", RUNTIME, RULE, submit=sid, checkpoint=g.head, mode=_polish_mode(g, cfg))
+        if tx.g.run.improving:
+            ready = _audit_ready(tx, sid) if tx.g.run.polish_mode == "verify" else _improvements_ready(tx, sid)
+            if not ready:
+                return
         g = tx.g
+        left = [r.id for r in open_requirements(g)]
     tx.emit("submit_updated", RUNTIME, RULE, submit=sid, status="returned" if left else "accepted", open=left,
             checkpoint=s.checkpoint if s.checkpoint is not None else g.head)
+    if left:
+        check_stuck(tx, sid)
+
+
+def _time_for_new_session(g: Graph, cfg: BelayConfig, now: float) -> bool:
+    """新会话（POLISH、打转换人）要先重新读代码：剩余时间扣掉截止预留后至少 new_session_min_sec 才值得开。"""
+    return remaining_sec(g, now) - reserve_sec(g, cfg) >= cfg.new_session_min_sec
+
+
+def _polish_mode(g: Graph, cfg: BelayConfig) -> str:
+    if not cfg.polish:
+        return "improve"
+    if cfg.polish_mode != "auto":
+        return cfg.polish_mode
+    return "improve" if last_score(g)[0] is not None else "verify"
+
+
+def audit_focus(g: Graph) -> list[str]:
+    """复审的焦点：判了完成的需求，证据弱的在前（E0 / E1，再 E2；E3 已由测试证明，不复审）。"""
+    done = [r for r in actionable(g) if r.status == REQ_DONE and r.level != E3]
+    return [r.id for r in sorted(done, key=lambda r: (LEVEL_RANK.get(r.level or E0, 0), num(r.id)))]
+
+
+def _audit_ready(tx: Tx, sid: str) -> bool:
+    """VERIFY：接受一次提交之前请复核者复审（只判定、不合并）。这次提交的复审有了结论 → 可以给结论：退回了需求就交还
+    （POLISH 继续），什么都没退回就结束 POLISH；复审轮数用完、没有可复审的需求、复核者不可用时也结束 POLISH。"""
+    g, cfg = tx.g, tx.cfg
+    if g.run.improve_closed:
+        return True
+    mine = sorted((v for v in g.reviews.values() if v.submit == sid and v.trigger == VERIFY_TRIGGER),
+                  key=lambda v: v.seq)
+    if any(v.status in (REV_RUNNING, REV_RECORDED) for v in mine):
+        return False
+    decided = [v for v in mine if v.status == REV_DECIDED]
+    if decided:
+        reopened = [j["requirement"] for j in decided[-1].decision.get("judgements") or []
+                    if j.get("reason") == "reassessed"]
+        if not reopened and not open_requirements(g):
+            tx.emit("improve_closed", RUNTIME, RULE, reason="the audit found no gap in the requirements judged done",
+                    review=decided[-1].id, by="rule")
+        return True
+    rounds = sum(1 for v in g.reviews.values() if v.trigger == VERIFY_TRIGGER and v.status == REV_DECIDED)
+    focus = audit_focus(g)
+    reason = ""
+    if rounds >= cfg.verify_rounds:
+        reason = f"the audit ran {rounds} time(s)"
+    elif not focus:
+        reason = "every requirement judged done is shown by tests (E3); nothing to audit"
+    elif len(mine) > cfg.review_retries:
+        reason = "the reviewer could not audit the requirements"
+    if reason:
+        tx.emit("improve_closed", RUNTIME, RULE, reason=reason, review=mine[-1].id if mine else None, by="rule")
+        return True
+    if not _review_slot(tx, LANE_FG):
+        return False                                # 复核者在忙：复核结束时级联会再来
+    head = tx.g.head_cp
+    s = tx.g.submits[sid]
+    tx.emit("review_started", RUNTIME, RULE, review=next_id("V", tx.g.reviews), trigger=VERIFY_TRIGGER,
+            checkpoint=tx.g.head, tree=head.tree, snapshot=s.snapshot, base=tx.g.head, submit=sid, focus=focus,
+            gate={}, retry_of=mine[-1].id if mine else None)
+    return False
 
 
 def _improvements_ready(tx: Tx, sid: str) -> bool:
@@ -1670,6 +1795,9 @@ def _review_rejections_in_row(g: Graph, worker: str) -> list[Attempt]:
         if a.status == ATT_CREATED:
             break
         if a.reason == "review":
+            v = g.reviews.get(a.review) if a.review else None
+            if v is not None and v.decision.get("blocks") is False:
+                continue                            # 复核者没给出阻断原因：不算 worker 的问题
             out.append(a)
         elif a.lane == LANE_FG:
             break
@@ -1696,7 +1824,7 @@ def detect_stalls(tx: Tx) -> None:
                 if not any(x.kind == "repeated_failure" and sig in x.detail for x in since):
                     tx.emit("stall_detected", RUNTIME, RULE, kind="repeated_failure", action="hint", worker=w,
                             detail=f"signature {sig}: the same {len(mine[-1].regressions)} regression(s) "
-                                   f"rejected {len(mine)} submits in a row")
+                                   f"rejected {len(mine)} submits in a row", sig=f"reg:{sig}")
                     return
         rej = _review_rejections_in_row(g, w)
         if len(rej) >= cfg.stall_same_failure:
@@ -1709,6 +1837,105 @@ def detect_stalls(tx: Tx) -> None:
                 return
 
 
+# ======================================================================== 打转：同一个问题在 submit 上反复失败
+
+def _submit_missed(g: Graph, s, rid: str) -> Optional[bool]:
+    """这次提交上 rid 是否“又没做完”：复核者明确判 partial / not_done → True；判完成（或提交被接受）→ False；
+    没有新改动又提交、它仍未完成 → True（什么都没改就声称做完了）；其余（没被复核到，如回归门就拒了）→ None。"""
+    judged = None
+    for v in sorted((v for v in g.reviews.values() if v.submit == s.id and v.status == REV_DECIDED),
+                    key=lambda v: v.seq):
+        for j in v.decision.get("judgements") or []:
+            if j.get("requirement") == rid:
+                judged = j.get("status") == REQ_OPEN and j.get("judgement") in (J_PARTIAL, J_NOT_DONE)
+    if judged is not None:
+        return judged
+    if s.status == "accepted":
+        return False
+    if s.status == "returned" and s.attempt is None:
+        return rid in s.open
+    return None
+
+
+def submit_miss_streak(g: Graph, worker: str, rid: str) -> int:
+    """rid 在这个 worker 最近连续几次提交上又没做完（中间没被复核到的提交跳过）。"""
+    n = 0
+    for s in sorted((s for s in g.submits.values() if s.worker == worker and s.status != SUB_PENDING),
+                    key=lambda s: s.seq, reverse=True):
+        m = _submit_missed(g, s, rid)
+        if m is None:
+            continue
+        if not m:
+            break
+        n += 1
+    return n
+
+
+def fg_failure_streak(g: Graph, worker: str) -> tuple[int, str, Optional[Attempt]]:
+    """最近连续几个前台合并请求（submit）都被同一组回归拒掉：(次数, 回归签名, 最近的那个请求)。"""
+    mine = sorted((a for a in g.attempts.values() if a.worker == worker and a.lane == LANE_FG and a.trigger == "submit"
+                   and a.status in (ATT_REJECTED, ATT_CREATED) and a.reason != "cancelled"),
+                  key=lambda a: a.created_seq, reverse=True)
+    if not mine or mine[0].status != ATT_REJECTED or not mine[0].regressions:
+        return 0, "", None
+    sig = failure_signature(mine[0].regressions)
+    n = 0
+    for a in mine:
+        if a.status != ATT_REJECTED or not a.regressions or failure_signature(a.regressions) != sig:
+            break
+        n += 1
+    return n, sig, mine[0]
+
+
+def check_stuck(tx: Tx, sid: str) -> None:
+    """一次提交得到结论（交还或被拒）之后：同一个问题反复出现时先提醒；这个会话里提醒过、之后又失败了一次、提醒之后
+    没有任何进展、还有时间给新会话热身时，写 stall_detected(action=handoff)：会话层在这次 submit 的回复之后结束会话，
+    交给新会话（开场理由 fresh）。每个问题只换一次。"""
+    g, cfg = tx.g, tx.cfg
+    s = g.submits.get(sid)
+    if s is None or not cfg.stall or not _running_run(g) or g.run.finalizing or g.run.reserve:
+        return
+    ws = g.workers.get(s.worker)
+    sess = g.sessions.get(ws.session) if ws is not None and ws.session else None
+    if sess is None:
+        return
+    problems = []                                   # (kind, sig, 这次是否又失败, 次数, 门槛, 说明)
+    for r in open_requirements(g):
+        n = submit_miss_streak(g, s.worker, r.id)
+        if n >= cfg.stuck_submit_misses:
+            miss = "; ".join(r.missing[:3])[:400]
+            problems.append(("requirement_misses", f"req:{r.id}", _submit_missed(g, s, r.id) is True, n,
+                             cfg.stuck_submit_misses, f"{r.id} was judged not done on {n} submits in a row"
+                             + (f"; missing: {miss}" if miss else "")))
+    n, sig, last = fg_failure_streak(g, s.worker)
+    if n >= cfg.stall_same_failure:
+        problems.append(("repeated_failure", f"reg:{sig}", last is not None and last.id == s.attempt, n,
+                         cfg.stall_same_failure, f"signature {sig}: the same {len(last.regressions)} regression(s) "
+                                                 f"rejected {n} submits in a row"))
+    for kind, key, again, n, k, detail in problems:
+        hints = [x for x in tx.g.stalls if x.sig == key and x.worker == s.worker and x.action == "hint"
+                 and x.seq > sess.started_seq]
+        if not hints:
+            tx.emit("stall_detected", RUNTIME, RULE, kind=kind, action="hint", worker=s.worker, detail=detail, sig=key)
+            continue
+        handed = any(x.sig == key and x.action == "handoff" for x in tx.g.stalls)
+        if cfg.stuck_handoff and again and n > k and not handed and tx.g.last_progress_seq < hints[-1].seq and \
+                _time_for_new_session(tx.g, cfg, tx.now):
+            tx.emit("stall_detected", RUNTIME, RULE, kind=kind, action="handoff", worker=s.worker, detail=detail,
+                    sig=key)
+            return
+
+
+def handoff_requested(g: Graph, worker: str, since_seq: int) -> Optional[Stall]:
+    """since_seq 之后为这个 worker 写下的换人请求（stall_detected action=handoff）。"""
+    for x in reversed(g.stalls):
+        if x.seq <= since_seq:
+            break
+        if x.worker == worker and x.action == "handoff":
+            return x
+    return None
+
+
 # ======================================================================== 会话
 
 def session_reason(g: Graph, worker: str) -> str:
@@ -1716,7 +1943,8 @@ def session_reason(g: Graph, worker: str) -> str:
     if s is None:
         return "first"
     return {"handoff": "handoff", "crash": "crash", "runtime_crash": "recover", "stuck": "restart",
-            "suspended": "resume", "rebuild": "rebuild"}.get(s.end_reason or "", "restart")
+            "suspended": "resume", "rebuild": "rebuild", "phase": "phase",
+            "stuck_handoff": "fresh"}.get(s.end_reason or "", "restart")
 
 
 def start_session(tx: Tx, worker: str, reason: str, opening: dict, transcript: Optional[str] = None) -> str:
@@ -1803,8 +2031,8 @@ def begin_finalize(tx: Tx, reason: str) -> None:
     for a in list(tx.g.attempts.values()):
         if a.status == ATT_PENDING and a.lane == LANE_BG:
             supersede_attempt(tx, a.id, "finalize")
-    v = running_review(tx.g)                        # 请复核者提改进方向的复核：收尾时不再需要
-    if v is not None and v.trigger == IMPROVE_TRIGGER:
+    v = running_review(tx.g)                        # 请复核者提改进方向 / 复审的复核：收尾时不再需要
+    if v is not None and v.trigger in (IMPROVE_TRIGGER, VERIFY_TRIGGER):
         _cancel_review(tx, v.id, "the run is finalizing")
     _cascade(tx)                                    # 复核者空出来了：在等它的前台请求（submit）接着走
 

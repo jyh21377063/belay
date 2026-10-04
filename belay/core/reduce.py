@@ -246,7 +246,8 @@ def _improve_started(g: Graph, e: Event) -> Graph:
     _running(g)
     _need(not g.run.improving, "improve_started twice")
     _need(e.get("submit") in g.submits, f"improve_started for unknown submit {e.get('submit')}")
-    return replace(g, run=replace(g.run, improving=True, improve_seq=e.seq))
+    mode = str(e.get("mode") or "improve")
+    return replace(g, run=replace(g.run, improving=True, improve_seq=e.seq, polish_mode=mode))
 
 
 def _improve_closed(g: Graph, e: Event) -> Graph:
@@ -475,7 +476,8 @@ def _snapshot_taken(g: Graph, e: Event) -> Graph:
 
 
 def _stall_detected(g: Graph, e: Event) -> Graph:
-    s = Stall(e.seq, e.t, e.get("kind"), e.get("action"), e.get("worker"), e.get("detail", ""))
+    s = Stall(e.seq, e.t, e.get("kind"), e.get("action"), e.get("worker"), e.get("detail", ""),
+              str(e.get("sig") or ""))
     return replace(g, stalls=g.stalls + (s,))
 
 
@@ -729,7 +731,7 @@ def _review_decided(g: Graph, e: Event) -> Graph:
     merge = e.get("merge")
     _need((merge is None) == (v.attempt is None), "only a review of a merge request decides a merge")
     d = {k: e.get(k) for k in ("merge", "reasons", "notes", "judgements", "mentioned", "score", "score_note", "label",
-                                "feedback", "improvements", "improved")}
+                                "feedback", "improvements", "improved", "blockers", "blocking", "blocks")}
     return _set_review(g, replace(v, status=REV_DECIDED, decision=d))
 
 

@@ -9,7 +9,7 @@ from belay.core.context import build_context
 from belay.core.invariants import check_log, llm_effects
 from belay.core.model import REQ_BLOCKED, REQ_DONE, REQ_OPEN
 from belay.core.queries import delivery_checkpoint, resume_point
-from belay.core.render import ledger, ledger_markdown, render_board, render_submit
+from belay.core.render import ledger, ledger_markdown, render_board, render_review_notice, render_submit
 from belay.core.rules import Rejected
 from tests.sim import APPROVE, MANUAL, Sim, judge
 
@@ -821,7 +821,8 @@ def test_score_never_drops_along_the_merge_chain():
 
 
 def test_reviewer_not_approving_tells_the_worker_and_repeats_raise_a_stall_hint():
-    s = sim(reviewer=judge(False, reason="debug prints left in pkg/mod.py", feedback="remove the prints"),
+    s = sim(reviewer=judge(False, reason="debug prints left in pkg/mod.py", feedback="R3 still needs docs",
+                           blockers=["debug_code"], blocking="remove the prints"),
             cfg=bgc(stall_same_failure=2))
     for i in range(2):
         s.world.define(f"n{i}", {})
@@ -829,14 +830,42 @@ def test_reviewer_not_approving_tells_the_worker_and_repeats_raise_a_stall_hint(
     assert s.g.head == 0
     rej = s.g.wips["w1"].last_rejection
     assert rej["reason"] == "review" and "debug prints" in rej["detail"]
+    d = s.g.reviews[rej["review"]].decision
+    assert d["blocks"] is True and d["blockers"] == ["debug_code"] and d["blocking"] == "remove the prints"
     text = build_context(s.g, "w1", 50_000, s.now, s.cfg, mode="resume").text
     assert "The reviewer did not merge your snapshot" in text and "remove the prints" in text
+    assert "R3 still needs docs" not in text                     # 还缺什么不算阻断原因
+    notice = render_review_notice(s.g, rej["review"])
+    assert "What blocks the merge: remove the prints" in notice and "R3 still needs docs" not in notice
     s.tick()
     st = s.g.stalls[-1]
     assert st.kind == "review_rejections" and "2 merge requests in a row" in st.detail
     n = len(s.g.stalls)
     s.tick()
     assert len(s.g.stalls) == n
+
+
+def test_not_approving_without_a_blocker_is_noted_and_not_pushed_to_the_worker():
+    """merge=false 却没有有效的阻断原因（多半是“还没做完”）：照常不批准，记 Note；不提醒 worker，开场不当作待处理
+    的问题，也不计入“连续被复核者拒绝”的停滞。"""
+    s = sim(reviewer=judge(False, reason="R3 is not finished", feedback="write the docs"), cfg=bgc(stall_same_failure=2))
+    for i in range(3):
+        s.world.define(f"n{i}", {})
+        s.snap(f"n{i}")
+    assert s.g.head == 0
+    rej = s.g.wips["w1"].last_rejection
+    d = s.g.reviews[rej["review"]].decision
+    assert d["merge"] is False and d["blocks"] is False
+    assert "merge=false without a blocking reason" in d["notes"]
+    assert render_review_notice(s.g, rej["review"]) == ""
+    text = build_context(s.g, "w1", 50_000, s.now, s.cfg, mode="resume").text
+    assert "The reviewer did not merge your snapshot" not in text
+    s.tick()
+    assert not any(x.kind == "review_rejections" for x in s.g.stalls)
+    s2 = sim(reviewer=judge(False, reason="x", blockers=["other"]), cfg=bgc())          # other 必须附文字
+    s2.world.define("n0", {})
+    s2.snap("n0")
+    assert s2.g.reviews["V1"].decision["blocks"] is False
 
 
 def test_reviewer_failure_is_retried_then_the_gate_alone_decides():
