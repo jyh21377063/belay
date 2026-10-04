@@ -11,6 +11,8 @@
   - todo 提醒（学 Claude Code，但按事件）：第一次改文件时还没有 todo 提醒一次；刚跑完测试、有进行中的条目、之后改过
     文件时提醒一句“做完了就勾掉”（勾掉是后台合并的时机；同一组进行中的条目有上限）；改了文件却很久没更新 todo 时再
     提醒（纯探索期不计时；不限次数，被忽略就拉长间隔）；多项同时进行中时按“这一组”说，不点名其中一项；
+  - 打转的断路器（belay.core.loops，参照 OpenHands）：同一动作同一结果连续几次、同一动作连续出错、两个动作来回交替时，
+    在工具结果后面提醒一句，并记一条 stall_detected（只提醒，不换会话）；
   - 每条追加进对话的消息都写进轨迹（message 记录），整体替换时写 messages_checkpoint：runtime 崩溃后可以读盘重放；
   - 模型接口多次重试仍失败时抛 ModelCallFailed：驱动可以在内存里原样重试同一个会话。
 会话返回时给出结束原因：submitted（提交被接受，或 submit 之后换新会话：进入 POLISH、同一个问题反复失败——由驱动按
@@ -25,6 +27,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 
+from belay.core import loops
 from belay.core.compact import count_results, l0_shrink, l1_clear, l2_rebuild, messages_tokens
 from belay.core.config import BelayConfig
 from belay.env import Env
@@ -94,6 +97,7 @@ class SessionHooks(Protocol):
     def active_todo_titles(self) -> list[str]: ...     # 图上全部进行中的 todo（会话刚开始、模型还没写过列表时用）
     def has_todos(self) -> bool: ...
     async def implicit_submit(self, summary: str) -> tuple[str, bool]: ...   # 模型停下不调用工具时当作提交
+    async def record_loop(self, kind: str, n: int, detail: str, sig: str) -> None: ...   # 打转的断路器命中（记入图）
 
 
 @dataclass
@@ -146,6 +150,7 @@ class BelaySession:
         self._writes_since_todo = 0                    # 上次更新 todo 之后成功改文件的次数
         self._done_nudges: dict[frozenset, int] = {}   # 进行中的那一组条目 → 已提醒“做完就勾掉”的次数
         self._last_done_nudge = -10**9
+        self._steps: list[loops.Step] = []             # 最近的工具调用（打转的断路器用）
 
     # ---------------------------------------------------------------- 主循环
     async def run(self) -> SessionOutcome:
@@ -217,7 +222,8 @@ class BelaySession:
             for tu, (out, err) in zip(tool_uses, results):
                 content.append({"type": "tool_result", "tool_use_id": tu["id"], "content": self._l0(tu, out),
                                 "is_error": err})
-            notes = self._todo_notes(tool_uses, results) + self.hooks.notices()
+            notes = self._todo_notes(tool_uses, results) + await self._loop_notes(tool_uses, results) + \
+                self.hooks.notices()
             if notes:
                 content.append({"type": "text", "text": "".join(f"<system-reminder>{n}</system-reminder>" for n in notes)})
             self._append({"role": "user", "content": content})
@@ -259,6 +265,24 @@ class BelaySession:
                     if t.get("status") == "in_progress" and str(t.get("content") or "").strip()]
         fn = getattr(self.hooks, "active_todo_titles", None)
         return [t for t in (fn() if fn is not None else []) or [] if t]
+
+    async def _loop_notes(self, tool_uses: list[dict], results: list) -> list[str]:
+        """打转的断路器：逐个记下这一批工具调用，某种循环正好达到阈值时提醒模型，并记一条 stall_detected。"""
+        notes = []
+        for tu, (out, err) in zip(tool_uses, results):
+            self._steps.append(loops.step(str(tu.get("name") or ""), tu.get("input"), out, bool(err)))
+            del self._steps[:-loops.KEEP]
+            hit = loops.check(self._steps)
+            if hit is None:
+                continue
+            notes.append(loops.reminder(hit))
+            record = getattr(self.hooks, "record_loop", None)
+            if record is not None:
+                try:
+                    await record(hit.kind, hit.n, hit.detail, hit.sig)
+                except Exception as e:                  # noqa: BLE001  记不进图也不影响提醒
+                    self.transcript.write("loop_record_failed", error=f"{type(e).__name__}: {e}")
+        return notes
 
     def _todo_notes(self, tool_uses: list[dict], results: list) -> list[str]:
         """todo 提醒（学 Claude Code，但按事件而不是只按轮数）：

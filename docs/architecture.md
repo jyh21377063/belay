@@ -20,6 +20,7 @@ belay/
 │   ├── queries.py   只读查询（需求与证据检查、提交、复核、合并链、交付点、快照时间线、todo、恢复点、DONE 的条件……）
 │   ├── context.py   build_context：分层开场上下文（受保护段 + 各段上限 + 折叠与查询入口）；resume_reminder
 │   ├── compact.py   L0 落盘 / L1 清理 / L2 用图重建（消息列表的纯变换）
+│   ├── loops.py     会话内的打转断路器（同一动作同一结果 / 连续出错 / 来回交替 → 提醒）
 │   ├── plan.py      规划提议的校验（逐字引文、覆盖、actionable / context、检查项存在）与机械切分
 │   ├── invariants.py 不变量
 │   ├── effects.py   事件 → 副作用计划

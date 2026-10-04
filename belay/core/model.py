@@ -290,7 +290,7 @@ class Stall:
     seq: int
     t: float
     kind: str                                # no_progress | repeated_failure | review_rejections | requirement_misses |
-    #                                          sessions_no_progress
+    #                                          sessions_no_progress | loop_repeat | loop_error | loop_alternate
     action: str                              # hint | stop | handoff（结束会话，交给新会话）
     worker: Optional[str] = None
     detail: str = ""

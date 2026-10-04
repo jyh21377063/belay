@@ -1909,6 +1909,15 @@ def check_stuck(tx: Tx, sid: str) -> None:
             return
 
 
+def record_loop(tx: Tx, worker: str, kind: str, n: int, detail: str, sig: str) -> None:
+    """会话内的打转断路器命中（belay.core.loops：同一动作同一结果、同一动作连续出错、来回交替）：只记下来，
+    提醒由会话层直接附在工具结果后面。kind 记为 loop_<kind>，签名以 loop: 开头，与 submit 上的打转信号互不影响。"""
+    if not _running_run(tx.g):
+        return
+    tx.emit("stall_detected", RUNTIME, RULE, kind=f"loop_{kind}", action="hint", worker=worker,
+            detail=f"{n} in a row: {detail}"[:600], sig=sig[:100])
+
+
 def handoff_requested(g: Graph, worker: str, since_seq: int) -> Optional[Stall]:
     """since_seq 之后为这个 worker 写下的换人请求（stall_detected action=handoff）。"""
     for x in reversed(g.stalls):

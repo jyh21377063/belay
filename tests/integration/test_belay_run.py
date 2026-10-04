@@ -359,6 +359,27 @@ def test_stopping_is_nudged_then_treated_as_a_submit(tmp_path):
     h.verify_log(run)
 
 
+# ======================================================================== 打转的断路器（会话内，只提醒）
+
+def test_the_same_failing_command_three_times_gets_a_loop_reminder(tmp_path):
+    h = Harness(tmp_path)
+    bad = [tu(f"bad{i}", "bash", command="python -c 'import pkg.missing'") for i in range(3)]
+    llm = ScriptedLLM([PLANNER, call(bad[0]), call(bad[1]), call(bad[2]), call(READ), call(FIX_ADD), call(ADD_SUB),
+                       call(SUBMIT)])
+    run = h.make(llm)
+    res = asyncio.run(run.start(TASK))
+    assert res.status == "DONE", run.rt.graph.run.status_reasons
+    last = [json.dumps(r["messages"][-1]["content"]) for r in llm.requests]
+    hits = [i for i, x in enumerate(last) if "Loop check:" in x]
+    assert len(hits) == 1 and '"tool_use_id": "bad2"' in last[hits[0]]   # 第三次失败之后提醒一次
+    assert "failed 3 times in a row" in last[hits[0]]
+    g = run.rt.graph
+    st = [s for s in g.stalls if s.kind.startswith("loop_")]
+    assert [(s.kind, s.action) for s in st] == [("loop_error", "hint")] and st[0].sig.startswith("loop:error:")
+    assert g.sessions["S1"].end_reason == "submitted" and len(g.sessions) == 1      # 只提醒，不换会话
+    h.verify_log(run)
+
+
 def test_an_implicit_submit_that_is_returned_continues_the_session(tmp_path):
     h = Harness(tmp_path)
     llm = ScriptedLLM([PLANNER, call(READ), say("done"), say("done"), call(FIX_ADD), call(ADD_SUB), call(SUBMIT)])

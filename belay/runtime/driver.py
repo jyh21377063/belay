@@ -168,6 +168,10 @@ class _Hooks:
     def has_todos(self) -> bool:
         return bool(self.run.rt.graph.todos)
 
+    async def record_loop(self, kind: str, n: int, detail: str, sig: str) -> None:
+        """打转的断路器命中：记一条 stall_detected（只是提醒，提醒文字由会话层附上）。"""
+        await self.run.rt.submit(R.record_loop, self.run.w, kind, n, detail, sig)
+
     async def implicit_submit(self, summary: str) -> tuple[str, bool]:
         """模型停下不调用工具：当作一次提交（结果交还给它）。"""
         try:

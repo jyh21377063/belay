@@ -255,6 +255,13 @@ submit 的回复本身就是边界。
 - **每个签名只换一次**。换出去的会话不计入 `max_idle_sessions` / `improve_idle_sessions`：合并链单调，多给新会话一次
   机会不会让交付变差。
 - `review_rejections`（连续被复核者拒绝）只数有真正阻断原因的拒绝，仍然只提醒。
+- **会话内的断路器**（`core/loops.py`，参照 OpenHands 的 StuckDetector）：上面的信号都在 submit 上，看不到会话里逐字
+  重复的病态循环（环境坏了、命令每次超时、压缩之后反复读同样的东西）。会话层逐个记下工具调用（动作 = 工具名 + 参数，
+  观察 = 输出去掉耗时、地址、时间戳之后的摘要），同一动作同一观察连续 4 次（`repeat`）、同一动作连续出错 3 次
+  （`error`，bash 退出码非 0 或超时也算）、两组动作来回交替 6 步（`alternate`）时，在这一批工具结果后面附一句以
+  “Loop check:” 开头的提醒，并写 `stall_detected(kind=loop_<kind>, action=hint)`（签名以 `loop:` 开头，与 submit 上的
+  信号互不影响）。每段连续只在正好达到阈值时报一次；只提醒，不换会话、不改任何状态。模型只说话不调用工具的情况由
+  “先追问、再当作提交”处理，不在这里。
 
 ### 4.8 给 worker 的复核反馈
 
@@ -350,6 +357,7 @@ runtime 重启后从头再开（`recovery.reconcile` 第 4 步）；复核目录
 | 合并请求（节流、交接与 todo、回归门、复核）、证据等级校验、单调（已完成不退回、E3 测试、分数）、豁免由复核者裁决、复核失败的重试与降级、只判定的复核、受阻的裁决、没有回归门的路径、收尾、DONE 的条件 | `tests/unit/test_rules.py` |
 | 后台挑快照：todo 锚点优先于之后的改动、合并期间攒下的 todo 合成一次、不抢占进行中的复核、submit 仍然取代、被拒不回退、revert 是屏障、auto 只是兜底 | `tests/unit/test_rules.py`（“边界快照”一节） |
 | todo 提醒的触发与节流（跑完测试、有进行中的条目、改过文件；同一组上限与间隔、组变了重新计数；探索期不计时；不限次数与退避；多项并行按组说；交接后从图上取条目） | `tests/unit/test_todo_reminders.py` |
+| 会话内的断路器：同一动作同一结果、同一动作连续出错、来回交替；耗时不算不同；中间有别的调用就断开；每段只报一次；正常工作不报 | `tests/unit/test_loops.py`、`tests/integration/test_belay_run.py`（打转的断路器一节） |
 | 改进阶段（POLISH 的 IMPROVE）：finalize 不变；接受后开始、请复核者提方向；提议的校验（引文、目标、去重、上限、需求没做完时不提）；证据等级；分数提高与改进项完成算进展；放弃与宣布结束；重试后结束；空闲会话结束；收尾取消；后台复核更新改进项；被拒的复核不记；回退重新打开 | `tests/unit/test_improve.py`、`tests/integration/test_polish_run.py`、`test_replay.py`（improve 模式） |
 | 重放一致性（随机复核结论：失败、格式坏、豁免、分数、各种等级）；随机交错下后台总是挑最新的边界快照（性质检查） | `tests/unit/test_replay.py` |
 | 开场、等级与缺失项、board | `tests/unit/test_context.py` |
