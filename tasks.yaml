@@ -1,10 +1,15 @@
 # =====================================================================
-# 评测任务清单（第 2 版）
+# 评测任务清单（第 3 版）
 #
 # 结构：
 #   benchmarks:   各数据集的公共信息（数据位置、判分方式、给 agent 的输入字段）
 #   test:         正式集，按数据集分组。最终结果只来自这里
 #                 role: negative_control 为负对照（预期 runtime 无收益）
+#                 seen_in_dev: true 为开发期看过运行结果的题，报告给出含 / 不含两版结论
+#                 polish: Belay 需求做完后的 POLISH 模式，跑之前按题目的计分方式定好（不用 auto）：
+#                   improve  题目有 agent 能在容器里自己测的连续指标（速度、成本、覆盖率、胜率），
+#                            需求做完后还能继续往上推
+#                   verify   按正确性比例计分（隐藏测试 / 关口 / 验证层），需求做完后该做的是复审补漏
 #   dev:          调试集。开发机制时使用，不进最终报告
 #   backups:      备选题，按顺序替换
 #   replacements: 替换记录
@@ -16,8 +21,8 @@
 # 选题依据见 task_selection.md；SWE-EVO 全部 48 题的指标见 docs/sweevo_catalog.md
 # =====================================================================
 
-version: 2
-frozen_at: "2026-09-25"
+version: 3
+frozen_at: "2026-10-05"
 
 benchmarks:
   promax:
@@ -56,7 +61,7 @@ benchmarks:
     name: Long-Horizon Terminal-Bench
     data: ../benchmarks/LHTB/tasks
     source: https://github.com/zli12321/LHTB
-    commit: d78f5eb52ad754c5ee9154741af73130a85a65b8   # 2026-09-15；python -m eval.tools.fetch_lhtb 按此版本下载
+    commit: 52381e7d747b03e6f6af1953a4c7ff5dad78112e   # 2026-10-02；python -m eval.tools.fetch_lhtb 按此版本下载
     task_format: native             # 原生 Harbor 格式；prepare 时关闭 continue_until_timeout、禁止联网
     image_template: null            # task.toml 的 environment.docker_image（预构建镜像）
     instruction_fields: [instruction.md]
@@ -65,9 +70,9 @@ benchmarks:
     solved_threshold: 0.95          # LHTB 口径：reward ≥ 0.95 视为解出
 
 # ---------------------------------------------------------------------
-# 正式集（16 道 = SWE-EVO 7 + ProMax 3 + LHTB 4 + 负对照 2）
-# stats：files 参考解改动文件数；code 其中代码文件数；items release notes 条目数；
-#        est_min 按调试集实测比例估算的 Claude Code 用时（见 task_selection.md 4.3）
+# 正式集（16 道 = SWE-EVO 6 + LHTB 10，其中 LHTB 3 道为负对照）
+# swe_evo stats：files 参考解改动文件数；code 其中代码文件数；items release notes 条目数
+# lhtb stats：取自 task.toml（commit 见上）；grade_min 为评分超时
 # ---------------------------------------------------------------------
 test:
   swe_evo:
@@ -75,81 +80,108 @@ test:
       lang: python
       repo: iterative/dvc
       image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-3760
-      stats: {files: 107, code: 105, items: 34, f2p: 68, f2p_files: 18, p2p: 242, est_min: 109}
-    - id: conan-io__conan_2.0.14_2.0.15
-      lang: python
-      repo: conan-io/conan
-      image: xingyaoww/sweb.eval.x86_64.conan-io_s_conan-15109
-      stats: {files: 78, code: 77, items: 43, f2p: 72, f2p_files: 5, p2p: 649, est_min: 80}
+      polish: verify
+      stats: {files: 107, code: 105, loc: 3289, items: 34, f2p: 68, f2p_files: 18, p2p: 242}
     - id: iterative__dvc_2.8.1_2.8.2
       lang: python
       repo: iterative/dvc
       image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-6550
-      stats: {files: 79, code: 69, items: 30, f2p: 133, f2p_files: 28, p2p: 662, est_min: 71}
-    - id: iterative__dvc_0.52.1_0.53.1
+      polish: verify
+      stats: {files: 79, code: 69, loc: 3254, items: 30, f2p: 133, f2p_files: 28, p2p: 662}
+    - id: conan-io__conan_2.0.14_2.0.15
       lang: python
-      repo: iterative/dvc
-      image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-2275
-      stats: {files: 42, code: 41, items: 12, f2p: 132, f2p_files: 13, p2p: 0, est_min: 42}
+      repo: conan-io/conan
+      image: xingyaoww/sweb.eval.x86_64.conan-io_s_conan-15109
+      polish: verify
+      seen_in_dev: true
+      stats: {files: 78, code: 77, loc: 1665, items: 43, f2p: 72, f2p_files: 5, p2p: 649}
     - id: dask__dask_2023.3.2_2023.4.0
       lang: python
       repo: dask/dask
       image: xingyaoww/sweb.eval.x86_64.dask_s_dask-10042
-      stats: {files: 69, code: 36, items: 39, f2p: 61, f2p_files: 8, p2p: 6246, est_min: 37}
+      polish: verify
+      stats: {files: 69, code: 36, loc: 4112, items: 39, f2p: 61, f2p_files: 8, p2p: 6246}
     - id: dask__dask_2022.9.2_2022.10.0
       lang: python
       repo: dask/dask
       image: xingyaoww/sweb.eval.x86_64.dask_s_dask-9531
-      stats: {files: 50, code: 28, items: 25, f2p: 44, f2p_files: 8, p2p: 2861, est_min: 29}
+      polish: verify
+      stats: {files: 50, code: 28, loc: 1803, items: 25, f2p: 44, f2p_files: 8, p2p: 2861}
     - id: dask__dask_2023.6.0_2023.6.1
       lang: python
       repo: dask/dask
       image: xingyaoww/sweb.eval.x86_64.dask_s_dask-10342
-      stats: {files: 33, code: 22, items: 21, f2p: 105, f2p_files: 8, p2p: 3415, est_min: 23}
-
-  promax:
-    - id: OpenListTeam__OpenList-1001
-      lang: go
-      repo: OpenListTeam/OpenList
-      stats: {src_files: 46, loc: 850, top_dirs: 37}
-    - id: nacos__alibaba-13142
-      lang: java
-      repo: alibaba/nacos
-      stats: {src_files: 46, loc: 889, top_dirs: 7}
-    - id: tracel-ai__burn-4337
-      lang: rust
-      repo: tracel-ai/burn
-      stats: {src_files: 49, loc: 1954, top_dirs: 12}
-    - id: roboflow__supervision-1943
-      lang: python
-      repo: roboflow/supervision
-      role: negative_control        # pilot 中 Claude Code 5.5 / 10.9 min 解出
-      stats: {src_files: 11, loc: 861, top_dirs: 7}
-
-  deepswe:
-    - id: koota-query-predicates
-      lang: typescript
-      repo: pmndrs/koota
-      role: negative_control        # pilot 中 Claude Code 16.9 min 解出
-      stats: {files: 17, loc: 877}
+      polish: verify
+      stats: {files: 33, code: 22, loc: 695, items: 21, f2p: 105, f2p_files: 8, p2p: 3415}   # 105 个 F2P 中 76 个在 test_utils.py
 
   lhtb:
+    # ---- 论文 Table 2「Software & reverse engineering」
     - id: commit0-multilib-tdd
       lang: python
-      scoring: proportional         # 784 个隐藏测试，按通过比例计分
-      stats: {expert_min: 480, junior_min: 1200, cpus: 2, memory_mb: 4096}
+      category: software_reverse
+      scoring: proportional         # 784 个隐藏测试的通过比例
+      polish: verify
+      seen_in_dev: true
+      stats: {expert_min: 480, junior_min: 1200, cpus: 2, memory_mb: 4096, grade_min: 30}
     - id: langchain-version-migration
       lang: python
-      scoring: binary               # 部分完成不计分；独立评分容器
-      stats: {expert_min: 120, junior_min: 360, cpus: 2, memory_mb: 4096}
-    - id: duckdb-optimizer-closure
-      lang: cpp
-      scoring: correctness_gated    # 任一查询错误即 0 分，否则按性能计分
-      stats: {expert_min: 300, junior_min: 720, cpus: 4, memory_mb: 8192}
+      category: software_reverse
+      scoring: proportional         # 18 道隐藏关口的通过比例；独立评分容器
+      polish: verify
+      stats: {expert_min: 120, junior_min: 360, cpus: 2, memory_mb: 4096, grade_min: 15}
     - id: riscv-core-debug
       lang: systemverilog
-      scoring: proportional         # 数量未知的注入 bug
-      stats: {expert_min: 360, junior_min: 720, cpus: 4, memory_mb: 8192}
+      category: software_reverse
+      scoring: weighted_layers      # 数量未知的注入 bug，按各验证层加权
+      polish: verify
+      stats: {expert_min: 360, junior_min: 720, cpus: 4, memory_mb: 8192, grade_min: 90}
+    - id: great-expectations-audit
+      lang: python
+      category: software_reverse
+      scoring: proportional         # 测试通过比例
+      polish: verify
+      stats: {expert_min: 120, junior_min: 360, cpus: 2, memory_mb: 4096, grade_min: 15}
+    - id: apex-openroad-ibex-signoff
+      lang: eda                     # OpenROAD-flow-scripts 配置与约束
+      category: software_reverse
+      scoring: gated_stages         # 芯片签核流程各关口
+      polish: verify
+      stats: {expert_min: 480, junior_min: 1200, cpus: 4, memory_mb: 8192, grade_min: 90}
+    - id: generals-bot-arena
+      lang: python
+      category: software_reverse
+      scoring: win_rate             # 对各档对手的平均胜率；agent 可用自带对战命令自测
+      polish: improve
+      role: negative_control
+      stats: {expert_min: 300, junior_min: 600, cpus: 4, memory_mb: 4096, grade_min: 30}
+    # ---- 论文 Table 2「Systems, performance & security」
+    - id: duckdb-optimizer-closure
+      lang: cpp
+      category: systems_perf
+      scoring: correctness_gated    # 任一查询错误即 0 分，否则按加速比；bench run 可自测
+      polish: improve
+      stats: {expert_min: 300, junior_min: 720, cpus: 4, memory_mb: 8192, grade_min: 60}
+    - id: vector-db-iterative-build
+      lang: python
+      category: systems_perf
+      scoring: correctness_gated    # recall@10 ≥ 0.95 才算分，再按 QPS / 暴力基线；vecdb bench 可自测
+      polish: improve
+      stats: {expert_min: 360, junior_min: 720, cpus: 4, memory_mb: 8192, grade_min: 30}
+    - id: grammar-fuzz-coverage-hunt
+      lang: python
+      category: systems_perf
+      scoring: coverage             # 0.6 行覆盖 + 0.4 分支覆盖；fuzz coverage 可自测
+      polish: improve
+      role: negative_control
+      stats: {expert_min: 240, junior_min: 480, cpus: 2, memory_mb: 4096, grade_min: 10}
+    - id: spot-scheduler-traces
+      lang: python
+      category: systems_perf
+      scoring: cost_score           # 相对按需 / oracle 的成本得分；simulate score 可自测
+      polish: improve
+      role: negative_control
+      seen_in_dev: true
+      stats: {expert_min: 200, junior_min: 480, cpus: 2, memory_mb: 4096, grade_min: 5}
 
 # ---------------------------------------------------------------------
 # 调试集（3 道）
@@ -160,45 +192,41 @@ dev:
       lang: python
       repo: conan-io/conan
       image: xingyaoww/sweb.eval.x86_64.conan-io_s_conan-13450
-      stats: {files: 48, code: 44, items: 22, f2p: 8, f2p_files: 3, p2p: 317, est_min: 46}
+      polish: verify
+      stats: {files: 48, code: 44, items: 22, f2p: 8, f2p_files: 3, p2p: 317}
     - id: pydantic__pydantic_v2.7.0_v2.7.1
       lang: python
       repo: pydantic/pydantic
       image: xingyaoww/sweb.eval.x86_64.pydantic_s_pydantic-9214
-      stats: {files: 19, code: 11, items: 23, f2p: 234, f2p_files: 6, p2p: 1477, est_min: 11}
+      polish: verify
+      stats: {files: 19, code: 11, items: 23, f2p: 234, f2p_files: 6, p2p: 1477}
 
   lhtb:
-    - id: spot-scheduler-traces     # 2026-09-26 替换 unknown-config-semantics（后者有 50 秒 / 次的强制限速，参考解本身需约 88 分钟）
+    - id: nbody-accel-iterative
       lang: python
-      scoring: proportional
-      stats: {expert_min: 200, junior_min: 480, cpus: 2, memory_mb: 4096}
+      scoring: speedup              # bench run 可自测加速比
+      polish: improve
+      stats: {expert_min: 240, junior_min: 480, cpus: 4, memory_mb: 8192, grade_min: 60}
 
 # ---------------------------------------------------------------------
 # 备选题（按列表顺序使用）
+# v3 按规则选题：SWE-EVO 满足规则的 7 道已全部用上（含人工排除的 dask_2024.1.0），
+# LHTB 两个工程类别的 12 道也已全部用上（poc-exploit-craft、unknown-config-semantics 被排除），
+# 所以没有符合规则的备选。gold-check 不通过的题直接去掉，记入 replacements。
 # ---------------------------------------------------------------------
 backups:
   swe_evo:
-    any:
-      - id: iterative__dvc_1.10.2_1.11.0        # 若不希望 conan 同时出现在调试集与正式集，用它替换 conan_2.0.14
-        image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-4961
-      - id: iterative__dvc_2.5.0_2.5.1
-        image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-6273
-      - id: iterative__dvc_3.43.1_3.44.0
-        image: xingyaoww/sweb.eval.x86_64.iterative_s_dvc-10277
-  promax:
-    cpp:        [nasa__fprime-3642, LMMS__lmms-7454]
-    go:         [go-gitea__gitea-35775, gitleaks__gitleaks-1831]
-    java:       [plantuml__plantuml-c_15fa06c]
-    rust:       [astral-sh__ruff-20221]
+    any: []
   lhtb:
-    any: [vector-db-iterative-build, nbody-accel-iterative, great-expectations-audit, unknown-config-semantics]
+    any: []
 
 # ---------------------------------------------------------------------
-# 替换记录（格式示例）
-#   - {split: test, benchmark: lhtb, removed: riscv-core-debug,
-#      added: vector-db-iterative-build, reason: "oracle 第二次运行失败", date: "2026-09-26"}
+# 替换 / 去除记录
 # ---------------------------------------------------------------------
-replacements: []
+replacements:
+  - {split: test, benchmark: lhtb, removed: unknown-config-semantics, added: null, date: "2026-10-05",
+     reason: "评分只回放 cfg submit 的快照并取最高分，题目自带“随时可交付”，体现不出 Belay 的合并链；
+              且要改的文件在 /opt/cfg，不在工作目录 /app 下，Belay 的快照与复核接管不到"}
 
 # ---------------------------------------------------------------------
 # 选题修订记录
@@ -221,3 +249,11 @@ revisions:
     summary: >-
       LHTB 调试题由 unknown-config-semantics 换为 spot-scheduler-traces：前者的 daemon 对每次探测强制等待 50 秒，
       完整解法至少需要 5 × 21 × 50 秒 ≈ 88 分钟，几乎等于 90 分钟预算，不适合作为快速迭代的调试题；移入备选末尾。
+  - version: 3
+    date: "2026-10-05"
+    summary: >-
+      正式集 16 道：SWE-EVO 6（阈值规则：改动 ≥ 30 文件、F2P ≥ 20 且 ≥ 3 个测试文件、P2P > 0；人工排除 dask_2024.1.0）
+      + LHTB 10（论文 Table 2 两个工程类别的 12 道，去掉 poc-exploit-craft 与 unknown-config-semantics；
+      其中 generals / grammar-fuzz / spot-scheduler 三道饱和题为负对照）。ProMax、DeepSWE 全部移出。
+      调试集换为 conan_2.0.2、pydantic_v2.7.0、nbody-accel-iterative。LHTB 升级到 52381e7。
+      每题写明 polish（improve / verify），agent 预算改为 180 分钟。

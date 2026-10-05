@@ -9,7 +9,7 @@ import datetime as dt
 import difflib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -31,6 +31,8 @@ class TaskRef:
     id: str
     lang: str = ""
     repo: str = ""
+    # Belay 需求做完后的 POLISH 模式（tasks.yaml 的 polish：improve / verify）；不参与比较，题目身份只看 benchmark/id
+    polish: str = field(default="", compare=False)
 
     @property
     def key(self) -> str:
@@ -152,7 +154,7 @@ def select_tasks(tasks_yaml: dict, split: str, benchmarks, wanted) -> list[TaskR
 
     def refs(sp: str, bm_list) -> list[TaskRef]:
         pool = tasks_yaml.get(sp) or {}
-        return [TaskRef(bm, e["id"], e.get("lang", ""), e.get("repo", ""))
+        return [TaskRef(bm, e["id"], e.get("lang", ""), e.get("repo", ""), e.get("polish", ""))
                 for bm in bm_list for e in (pool.get(bm) or [])]
 
     candidates = refs(split, bms)

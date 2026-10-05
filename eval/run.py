@@ -74,10 +74,14 @@ def main(argv=None) -> int:
             return 2
 
     if args.dry_run:
-        from eval.runner import preflight
+        from eval.runner import preflight, task_agent
         s, t = plan.steps[0], plan.tasks[0]
+        if any(st.agent.get("per_task_polish") for st in plan.steps):
+            print("\n逐题 POLISH 模式：")
+            for x in plan.tasks:
+                print(f"  {x.polish or '（未填）':8s} {x.key}")
         cfg = pb.job_config(job_name="agent", jobs_dir=plan.trial_dir(s, t, 1) / "pier",
-                            task_dir=plan.task_dir(t), agent_cfg=pb.agent_config(s.agent, plan.timeout_min),
+                            task_dir=plan.task_dir(t), agent_cfg=pb.agent_config(task_agent(s, t), plan.timeout_min),
                             environment=plan.environment, keep_container=plan.keep_containers,
                             verify=plan.inline_verify or s.grade_mode == "inline")
         print(f"\n第一个 trial 将生成的 Pier 配置：\n---\n{yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)}")

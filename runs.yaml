@@ -28,7 +28,7 @@ defaults:
   tasks: all
   repeats: 1
   concurrency: 2              # 8 vCPU / 32 GiB 下建议 ≤ 2；LHTB 的 duckdb、riscv 各需 4 核 8 GB
-  timeout_min: 90             # 每题统一的 agent 预算（覆盖 task.toml 中的 agent 超时，含 LHTB 原本 1–6 h 的设置）
+  timeout_min: 180            # 每题统一的 agent 预算（覆盖 task.toml 中的 agent 超时，含 LHTB 原本 1–6 h 的设置）
   environment: docker
   grading:
     inline_verify: true       # agent 结束后在原容器里也跑一次 verifier，用于和重放结果对账
@@ -85,7 +85,7 @@ agents:
     <<: *claude_code
     import_path: "eval.agents.claude_code_gate:ClaudeCodeGate"
     gate: true                          # runner 读取任务目录下的 gate.json（目前仅 SWE-EVO 转换器生成）
-    setup_timeout_min: 150              # setup 阶段在原始代码上跑两次基线测试，不计入 90 分钟预算
+    setup_timeout_min: 150              # setup 阶段在原始代码上跑两次基线测试，不计入 agent 预算
     kwargs:
       <<: *claude_code_kwargs
       max_blocks: 5                     # 最多拦截 5 次，之后放行并记录
@@ -107,7 +107,7 @@ agents:
       effort: max                       # 对应 A 组的 --effort max；若接口报错改为 high
       thinking: true
       max_tokens: 64000
-      budget_min: 90                    # 与 timeout_min 保持一致
+      budget_min: 180                   # 与 timeout_min 保持一致（runner 也会用 timeout_min 覆盖）
       record: true                      # 录制模型回复，调试 runtime 时可回放
       explore: true                     # 提供只读探索子 agent（对应 Claude Code 的 Explore）；模型可以不用
       clear_tokens: 500000              # 与 A 组对齐：Claude Code 约在 78.6 万 token 压缩
@@ -119,7 +119,7 @@ agents:
     <<: *flat
     import_path: "eval.agents.belay_agent:BelayAgent"
     gate: true                          # runner 读取任务目录下的 gate.json 作为回归门；没有时（LHTB）只靠复核者
-    pass_instruction: true              # setup 阶段就把任务原文交给 agent：基线双跑与规划不占 90 分钟
+    pass_instruction: true              # setup 阶段就把任务原文交给 agent：基线双跑与规划不占 agent 预算
     setup_timeout_min: 150              # setup 阶段：影子仓库、基线（工作区一次 + 验证槽位一次）、导入隔离探针、规划
     kwargs: &belay_kwargs
       <<: *flat_kwargs
@@ -170,6 +170,11 @@ agents:
   belay-polish-improve:       # 不看有没有分数，固定 IMPROVE
     <<: *belay
     kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, after_accept: polish, polish_mode: improve}}
+
+  belay-polish-task:          # Belay 正式配置：POLISH 模式按题取 tasks.yaml 的 polish（improve / verify），跑之前就定好
+    <<: *belay
+    per_task_polish: true               # runner 把这道题的 polish 写进 kwargs.runtime.polish_mode；没填的题过不了运行前检查
+    kwargs: {<<: *belay_kwargs, runtime: {<<: *belay_runtime, after_accept: polish}}
 
   belay-no-stuck-handoff:     # 同一个问题在 submit 上反复失败时只提醒，不换新会话
     <<: *belay
@@ -241,13 +246,13 @@ profiles:
 
   belay-dev:                  # Belay 调试（完整机制）；消融用 --agent belay-no-locate 等
     split: dev
-    agent: belay
+    agent: belay-polish-task         # 消融或不开 POLISH：--agent belay
     repeats: 1
     keep_containers: true
 
   belay-test:                 # Belay 组正式评测
     split: test
-    agent: belay
+    agent: belay-polish-task
     repeats: 1
     grading: {inline_verify: false}
 

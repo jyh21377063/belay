@@ -9,6 +9,7 @@ run.json / grade.json 的 status 为 done 时视为完成，重跑同一命令�
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
 import shutil
@@ -25,6 +26,19 @@ _print_lock = threading.Lock()
 
 # 这些数据集的评分脚本只评"已提交"的内容，重放时应用补丁后需要 commit（与其 solve.sh 一致）
 COMMIT_SUBMISSION = {"deepswe"}
+
+POLISH_MODES = ("improve", "verify")
+
+
+def task_agent(step: Step, t: TaskRef) -> dict:
+    """按题定制的 agent 定义。per_task_polish 的 agent（Belay POLISH）把 tasks.yaml 里这道题的 polish
+    写进 kwargs.runtime.polish_mode：模式在跑之前定好，不交给 auto 按“复核者有没有量过分数”临场决定。"""
+    if not step.agent.get("per_task_polish"):
+        return step.agent
+    agent = copy.deepcopy(step.agent)
+    runtime = agent.setdefault("kwargs", {}).setdefault("runtime", {})
+    runtime["polish_mode"] = t.polish
+    return agent
 
 
 def log(msg: str) -> None:
@@ -98,6 +112,12 @@ def preflight(plan: RunPlan) -> list[str]:
                 problems.append(f"{t.key}: {', '.join(gated)} 需要门禁配置，但任务目录里没有 gate.json"
                                 f"（目录可能是旧版转换器生成的）；运行 python -m eval.prepare --split {plan.split} "
                                 f"--benchmarks swe_evo --tasks {t.id} --force 重新生成")
+    polished = [s.agent_key for s in plan.steps if s.agent.get("per_task_polish")]
+    if polished:
+        for t in plan.tasks:
+            if t.polish not in POLISH_MODES:
+                problems.append(f"{t.key}: {', '.join(polished)} 按题选 POLISH 模式，但 tasks.yaml 里这道题的 "
+                                f"polish 是 {t.polish!r}（应为 {' / '.join(POLISH_MODES)}）")
     if plan.grading_only:
         for t in plan.tasks:
             if not any((plan.results_root / plan.source_run / t.benchmark / t.id).glob("*/patch.diff")):
@@ -128,13 +148,14 @@ def agent_phase(plan: RunPlan, step: Step, t: TaskRef, d: Path) -> dict:
         if instr.exists():
             extra["task_instruction"] = instr.read_text()
     cfg = pb.job_config(job_name="agent", jobs_dir=d / "pier", task_dir=plan.task_dir(t),
-                        agent_cfg=pb.agent_config(step.agent, plan.timeout_min, extra),
+                        agent_cfg=pb.agent_config(task_agent(step, t), plan.timeout_min, extra),
                         environment=plan.environment, keep_container=plan.keep_containers,
                         verify=verify_inline)
     # 预算之外还要留出：拉取 / 构建镜像（可达 1 h）与评分（LHTB 可达 1.5 h）
     out = pb.run_job(cfg, d / "agent_job.yaml", d / "agent_pier.log",
                      timeout_sec=plan.timeout_min * 60 + 3 * 3600)
     rec: dict = {"task": t.key, "agent": step.agent_key, "model": step.agent.get("model"), "grade_mode": mode,
+                 **({"polish_mode": t.polish} if step.agent.get("per_task_polish") else {}),
                  "pier_rc": out.returncode, "pier_trial_dir": str(out.trial_dir or "")}
     if not out.ok:
         rec.update(status="error", error=f"Pier 没有产出 trial 结果，见 {out.log_path}")
