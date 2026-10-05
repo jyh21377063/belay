@@ -1,14 +1,16 @@
 """把一个 run_id 下所有 trial 的 run.json / grade.json 汇总成 summary.csv 和 summary.md。
 
-也可以单独调用：python -m eval.report <results_root>/<run_id>
+也可以单独调用：python -m eval.report <results_root>/<run_id> [--gold-run <gold-check 的 oracle 结果目录>]
+
+给了 gold_run（runs.yaml 或 --gold-run）时，SWE-EVO 另外给出“以参考解为准”的 F2P / P2P（见 eval/gold_ref.py）。
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import re
 import statistics
-import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -16,7 +18,8 @@ COLUMNS = ["task", "repeat", "status", "resolved", "score", "fix_rate", "inline_
            "apply_ok", "exception", "agent_min", "trial_min", "grade_min",
            "n_input_tokens", "n_cache_tokens", "cache_hit_rate", "n_output_tokens", "cost_est",
            "n_agent_steps", "summarization_count", "patch_files", "patch_loc", "test_files_changed",
-           "f2p_passed", "f2p_total", "p2p_regressions", "error"]
+           "f2p_passed", "f2p_total", "p2p_regressions",
+           "f2p_passed_ref", "f2p_total_ref", "p2p_regressions_ref", "ref_excluded", "error"]
 
 # 判断补丁中哪些是测试文件（各语言常见约定）
 _TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*\.py$|_test\.(py|go)$|\.(test|spec)\.[jt]sx?$|(^|/)conftest\.py$")
@@ -59,7 +62,8 @@ def f2p_p2p(rewards: dict | None) -> tuple[int | None, int | None, int | None]:
     return None, None, None
 
 
-def collect_dir(root: Path, grade_mode: str = "replay", pricing: dict | None = None) -> list[dict]:
+def collect_dir(root: Path, grade_mode: str = "replay", pricing: dict | None = None, gold=None) -> list[dict]:
+    """gold：eval.gold_ref.GoldRef，给出时为 SWE-EVO 的行补上以参考解为准的 F2P / P2P。"""
     rows = []
     for run_json in sorted(root.glob("*/*/*/run.json")):
         d = run_json.parent
@@ -96,6 +100,7 @@ def collect_dir(root: Path, grade_mode: str = "replay", pricing: dict | None = N
             "_currency": (pricing or {}).get("currency"),
             "test_patch_failed": ((grade.get("rewards") if grade_mode_row == "replay" else rec.get("rewards")) or {})
                                  .get("test_patch_applied") == 0,
+            **(gold.adjust(d.parent.name, d) if gold is not None and d.parent.parent.name == "swe_evo" else {}),
         })
     return rows
 
@@ -103,7 +108,18 @@ def collect_dir(root: Path, grade_mode: str = "replay", pricing: dict | None = N
 def collect(plan, step) -> list[dict]:
     """汇总该 run_id 下的全部 trial（包括之前分批运行的题目），保证 summary 完整。"""
     root = plan.results_root / step.run_id
-    return collect_dir(root, step.grade_mode, step.agent.get("pricing"))
+    return collect_dir(root, step.grade_mode, step.agent.get("pricing"), gold_ref(plan.results_root, plan.gold_run,
+                                                                                  plan.task_dirs))
+
+
+def gold_ref(results_root: Path, gold_run: str | None, task_dirs: Path):
+    """gold_run 可以是 run_id（相对 results_root）或目录；不存在时不做调整。"""
+    if not gold_run:
+        return None
+    from eval.gold_ref import GoldRef
+    p = Path(gold_run)
+    p = p if p.is_absolute() else results_root / p
+    return GoldRef(p, task_dirs) if p.is_dir() else None
 
 
 def _mean(xs):
@@ -146,9 +162,16 @@ def write(root: Path, rows: list[dict]) -> None:
                      f"{_d(_mean(r['n_agent_steps'] for r in rs))} | {_d(_mean(r['cache_hit_rate'] for r in rs))} | "
                      f"{_d(_mean(r['cost_est'] for r in rs))} | {bad} |")
 
-    lines += ["", "| 题目 | # | 结果 | 得分 | Fix Rate | F2P 通过（不清零） | P2P 回归 | agent(min) | 总耗时(min) | 轮数 | "
-              "输入 / 缓存命中 / 输出 token | 成本 | 补丁文件数（其中测试） | 异常 | 备注 |",
-              "|---|---:|:-:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|---|"]
+    has_ref = any(r.get("f2p_total_ref") is not None for r in rows)
+    if has_ref:
+        lines += ["", "SWE-EVO 另列“以参考解为准”的 F2P / P2P：参考解在本环境中也没通过的测试在所有组里都扣掉"
+                      "（eval/gold_ref.py）。各题扣掉的数量：",
+                  *sorted({f"- {r['task']}：{r['ref_excluded']}" for r in rows if r.get("ref_excluded")})]
+    ref_head = "F2P（以参考解为准） | P2P 回归（以参考解为准） | " if has_ref else ""
+    lines += ["", "| 题目 | # | 结果 | 得分 | Fix Rate | F2P 通过（不清零） | P2P 回归 | " + ref_head +
+              "agent(min) | 总耗时(min) | 轮数 | 输入 / 缓存命中 / 输出 token | 成本 | 补丁文件数（其中测试） | 异常 | 备注 |",
+              "|---|---:|:-:|---:|---:|---:|---:|" + ("---:|---:|" if has_ref else "") +
+              "---:|---:|---:|---|---:|---:|---|---|"]
     fmt = lambda v: f"{v:,}" if isinstance(v, int) else ("" if v is None else str(v))
     for r in rows:
         mark = {True: "✅", False: "❌", None: "⚠️"}[r["resolved"]]
@@ -159,7 +182,11 @@ def write(root: Path, rows: list[dict]) -> None:
                                        (r["error"] or "")[:80]]))
         total = round((r["trial_min"] or 0) + (r["grade_min"] or 0), 1) or ""
         f2p = f"{r['f2p_passed']}/{r['f2p_total']}" if r.get("f2p_total") else ""
-        lines.append(f"| {r['task']} | {r['repeat']} | {mark} | {fmt(r['score'])} | {fmt(r['fix_rate'])} | {f2p} | {fmt(r.get('p2p_regressions'))} | "
+        ref = ""
+        if has_ref:
+            f2p_ref = f"{r['f2p_passed_ref']}/{r['f2p_total_ref']}" if r.get("f2p_total_ref") is not None else ""
+            ref = f"{f2p_ref} | {fmt(r.get('p2p_regressions_ref'))} | "
+        lines.append(f"| {r['task']} | {r['repeat']} | {mark} | {fmt(r['score'])} | {fmt(r['fix_rate'])} | {f2p} | {fmt(r.get('p2p_regressions'))} | {ref}"
                      f"{fmt(r['agent_min'])} | {total} | "
                      f"{fmt(r['n_agent_steps'])} | {fmt(r['n_input_tokens'])} / {fmt(r['n_cache_tokens'])} / "
                      f"{fmt(r['n_output_tokens'])} | {fmt(r['cost_est'])} | "
@@ -168,8 +195,14 @@ def write(root: Path, rows: list[dict]) -> None:
 
 
 if __name__ == "__main__":
-    target = Path(sys.argv[1])
+    ap = argparse.ArgumentParser(prog="python -m eval.report")
+    ap.add_argument("run", type=Path, help="<results_root>/<run_id>")
+    ap.add_argument("--gold-run", help="gold-check 的 oracle 结果（run_id 或目录）；默认取 plan.json 里记录的 gold_run")
+    ap.add_argument("--task-dirs", type=Path, default=Path(__file__).resolve().parents[1].parent / "tasks")
+    a = ap.parse_args()
+    target = a.run
     plan = _read(target / "plan.json")
     agent = plan.get("agent") or {}
-    write(target, collect_dir(target, agent.get("grade", "replay"), agent.get("pricing")))
+    gold = gold_ref(target.parent, a.gold_run or plan.get("gold_run"), a.task_dirs)
+    write(target, collect_dir(target, agent.get("grade", "replay"), agent.get("pricing"), gold))
     print((target / "summary.md").read_text())

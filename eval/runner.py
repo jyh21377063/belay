@@ -242,7 +242,8 @@ def execute(plan: RunPlan) -> bool:
             "profile": plan.profile, "split": plan.split, "agent_key": step.agent_key,
             "agent": {k: v for k, v in step.agent.items() if k != "env"},
             "env_keys": sorted((step.agent.get("env") or {})), "repeats": step.repeats,
-            "timeout_min": plan.timeout_min, "tasks": [t.key for t in plan.tasks], **code_version()})
+            "timeout_min": plan.timeout_min, "tasks": [t.key for t in plan.tasks], "gold_run": plan.gold_run,
+            **code_version()})
 
         if plan.grading_only:     # 重新评分：源 run 里有几次就评几次
             jobs = [(t, int(d.name)) for t in plan.tasks

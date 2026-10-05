@@ -35,6 +35,7 @@ def parse_args(argv=None):
     p.add_argument("--timeout-min", type=int, dest="timeout_min")
     p.add_argument("--run-id", dest="run_id", help="自定义 run_id；与已有 run_id 相同则断点续跑")
     p.add_argument("--source-run", dest="source_run", help="regrade 时读取补丁的 run_id")
+    p.add_argument("--gold-run", dest="gold_run", help="gold-check 的 oracle run_id；SWE-EVO 以参考解为准统计 F2P / P2P")
     p.add_argument("--keep-containers", action="store_true", default=None, dest="keep_containers")
     p.add_argument("-y", "--yes", action="store_true", help="不询问，直接开始")
     p.add_argument("--dry-run", action="store_true", help="只打印计划和生成的 Pier 配置")
@@ -58,7 +59,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     overrides = {k: getattr(args, k) for k in
                  ("split", "benchmarks", "tasks", "agent", "model", "repeats", "concurrency",
-                  "timeout_min", "run_id", "source_run", "keep_containers")}
+                  "timeout_min", "run_id", "source_run", "keep_containers", "gold_run")}
     try:
         plan = build_plan(args.runs, args.profile, overrides)
     except ConfigError as e:

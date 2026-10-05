@@ -33,6 +33,8 @@ defaults:
   grading:
     inline_verify: true       # agent 结束后在原容器里也跑一次 verifier，用于和重放结果对账
   keep_containers: false
+  # gold-check 的 oracle 结果：SWE-EVO 另外“以参考解为准”统计 F2P / P2P（参考解在本环境也过不了的测试在所有组里扣掉）
+  gold_run: gold-test-final-v1-oracle
   run_id: "{profile}-{agent}-{split}-{date}"
   # 网络：不再在这里写白名单。任务的 task.toml 统一 allow_internet = false（prepare 会强制），
   # Pier 只放行 agent 自己声明的域名（claude-code 即 ANTHROPIC_BASE_URL 的域名）。
@@ -192,6 +194,7 @@ profiles:
       - {agent: nop,    repeats: 1, expect: fail}
     concurrency: 2            # 评测集含 Rust / C++ 完整编译，并发不宜过高
     grading: {inline_verify: true}
+    gold_run: null            # gold-check 自己就是基准
 
   cc-pilot:                   # Claude Code 试跑（调试集）：保留容器、原容器与重放双重评分，便于排查
     split: dev
