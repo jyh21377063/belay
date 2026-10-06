@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from functools import lru_cache
 from pathlib import Path
 
@@ -115,16 +116,39 @@ RUN bash /tmp/belay_setup_env.sh && rm -f /tmp/belay_setup_env.sh
 
 
 # ---------------------------------------------------------------- 评分
-def test_sh(spec: dict) -> str:
+def test_patch_files(test_patch: str) -> list[str]:
+    """测试补丁涉及的文件（两侧路径都算，去重保序）。"""
+    out = []
+    for m in re.finditer(r"(?m)^diff --git a/(\S+) b/(\S+)", test_patch):
+        for f in m.groups():
+            if f not in out:
+                out.append(f)
+    return out
+
+
+def test_sh(spec: dict, patch_files: list[str] | None = None) -> str:
     eval_cmds = "\n  ".join(spec["eval_commands"]) or ":"
+    files = " ".join(shlex.quote(f) for f in patch_files or [])
     return f"""#!/bin/bash
-# 由 eval/convert/sweevo_to_harbor.py 生成：应用测试补丁 → 运行测试 → 按官方规则判分
+# 由 eval/convert/sweevo_to_harbor.py 生成：复原测试补丁涉及的文件 → 应用测试补丁 → 运行测试 → 按官方规则判分
 set -uo pipefail
 mkdir -p /logs/verifier
 LOG=/logs/verifier/test_output.txt
 : > "$LOG"
 source /opt/miniconda3/bin/activate && conda activate testbed
 cd {REPO_DIR}
+
+# 与 SWE-bench 官方评测脚本一致（git checkout <base> -- <test files>）：先把测试补丁要改的文件恢复到起始版本，
+# 起始版本里没有的删掉，再应用测试补丁。否则 agent 只要改过（或新建了）同一个测试文件，测试补丁就应用不上，
+# 整道题一个测试都不会运行。HEAD 即起始版本（仓库在构建时重建为单一提交）。对所有组一视同仁。
+for f in {files}; do
+  if git cat-file -e "HEAD:$f" 2>/dev/null; then
+    git checkout -q HEAD -- "$f" >> "$LOG" 2>&1
+  else
+    rm -f "$f"
+  fi
+done
+echo "[belay] 已复原测试补丁涉及的文件：{len(patch_files or [])} 个" >> "$LOG"
 
 applied=0
 if git apply -v /tests/test.patch >> "$LOG" 2>&1; then
@@ -300,7 +324,7 @@ def convert(task_id: str, bench_cfg: dict, entry: dict, dst: Path) -> None:
         "tests/test.patch": rec["test_patch"] if rec["test_patch"].endswith("\n") else rec["test_patch"] + "\n",
         "tests/tests.json": json.dumps({"FAIL_TO_PASS": rec["FAIL_TO_PASS"],
                                         "PASS_TO_PASS": rec["PASS_TO_PASS"]}, indent=1),
-        "tests/test.sh": test_sh(spec),
+        "tests/test.sh": test_sh(spec, test_patch_files(rec["test_patch"])),
         "tests/grade.py": GRADE_PY,
         # A-gate 的门禁配置：与官方评测相同的测试命令，但不应用测试补丁（只跑仓库中已有的测试）。
         # 放在任务目录根部，Pier 不会上传；由 runner 以 gate_spec 参数传给 A-gate agent。

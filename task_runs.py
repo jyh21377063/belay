@@ -52,7 +52,10 @@ def main(argv=None) -> int:
         gd = grade_details(t) if grade else None
         f2p = p2p_bad = "-"
         bad_names = []
-        if gd and "error" not in gd:
+        status = run.get("status") or "-"
+        if rw.get("test_patch_applied") == 0:      # 测试补丁没应用上：一个测试都没运行，0/N 与“全部 P2P 失败”都不是真实结果
+            f2p, p2p_bad, status = "未运行", "未运行", f"{status}（测试补丁未应用）"
+        elif gd and "error" not in gd:
             n_graded += 1
             f2p = f"{gd['n_f2p'] - len(gd['f2p_bad'])}/{gd['n_f2p']}"
             p2p_bad = str(len(gd["p2p_bad"]))
@@ -68,7 +71,7 @@ def main(argv=None) -> int:
         rows.append([run_id, k, run.get("agent") or "-", fmt_min(run.get("agent_sec")),
                      "-" if fix is None else f"{fix:.3f}", "-" if score is None else f"{score:.4f}",
                      f2p, p2p_bad, "; ".join(n.split("::")[-1] for n in bad_names)[:80] or "-",
-                     run.get("status") or "-"])
+                     status])
 
     head = ["run_id", "#", "agent", "用时min", "fix_rate", "score", "F2P 通过", "P2P 失败", "失败的 P2P", "状态"]
     print("| " + " | ".join(head) + " |")
