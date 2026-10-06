@@ -4,6 +4,10 @@
   python task_runs.py conan-io__conan_2.0.2_2.0.3
   python task_runs.py conan-io__conan_2.0.2_2.0.3 --runs v9-conan,v8-conan   # 只看这几个 run_id
   python task_runs.py spot-scheduler-traces                                  # LHTB：只有连续得分
+  python task_runs.py                                   # 正式集（tasks.yaml 的 test）每道题一张表，逐题打印
+  python task_runs.py --split dev                       # 调试集每道题一张表
+  python task_runs.py commit0-multilib-tdd duckdb-optimizer-closure   # 指定几道题
+  python task_runs.py --runs belay-final,cc-test-v3     # 每道题只看这几个 run_id
 
 数据来源：<results_root>/<run_id>/<benchmark>/<题目>/<k>/ 下的 run.json、grade.json，以及评分容器的测试输出
 （pier/grade/*/verifier/test_output.txt，由 eval.belay_report.grade_details 解析）。不改任何文件。
@@ -29,17 +33,12 @@ def fmt_min(sec) -> str:
     return f"{sec / 60:.0f}" if isinstance(sec, (int, float)) else "-"
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("task", help="题目 id（短 id）")
-    ap.add_argument("--runs", help="只看这些 run_id，逗号分隔")
-    a = ap.parse_args(argv)
-    root = _root("results_root")
-    only = set(a.runs.split(",")) if a.runs else None
-    trials = sorted(p for p in root.glob(f"*/*/{a.task}/*") if p.is_dir() and p.name.isdigit()
+def show(task: str, only: set | None, root: Path, per_test_detail: bool = True) -> int:
+    """打印一道题的所有运行（原来的单题输出）。"""
+    trials = sorted(p for p in root.glob(f"*/*/{task}/*") if p.is_dir() and p.name.isdigit()
                     and (only is None or p.parts[-4] in only))
     if not trials:
-        print(f"在 {root} 下没有找到 {a.task} 的运行")
+        print(f"在 {root} 下没有找到 {task} 的运行")
         return 1
 
     rows, per_test, n_graded = [], defaultdict(lambda: ["", 0]), 0
@@ -79,10 +78,33 @@ def main(argv=None) -> int:
     for r in rows:
         print("| " + " | ".join(str(x) for x in r) + " |")
 
-    if per_test:
+    if per_test and per_test_detail:
         print(f"\n在 {n_graded} 次有测试明细的运行里，失败过的测试（失败次数 / 有明细的运行数）：\n")
         for name, (kind, bad) in sorted(per_test.items(), key=lambda kv: (-kv[1][1], kv[0])):
             print(f"  {bad}/{n_graded}  {kind}  {name}")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tasks", nargs="*", help="题目 id（短 id），可以给多个；不给时按 --split 列出 tasks.yaml 里的全部题目")
+    ap.add_argument("--split", default="test", choices=["test", "dev"], help="不给题目时用哪个 split（默认 test）")
+    ap.add_argument("--runs", help="只看这些 run_id，逗号分隔")
+    ap.add_argument("--per-test", action="store_true",
+                    help="多道题时也列出每个测试的失败次数（只给一道题时默认就列）")
+    a = ap.parse_args(argv)
+    root = _root("results_root")
+    only = set(a.runs.split(",")) if a.runs else None
+    tasks = a.tasks
+    if not tasks:
+        from eval.config import load_tasks_yaml
+        ty = load_tasks_yaml(_root("tasks_file"))
+        tasks = [e["id"] for lst in (ty.get(a.split) or {}).values() for e in (lst or [])]
+    if len(tasks) == 1:
+        return show(tasks[0], only, root)
+    for t in tasks:
+        print(f"\n## {t}\n")
+        show(t, only, root, per_test_detail=a.per_test)
     return 0
 
 
