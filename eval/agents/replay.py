@@ -41,7 +41,18 @@ class PatchReplayAgent(PatchCaptureMixin, BaseAgent):
         if not self.patch_path.exists() or self.patch_path.stat().st_size == 0:
             report.update(ok=True, method="empty")
         else:
-            repo = await self._belay_find_repo(environment)
+            repo = await self._belay_find_repo(environment, required=False)
+            if repo is None:
+                # 工作目录不是 git 仓库（部分 LHTB 任务，例如 duckdb 的 /app、riscv 删掉 .git 之后的 /app）：
+                # 补丁是相对工作目录的（Belay 的合并点 / worktree.diff 都以容器工作目录为根），直接在工作目录里应用。
+                # git apply 在仓库外同样可用（等同于 patch，但支持二进制补丁与新建文件）。
+                if self.repo_dir:
+                    repo = self.repo_dir
+                else:
+                    res = await environment.exec(command="pwd")
+                    repo = (res.stdout or "/").strip().splitlines()[-1]
+                report["workdir_not_git"] = True
+            report["apply_dir"] = repo
             await environment.upload_file(self.patch_path, "/tmp/belay_submission.diff")
             # 与 SWE-bench 系列评估器一致：先 git apply，失败再用 patch 的模糊匹配兜底
             for method, cmd in [
@@ -56,7 +67,7 @@ class PatchReplayAgent(PatchCaptureMixin, BaseAgent):
                     break
             else:
                 report.update(ok=False, method=None)   # 不抛异常：让 verifier 照常跑，结果自然是失败
-            if report.get("ok") and self.commit:
+            if report.get("ok") and self.commit and not report.get("workdir_not_git"):
                 res = await self._belay_exec(environment, (
                     f"cd {shlex.quote(repo)} && {GIT} checkout -q -b belay/submission 2>/dev/null; "
                     f"{GIT} add -A && {GIT} -c user.name=belay -c user.email=belay@localhost "
