@@ -18,7 +18,7 @@
 | I | POLISH 用 improve 的运行，实际交付 |
 | R | SWE-EVO 用新评分脚本重评（`belay-final-regrade`） |
 | H | 开发期的历史运行 |
-| C | 合并链链头单独评分（这个版本当时在链上，但没有交付出去） |
+| C | 某个 checkpoint 单独评分（这个版本当时在 checkpoint 链上，但没有交付出去） |
 | W | worker 最终工作区单独评分（没有合并进链，也没有交付） |
 
 ## SWE-EVO（6 道）
@@ -62,12 +62,12 @@
 
 **LHTB 表注**
 
-- **commit0**：最高分 0.946 来自 `v10-improve-commit0`（improve，开发期）。同一次运行里，合并点 #14 单独评分也是 0.946。其他运行：`belay-final`（verify）0.931，用时 37 分钟；`belay-improve-lhtb` 0.909；improve 另外两次是 0.924 和 0.918；不进 POLISH 是 0.889。重复跑的分数相差约 0.03，**不稳定**。CC 用时 46 分钟。
-- **langchain**：verify 和 improve 都是 0.333，分别用了 16 分钟和 40 分钟。失败在 `router_structure` 关口：`create_agent` 没有传 `context_schema`，也没有带运行时上下文。题面要求了 runtime context，但复核者把这条需求判成了已完成。CC 用时 13 分钟。
-- **riscv**：最高分 1.000 来自 W，也就是 `belay-final` 的 worker 最终工作区（第 167 分钟），**补丁应用方式显示为 None，待核实**。`belay-final` 实际交付的是链头 #2（第 38 分钟），得 0.662：之后 9 次合并请求都没通过复核。improve 运行只得 0.280，和空补丁一样。**很不稳定**。CC 用时 90 分钟。
+- **commit0**：最高分 0.946 来自 `v10-improve-commit0`（improve，开发期）。同一次运行里，checkpoint #14 单独评分也是 0.946。其他运行：`belay-final`（verify）0.931，用时 37 分钟；`belay-improve-lhtb` 0.909；improve 另外两次是 0.924 和 0.918；不进 POLISH 是 0.889。重复跑的分数相差约 0.03，**不稳定**。CC 用时 46 分钟。
+- **langchain**：verify 和 improve 都是 0.333，分别用了 16 分钟和 40 分钟。失败在 `router_structure` 关口：`create_agent` 没有传 `context_schema`，也没有带运行时上下文。题面要求了 runtime context，但 Reviewer 把这条需求判成了已完成。CC 用时 13 分钟。
+- **riscv**：最高分 1.000 来自 W，也就是 `belay-final` 的 worker 最终工作区（第 167 分钟），**补丁应用方式显示为 None，待核实**。`belay-final` 实际交付的是 checkpoint #2（第 38 分钟），得 0.662：之后 9 次合并请求都没通过评审。improve 运行只得 0.280，和空补丁一样。**很不稳定**。CC 用时 90 分钟。
 - **great-expectations**：verify、improve、CC 三次都是 0.273，很可能卡在同一组隐藏测试上。用时分别是 Belay 22 / 42 分钟、CC 10 分钟。
 - **apex-openroad**：verify 和 improve 都是 0.288，分别用了 174 和 176 分钟。CC 跑满 90 分钟被强制结束，评的是当时的工作区。
-- **duckdb**：最高分 0.760 来自 C，也就是合并链链头 #4。`belay-final`（improve）实际得 0，原因是收尾时打快照太慢、没能交付，加上 agent 在 DuckDB 暂存区里留了一个新文件，评分器打 `solution.patch` 失败。CC 用时 84 分钟。
+- **duckdb**：最高分 0.760 来自 C，也就是 checkpoint #4。`belay-final`（improve）实际得 0，原因是收尾时打快照太慢、没能交付，加上 agent 在 DuckDB 暂存区里留了一个新文件，评分器打 `solution.patch` 失败。CC 用时 84 分钟。
 - **vector-db**：`belay-final`（improve），用时 131 分钟。
 - **generals**：`belay-final`（improve），用时 172 分钟。
 - **grammar-fuzz**：`belay-final`（improve），用时 59 分钟。
@@ -84,18 +84,18 @@
 - **负对照**：3 道题 Belay 都和参考解持平或更高，没有拖后腿。
 - **超过参考解**：vector-db、generals、grammar-fuzz。
 
-## 机制观察：执行层和管控层
+## 机制观察：Worker 产出 vs Runtime 验收与交付
 
-用单独评分把这两层拆开来看：
+用单独评分把这两部分拆开来看：
 
-| 题目 | 实际交付 | 执行层的产出 | 差距来自 |
+| 题目 | 实际交付 | Worker 产出 | 差距来自 |
 |---|---|---|---|
-| riscv | 0.662（链头 #2） | 1.000（worker 工作区，待核实） | 复核连续拒绝合并，好的改动进不了合并链 |
-| duckdb | 0.000 | 0.760（链头 #4） | 收尾时交付失败 |
-| langchain | 0.333 | – | 复核者误判需求已完成，16 分钟就收尾 |
-| commit0 | 0.931 / 0.946 | 合并点 #7、#9、#14 分别是 0.941、0.924、0.946 | 运行中分数会下降，合并链保证交付的版本不低于链头 |
+| riscv | 0.662（checkpoint #2） | 1.000（worker 工作区，待核实） | Reviewer 连续拒绝合并，好的改动进不了 checkpoint 链 |
+| duckdb | 0.000 | 0.760（checkpoint #4） | 收尾时交付失败 |
+| langchain | 0.333 | – | Reviewer 误判需求已完成，16 分钟就收尾 |
+| commit0 | 0.931 / 0.946 | checkpoint #7、#9、#14 分别是 0.941、0.924、0.946 | 运行中分数会下降，checkpoint 链保证交付的版本不低于最新 checkpoint |
 
-从这几道题看，执行层的产出和 CC 相当，分数损失主要来自管控层：复核把关太严或者误判，加上大仓库上收尾不可靠。这三点就是下一步要改进的地方。
+从这几道题看，worker 的代码产出和 CC 相当，分数损失主要来自 runtime 的验收与交付环节：Reviewer 把关太严或者误判，加上大仓库上收尾不可靠。这三点就是下一步要改进的地方。
 
 ## POLISH 模式对比（5 道 LHTB，各跑 1 次）
 
@@ -112,7 +112,7 @@ improve 更适合有自测指标的优化题：vector-db、generals、grammar-fu
 ## 待核实与局限
 
 - **riscv 的 W = 1.000**：要看 `wt-riscv-final` 的 `apply.json` 和评分器分项，还要确认 worker 没有改 `hw/rtl/` 以外的文件，也没有写死预期输出。
-- **疑似 reward hacking，尚未确认**：几道超过参考解的优化题（vector-db、generals、grammar-fuzz），要确认 agent 没有改过评测工具或 benchmark 脚本。duckdb 复核者自测的加速比是 1.279，评分器只量到约 0.99 倍，更可能是计时方法不同，但说明复核者自测的分数不能直接信。
+- **疑似 reward hacking，尚未确认**：几道超过参考解的优化题（vector-db、generals、grammar-fuzz），要确认 agent 没有改过评测工具或 benchmark 脚本。duckdb Reviewer 自测的加速比是 1.279，评分器只量到约 0.99 倍，更可能是计时方法不同，但说明 Reviewer 自测的分数不能直接信。
 - **SWE-EVO 的 P2P**：dvc_2.8.1 和 conan 还没扣除参考解也失败的测试，可以用 `eval.report --gold-run gold-test-final-v1-oracle` 计算。
 - **CC 缺的题**：vector-db、generals、grammar-fuzz 没有 CC 结果，派生镜像在 CC 构建时拉不到。后两道是负对照，影响较小。
 - **重复次数**：每个配置在每道题上大多只跑过 1 次，commit0 和 riscv 都已经观察到明显的波动。
