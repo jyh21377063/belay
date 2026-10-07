@@ -56,6 +56,8 @@ Belay 把“进度”和“验收”从模型手里拿出来，交给一个外�
 
 ### 一个快照如何成为 Checkpoint
 
+![无标题-2026-10-07-1430](./assets/无标题-2026-10-07-1430.svg)
+
 ![images2](./assets/images2.png)
 
 更完整的架构说明见 [docs/architecture.md](docs/architecture.md)，每个模块的详细设计见 [docs/design.md](docs/design.md)。
