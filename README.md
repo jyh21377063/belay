@@ -52,46 +52,11 @@ Belay 把“进度”和“验收”从模型手里拿出来，交给一个外�
 
 ### 系统架构
 
-```mermaid
-flowchart LR
-  subgraph Host["宿主机"]
-    W["Worker<br/>（执行 agent：LLM + 工具循环）"]
-    RT["Runtime<br/>（唯一写者：规则 → 事件 → 副作用）"]
-    LOG[("事件日志<br/>SQLite，只追加")]
-    VIEW["状态视图<br/>需求清单 / 执行状态 / Checkpoint 链"]
-    P["Planner<br/>需求拆解"]
-    RV["Reviewer<br/>带工具的评审 agent"]
-  end
-  subgraph Box["任务容器"]
-    WS["工作区<br/>worker 改代码"]
-    GIT["影子 git 仓库<br/>快照与 checkpoint"]
-    VS["验证目录<br/>隔离跑测试"]
-    RD["评审目录<br/>Reviewer 读代码、跑程序"]
-  end
-  W -- "读写文件 / 执行命令" --> WS
-  W -- "submit / todo" --> RT
-  RT -- "评审结论 / 缺失项 / 回归定位" --> W
-  RT --> LOG --> VIEW --> RT
-  P -- "需求清单（经校验）" --> RT
-  RT -- "拍快照、推进 checkpoint" --> GIT
-  RT -- "回归门禁" --> VS
-  RT -- "合并请求" --> RV
-  RV -- "结论（经规则校验）" --> RT
-  RV --> RD
-```
+![images1](./assets/images1.png)
 
 ### 一个快照如何成为 Checkpoint
 
-```mermaid
-flowchart LR
-  A["Worker 改代码<br/>勾掉 todo / submit"] --> B["自动快照<br/>（剔除对测试文件的改动）"]
-  B --> C{"回归门禁<br/>原始测试 · 全量 · 隔离目录"}
-  C -- "有回归" --> D["持续出现 → 二分定位<br/>+ 失败诊断 → 通知 worker"]
-  C -- "通过" --> E{"Reviewer 评审<br/>不比上一个 checkpoint 差？<br/>逐条验收需求 + 证据等级"}
-  E --> F{"规则校验<br/>证据真实 · 单调 · 分数不降"}
-  F -- "通过" --> G["新 Checkpoint<br/>（即当前交付物）"]
-  F -- "不通过" --> H["原因与缺失项反馈 worker"]
-```
+![images2](./assets/images2.png)
 
 更完整的架构说明见 [docs/architecture.md](docs/architecture.md)，每个模块的详细设计见 [docs/design.md](docs/design.md)。
 
